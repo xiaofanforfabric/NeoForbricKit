@@ -211,74 +211,75 @@ public final class ForbricRegistryAccess implements RegistryAccess {
         private ForbricItemRegistry() {
         }
 
-        /** The game's item ids, as this bridge sees them, in the order the game keeps them. */
+        /** One report per distinct problem: this runs per lookup, and a plugin loops over items. */
+        private static final java.util.Set<String> REPORTED =
+                        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+        private static void report(String what, Throwable failure) {
+            if (!REPORTED.add(what)) {
+                return;
+            }
+            if (failure == null) {
+                ForbricLog.warn("[Forbric/Bukkit] item registry: %s", what);
+            } else {
+                ForbricLog.error("[Forbric/Bukkit] item registry: " + what, failure);
+            }
+        }
+
+        /**
+         * The game-layer half of this registry, loaded from the layer that can see Minecraft.
+         *
+         * <p>{@code gameLayer} is taken from the {@code RegistryAccess} the server published, so it is the game
+         * layer by construction. The class it loads is public with static methods precisely so that this call
+         * works from here — see {@link ForbricItemLookup}.
+         */
+        private static Class<?> gameLayerHalf(ClassLoader gameLayer) throws ClassNotFoundException {
+            return Class.forName("net.neoforbrickit.bukkit.ForbricItemLookup", true, gameLayer);
+        }
+
+        /** The game's item ids, in the order the game keeps them. */
         private java.util.List<org.bukkit.NamespacedKey> keys() {
             Object registries = ForbricRegistries.access();
             if (registries == null) {
+                report("no game registries have been published yet, so every item lookup answers null", null);
                 return java.util.List.of();
             }
             try {
-                // Reflection bridge: FML-Plugins layer cannot link net.minecraft.* directly. Ask game layer.
-                ClassLoader gameLoader = registries.getClass().getClassLoader();
-                Class<?> resourceKeyClass = Class.forName("net.minecraft.resources.ResourceKey", true, gameLoader);
-                Object itemRegistry = registries.getClass()
-                        .getMethod("lookupOrThrow", resourceKeyClass)
-                        .invoke(registries, Class.forName("net.minecraft.core.registries.Registries", true, gameLoader)
-                                .getField("ITEM").get(null));
                 @SuppressWarnings("unchecked")
-                java.util.Set<Object> keySet = (java.util.Set<Object>) itemRegistry.getClass()
-                        .getMethod("keySet").invoke(itemRegistry);
-                return keySet.stream()
-                        .map(id -> {
-                            try {
-                                String ns = (String) id.getClass().getMethod("getNamespace").invoke(id);
-                                String path = (String) id.getClass().getMethod("getPath").invoke(id);
-                                return new org.bukkit.NamespacedKey(ns, path);
-                            } catch (Exception e) {
-                                return null;
-                            }
-                        })
-                        .filter(java.util.Objects::nonNull)
-                        .toList();
-            } catch (Exception e) {
+                java.util.List<org.bukkit.NamespacedKey> keys = (java.util.List<org.bukkit.NamespacedKey>)
+                                gameLayerHalf(registries.getClass().getClassLoader())
+                                                .getMethod("keys").invoke(null);
+                return keys;
+            } catch (Throwable failure) {
+                report("listing the game's items failed", failure);
                 return java.util.List.of();
             }
         }
 
+        /**
+         * One item, or null when the game has no such id.
+         *
+         * <p>The null is the GAME's answer, asked of its own item registry in its own layer. Every other
+         * failure — a layer that cannot see Minecraft, a lookup that threw — is reported rather than turned
+         * into the same null, which is what made a registry that answered nothing read as "PAPER isn't an
+         * item".
+         */
         @Override
         public org.bukkit.inventory.ItemType get(org.bukkit.NamespacedKey key) {
             if (key == null) {
                 return null;
             }
-            // Whether the item exists is a question for the game's registry, not for a table here:
-            // a mod-added item is as real as a vanilla one, and only the game knows it.
             Object registries = ForbricRegistries.access();
             if (registries == null) {
+                report("no game registries have been published yet, so every item lookup answers null", null);
                 return null;
             }
             try {
-                // Build Identifier via reflection to avoid linking net.minecraft.resources.Identifier in FML-Plugins.
-                // Use the game layer's ClassLoader (from registries object) to load Minecraft classes.
-                ClassLoader gameLoader = registries.getClass().getClassLoader();
-                Class<?> identifierClass = Class.forName("net.minecraft.resources.Identifier", true, gameLoader);
-                Object id = identifierClass.getMethod("fromNamespaceAndPath", String.class, String.class)
-                        .invoke(null, key.getNamespace(), key.getKey());
-                
-                Class<?> resourceKeyClass = Class.forName("net.minecraft.resources.ResourceKey", true, gameLoader);
-                Object itemRegistry = registries.getClass()
-                        .getMethod("lookupOrThrow", resourceKeyClass)
-                        .invoke(registries, Class.forName("net.minecraft.core.registries.Registries", true, gameLoader)
-                                .getField("ITEM").get(null));
-                
-                boolean contains = (boolean) itemRegistry.getClass()
-                        .getMethod("containsKey", identifierClass).invoke(itemRegistry, id);
-                if (!contains) {
-                    return null;
-                }
-                // ForbricItemType.of expects an Identifier, but it's loaded in the game layer where Identifier is visible.
-                // Pass the id object; the bridge code in game layer will cast it.
-                return ForbricItemType.of(id);
-            } catch (Exception e) {
+                return (org.bukkit.inventory.ItemType) gameLayerHalf(registries.getClass().getClassLoader())
+                                .getMethod("of", String.class, String.class)
+                                .invoke(null, key.getNamespace(), key.getKey());
+            } catch (Throwable failure) {
+                report("item lookup failed for " + key, failure);
                 return null;
             }
         }
@@ -309,8 +310,10 @@ public final class ForbricRegistryAccess implements RegistryAccess {
 
         @Override
         public Stream<org.bukkit.inventory.ItemType> stream() {
-            return keys().stream().map(key -> ForbricItemType.of(
-                            net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey())));
+            // Through get(), which asks the game layer. Building an Identifier here would name a
+            // net.minecraft.* type in THIS class, and this class is defined by the layer that cannot see
+            // Minecraft — the same trap the lookup itself used to fall into.
+            return keyStream().map(this::get).filter(java.util.Objects::nonNull);
         }
 
         @Override

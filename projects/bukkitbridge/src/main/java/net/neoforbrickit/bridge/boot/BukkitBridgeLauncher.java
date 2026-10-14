@@ -223,7 +223,11 @@ public final class BukkitBridgeLauncher {
 			Method stop = handle.getClass().getMethod("stop");
 			stop.invoke(handle);
 		} catch (Throwable failure) {
-			ForbricLog.warn("[NeoFobric/Bukkit] the plugin bridge did not stop cleanly: %s", String.valueOf(failure));
+			// Unwrapped: an InvocationTargetException's own toString says nothing about what the bridge threw,
+			// and the shutdown report "java.lang.reflect.InvocationTargetException" is a dead end.
+			Throwable cause = failure instanceof java.lang.reflect.InvocationTargetException wrapped
+					&& wrapped.getCause() != null ? wrapped.getCause() : failure;
+			ForbricLog.warn("[NeoFobric/Bukkit] the plugin bridge did not stop cleanly: " + cause, cause);
 		}
 	}
 

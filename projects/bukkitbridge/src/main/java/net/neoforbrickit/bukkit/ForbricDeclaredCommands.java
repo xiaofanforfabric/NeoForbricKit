@@ -375,17 +375,17 @@ final class ForbricDeclaredCommands {
             // A plugin that throws here would otherwise be a silently dead command: Brigadier turns the
             // exception into a failed dispatch with no message to anyone. Naming the plugin is the only
             // way the operator learns which one it was.
+            String pluginName = command instanceof PluginCommand plugin ? plugin.getPlugin().getName() : name;
             ForbricLog.warn("[Forbric/Bukkit] %s threw while running /%s %s: %s",
-                    command instanceof PluginCommand plugin ? plugin.getPlugin().getName() : name,
-                    name, java.util.Arrays.toString(args), pluginBug);
-            if (pluginBug instanceof org.bukkit.command.CommandException commandException
-                            && commandException.getCause() != null) {
-                server.getLogger().log(java.util.logging.Level.SEVERE,
-                                "[Forbric/Bukkit] command cause for /" + name, commandException.getCause());
-            } else {
-                server.getLogger().log(java.util.logging.Level.SEVERE,
-                                "[Forbric/Bukkit] command failure for /" + name, pluginBug);
-            }
+                    pluginName, name, java.util.Arrays.toString(args), pluginBug);
+            // The cause, through ForbricLog — NOT through server.getLogger(). That one is a
+            // java.util.logging logger whose ConsoleHandler writes to System.err, and a launcher that keeps
+            // only log4j's latest.log drops it: a real report arrived as "CommandException: Unhandled
+            // exception executing command 'osc'" with nothing under it, which is the single line that would
+            // have named the fault. Unwrapped, because a CommandException is a wrapper by construction.
+            ForbricLog.error("[Forbric/Bukkit] command failure for /" + name + " (" + pluginName + ")",
+                    pluginBug instanceof org.bukkit.command.CommandException wrapper && wrapper.getCause() != null
+                            ? wrapper.getCause() : pluginBug);
             return 0;
         }
         return handled ? 1 : 0;

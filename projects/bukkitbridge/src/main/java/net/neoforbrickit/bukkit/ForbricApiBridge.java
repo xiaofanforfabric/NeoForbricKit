@@ -214,7 +214,11 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 
 	@Override
 	public ItemStack deserializeItem(byte[] data) {
-		return ForbricItemCodec.decode(data);
+		// Through the game-layer half, NOT ForbricItemCodec directly. This class is a ServiceLoader
+		// provider, so it is loaded by FML's "FML Plugins" layer, which cannot link net.minecraft.*.
+		// Naming ForbricItemCodec here would resolve THAT class in THIS layer, and its first
+		// RegistryAccess reference then fails with NoClassDefFoundError inside a plugin's command.
+		return (ItemStack) itemCodec("decode", new Class<?>[] {byte[].class}, data);
 	}
 
 	@Override
@@ -240,7 +244,11 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 	 */
 	@Override
 	public ItemStack createEmptyStack() {
-		return ForbricItemStack.plain(org.bukkit.Material.AIR, 0);
+		// Also through the game layer: ForbricItemStack's constructor descriptor names
+		// net.minecraft.world.item.ItemStack, and a descriptor is resolved when the call site is
+		// linked -- so naming the class here fails at load, one step along the same chain that
+		// ForbricItemCodec failed on.
+		return (ItemStack) itemCodec("emptyStack", new Class<?>[0]);
 	}
 
 	@Override
@@ -252,5 +260,44 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 	@Override
 	public ComponentFlattener componentFlattener() {
 		throw notYet("component flattening");
+	}
+
+	// ---- Cross-layer calls -------------------------------------------------------------------------
+	//
+	// The bridge is present in two FML classloader layers, because Paper's ServiceLoader resolves
+	// its providers from the API layer. That layer cannot see Minecraft, so anything naming a
+	// net.minecraft.* type has to be reached by name through the layer that can — the game layer,
+	// identified by the RegistryAccess the server published. See ForbricItemCodecLookup for the
+	// other half of this contract.
+
+	/**
+	 * Calls a method on the game layer's half of the item codec.
+	 *
+	 * <p>{@code ForbricItemCodecLookup} is the one class whose signatures stay inside types both
+	 * layers share (byte arrays and ItemStacks), so loading it here is safe and the work needing
+	 * Minecraft happens on the far side. Naming {@code ForbricItemCodec} directly would instead
+	 * resolve that class in this layer, and its {@code RegistryAccess} reference cannot be linked
+	 * from here.
+	 */
+	private static Object itemCodec(String method, Class<?>[] parameterTypes, Object... arguments) {
+		Object registries = ForbricRegistries.access();
+		if (registries == null) {
+			throw new IllegalStateException(
+					"[Forbric/Bukkit] the server has not published its registries yet, so an item cannot"
+							+ " be (de)serialised");
+		}
+		try {
+			Class<?> gameLayer = Class.forName("net.neoforbrickit.bukkit.ForbricItemCodecLookup", true,
+					registries.getClass().getClassLoader());
+			return gameLayer.getMethod(method, parameterTypes).invoke(null, arguments);
+		} catch (ReflectiveOperationException unreachable) {
+			// The class, the method and its shape are all fixed by this bridge, so a lookup that fails
+			// means the two halves were built from different sources. Wrapped rather than swallowed:
+			// the caller is inside a plugin's command and needs a stack trace, not a silent null.
+			throw new IllegalStateException(
+					"[Forbric/Bukkit] the item codec's game-layer half (ForbricItemCodecLookup." + method
+							+ ") is not present in the game layer",
+					unreachable);
+		}
 	}
 }

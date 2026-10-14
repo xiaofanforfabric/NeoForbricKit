@@ -171,6 +171,42 @@ dependencies {
         libraries("net.fabricmc:fabric-loader:${rootProject.fabricLoaderBaseVersion}")
     }
 
+    // NeoFobric: the Bukkit/Paper plugin bridge. Its jar is a runtime library (projects/bukkitbridge
+    // compiles against :neoforge as compileOnly, which must NOT become a runtime edge), so it is
+    // consumed through the deployJar configuration — an artifact with no project dependencies — rather
+    // than as a plain project dependency. The bridge is not on any public Maven repository and is
+    // embedded into the installer below, like fabricbridge.
+    //
+    // Paper's API is the half that is NOT bundled (it is somebody else's artifact): the launcher
+    // resolves it from PaperMC's repository, which settings.gradle adds to
+    // dependencyResolutionManagement — and NeoDevPlugin collects every repository there into the
+    // installer profile's repository list, so the coordinates below resolve on a user's machine too.
+    // Pinned to the version the bridge was written against.
+    //
+    // The bridge jar goes through a plain-file artifact, not a project dependency: this configuration
+    // extends `api`, so `project(':bukkitbridge')` would add :bukkitbridge:classes to
+    // :neoforge:compileJava, and :bukkitbridge:compileJava already depends on :neoforge:compileJava
+    // (it compiles against the patched Minecraft classes :neoforge emits) — a cycle. The bridge's
+    // classes are reached reflectively from the server lifecycle (see invokeBukkitHook in
+    // ServerLifecycleHooks), so :neoforge needs no compile-time view of them at all.
+    libraries(project(path: ':bukkitbridge', configuration: 'deployJar'))
+    libraries('io.papermc.paper:paper-api:26.2.build.133-stable')
+    // The adventure component library paper-api's signatures name, and snakeyaml (PluginDescriptionFile's
+    // static initialiser builds a Loader through it, and Minecraft does not ship it). Resolved from
+    // Central, which is already a repository.
+    libraries('org.yaml:snakeyaml:2.2')
+    libraries('net.kyori:adventure-api:5.2.0')
+    libraries('net.kyori:adventure-key:5.2.0')
+    libraries('net.kyori:adventure-text-minimessage:5.2.0')
+    libraries('net.kyori:adventure-text-serializer-gson:5.2.0')
+    libraries('net.kyori:adventure-text-serializer-json:5.2.0')
+    libraries('net.kyori:adventure-text-serializer-legacy:5.2.0')
+    libraries('net.kyori:adventure-text-serializer-plain:5.2.0')
+    libraries('net.kyori:adventure-text-logger-slf4j:5.2.0')
+    libraries('net.kyori:option:1.1.0')
+    // `+build.N` qualifiers are served by Paper's Maven only; Central answers 404.
+    libraries('net.md-5:bungeecord-chat:1.21-R0.2-deprecated+build.21')
+
     // Must be implementation instead of compileOnly so that running dependent projects such as tests will trigger (re)compilation of coremods.
     // (Only needed when compiling through IntelliJ non-delegated builds - otherwise `compileOnly` would work).
     implementation(jarJar(project(":neoforge-coremods")))

@@ -54,6 +54,16 @@ dependencyResolutionManagement {
                 includeModule('net.fabricmc', 'fabric-loader')
             }
         }
+        // NeoFobric: the Bukkit bridge compiles against Paper's API. mavenCentral does not serve
+        // io.papermc.paper:paper-api (nor net.md-5:bungeecord-chat's +build.N qualifiers), so the
+        // PaperMC repository is added here, scoped to the two groups the bridge actually resolves.
+        maven {
+            url = 'https://repo.papermc.io/repository/maven-public/'
+            content {
+                includeGroup('io.papermc.paper')
+                includeGroup('net.md-5')
+            }
+        }
     }
 }
 
@@ -73,6 +83,11 @@ project(":tests").projectDir = file("tests")
 // NeoFobric: bridge subproject that integrates the fabric-loader runtime into NeoForge.
 include ':fabricbridge'
 project(':fabricbridge').projectDir = file('projects/fabricbridge')
+
+// NeoFobric: bridge subproject that runs Bukkit/Paper plugins on the server. Carried from the
+// Forbric project's kernel (org.cn.xiaofan.bukkit) with only its kernel-side seams adapted.
+include ':bukkitbridge'
+project(':bukkitbridge').projectDir = file('projects/bukkitbridge')
 
 include ':testframework'
 include ':coremods'

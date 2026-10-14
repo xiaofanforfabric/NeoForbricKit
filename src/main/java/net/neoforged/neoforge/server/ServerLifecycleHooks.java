@@ -117,6 +117,17 @@ public class ServerLifecycleHooks {
 
     public static void handleServerStarted(final MinecraftServer server) {
         NeoForge.EVENT_BUS.post(new ServerStartedEvent(server));
+        // NeoFobric: bring up the Bukkit/Paper plugin bridge now that a running server exists. This is
+        // the point Forbric picks too (its KernelGameServerLifecycle does it from ServerStartedEvent):
+        // the bridge wraps the server every World and Player a plugin asks for is reached through, and
+        // before this there is nothing to wrap.
+        //
+        // Reached reflectively, on purpose. A direct call would make :neoforge:compileJava depend on
+        // :bukkitbridge:classes, and :bukkitbridge:compileJava already depends on :neoforge:compileJava
+        // (it compiles against the patched Minecraft classes :neoforge emits) — a build cycle. A
+        // reflective call names no bridge type, so it closes nothing; the class is on the runtime
+        // classpath because libraries(...) puts the bridge jar on the launcher profile.
+        invokeBukkitHook("startBukkitBridge", server);
     }
 
     public static void handleServerStopping(final MinecraftServer server) {
@@ -128,6 +139,11 @@ public class ServerLifecycleHooks {
     }
 
     public static void handleServerStopped(final MinecraftServer server) {
+        // NeoFobric: shut the Bukkit bridge down first, running every plugin's onDisable while the server
+        // object is still alive - a plugin that touches a world in onDisable must find one. Reflectively
+        // (see handleServerStarted for why), and guarded because a failure here must not leave the
+        // server's own shutdown half done.
+        invokeBukkitHook("stopBukkitBridge", null);
         NeoForge.EVENT_BUS.post(new ServerStoppedEvent(server));
         currentServer = null;
         CountDownLatch latch = exitLatch;
@@ -275,6 +291,57 @@ public class ServerLifecycleHooks {
         if (!entitiesWithoutPlacements.isEmpty() && !FMLEnvironment.isProduction()) {
             LOGGER.error("The following entities have not registered to the RegisterSpawnPlacementsEvent, but a spawn entry was found. This will mean that the entity doesn't have restrictions on its spawn location, please register a spawn placement for the entity, you can register with NO_RESTRICTIONS if you don't want any restrictions."
                     + entitiesWithoutPlacements.stream().map(EntityType::getKey).map(Identifier::toString).collect(Collectors.joining("\n\t - ", "\n\t - ", "")));
+        }
+    }
+
+    /**
+     * NeoFobric: records the game directory with the Bukkit bridge, so that when the server starts the
+     * bridge knows where {@code plugins} and the Paper-API cache live. Called from CommonModLoader
+     * during registry initialization, reflectively for the same build-cycle reason as
+     * {@link #invokeBukkitHook}.
+     */
+    public static void setBukkitBridgeGameDirectory() {
+        try {
+            Class<?> launcher = Class.forName("net.forbric.kernel.boot.BukkitBridgeLauncher");
+            launcher.getMethod("setGameDirectory", java.nio.file.Path.class)
+                    .invoke(null, net.neoforged.fml.loading.FMLPaths.GAMEDIR.get());
+        } catch (ClassNotFoundException absent) {
+            // The bridge is not installed. That is not an error.
+        } catch (Throwable failure) {
+            LOGGER.error("[NeoFobric/Bukkit] could not record the game directory with the plugin bridge", failure);
+        }
+    }
+
+    /**
+     * NeoFobric: calls a static method on the Bukkit bridge without naming the class.
+     *
+     * <p>Reflection is not ceremony here — it is what keeps the build acyclic. {@code :neoforge} and
+     * {@code :bukkitbridge} cannot see each other at compile time: the bridge compiles against the
+     * patched Minecraft classes {@code :neoforge} emits, and {@code :neoforge} would have to compile
+     * against the bridge to call it directly. A name in a string closes neither edge; the class is
+     * present at runtime because {@code libraries(...)} puts the bridge jar on the launcher profile.
+     *
+     * <p>Never fatal: a missing bridge (the switch is off, or a plain build without the bridge) is the
+     * normal case, and a bridge that throws costs the Bukkit plugins and nothing else.
+     */
+    private static void invokeBukkitHook(String method, Object argument) {
+        try {
+            Class<?> hooks = Class.forName("net.forbric.kernel.boot.BukkitBridgeHooks");
+            var target = argument == null
+                    ? hooks.getMethod(method)
+                    : hooks.getMethod(method, net.minecraft.server.MinecraftServer.class);
+            if (argument == null) {
+                target.invoke(null);
+            } else {
+                target.invoke(null, argument);
+            }
+        } catch (ClassNotFoundException absent) {
+            // The bridge is not installed. That is not an error.
+        } catch (Throwable failure) {
+            Throwable cause = failure instanceof java.lang.reflect.InvocationTargetException wrapped
+                    ? wrapped.getCause() : failure;
+            LOGGER.error("[NeoFobric/Bukkit] the plugin bridge hook {} failed; Bukkit plugins may stay unloaded",
+                    method, cause);
         }
     }
 }

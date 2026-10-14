@@ -819,7 +819,13 @@ final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public org.bukkit.command.ConsoleCommandSender getConsoleSender() {
-		throw notYet("getConsoleSender");
+		if (minecraft == null) {
+			// No game to talk to: naming that beats a NullPointerException from a sender nothing can deliver to.
+			throw notYet("getConsoleSender (no running server was handed to the bridge)");
+		}
+		// The game's own console source: a message sent here lands where a command typed on the server's stdin
+		// prints, which is the console a plugin means.
+		return new ForbricConsoleSender(minecraft.createCommandSourceStack(), this);
 	}
 
 	@Override

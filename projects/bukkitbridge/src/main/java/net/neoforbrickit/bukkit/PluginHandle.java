@@ -105,9 +105,13 @@ final class PluginHandle {
 
 		plugin.setEnabled(true);
 
-		ForbricLifecycleEventManager manager = ForbricApiBridge.lifecycleManagerOf(plugin);
-		if (manager != null) {
-			manager.fire("commands", new io.papermc.paper.plugin.lifecycle.event.registrar
+		// The firer, not the manager: this code runs in the game layer and the plugin's manager lives in the
+		// other copy of the bridge (see ForbricApiBridge.lifecycleFirer). A manager looked up here was always
+		// null, so the COMMANDS event was never fired and a modern plugin's whole Brigadier tree went missing.
+		java.util.function.BiConsumer<String, io.papermc.paper.plugin.lifecycle.event.LifecycleEvent> fire =
+				ForbricApiBridge.lifecycleFirer(plugin);
+		if (fire != null) {
+			fire.accept("commands", new io.papermc.paper.plugin.lifecycle.event.registrar
 					.ReloadableRegistrarEvent<io.papermc.paper.command.brigadier.Commands>() {
 				@Override
 				public io.papermc.paper.command.brigadier.Commands registrar() {

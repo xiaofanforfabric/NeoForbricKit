@@ -69,33 +69,65 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 		// Kept so the bridge can fire the handlers a plugin registered. JavaPlugin builds its manager here
 		// and holds it privately, so this call is the only moment the object is reachable -- a registry
 		// filled any later would be filled from nowhere.
-		MANAGERS.put(plugin, manager);
+		//
+		// Published rather than stored in a static: the copy of this class that fires the events is the OTHER
+		// one. See firers() for the failure that caused.
+		firers().put(plugin, manager::fire);
 		return manager;
 	}
 
 	/**
-	 * The managers this bridge has handed out, by plugin.
+	 * How a plugin's lifecycle handlers are fired, published across the bridge's two class-loader layers.
 	 *
-	 * <p>Static because the bridge is instantiated by ServiceLoader and the caller that needs the managers
-	 * (the loader, after a plugin enables) has no reference to the instance.
+	 * <p><b>The bug this exists for.</b> The bridge is defined twice — FML's plugins layer and the game layer.
+	 * {@code createPluginLifecycleEventManager} is called on the plugins-layer copy (Paper reaches
+	 * {@code InternalAPIBridge} through {@code ServiceLoader}, which uses the interface's own loader), while the
+	 * loader that fires the events after a plugin enables runs the game-layer copy. A static map therefore held
+	 * the plugin's manager in the copy nobody asks, {@code lifecycleManagerOf} answered null in the copy that
+	 * asks, and {@code LifecycleEvents.COMMANDS} was <b>never fired</b>: a modern plugin's Brigadier tree never
+	 * reached the dispatcher, so its command was absent from tab completion and did nothing when typed — while
+	 * the plugin itself logged "enabled" and looked healthy.
 	 *
-	 * <p><b>An identity map, and that is not a style choice.</b> This is populated from inside
-	 * {@code JavaPlugin}'s constructor -- the only moment the manager is reachable -- and at that point
-	 * the plugin's own fields are not yet assigned. {@code PluginBase.hashCode()} is
-	 * {@code getName().hashCode()}, {@code getName()} reads {@code pluginMeta}, and {@code pluginMeta} is
-	 * still null, so a HASHING map throws a NullPointerException out of the constructor: the plugin
-	 * cannot be instantiated at all, and the message names {@code getPluginMeta()} rather than the
-	 * registry that asked. An identity map compares references and never calls the plugin's methods.
+	 * <p>System properties are process-wide, which is the one channel both copies see — the same handoff
+	 * {@link ForbricRegistries} uses for the game's registries, for the same reason.
 	 *
-	 * <p>Synchronised because plugins load on the server thread here but nothing in the API promises
-	 * that forever, and the map is static.
+	 * <p><b>The value is deliberately a JDK type.</b> A map of managers would hand the loader a game-layer
+	 * {@code ForbricLifecycleEventManager} while it casts to its own copy's class, and the two copies of a
+	 * bridge class are different classes — a ClassCastException. {@code BiConsumer} and paper-api's
+	 * {@code LifecycleEvent} are shared, so the value crosses intact and the plugin's handler still runs in the
+	 * layer that registered it.
 	 */
-	private static final java.util.Map<JavaPlugin, ForbricLifecycleEventManager> MANAGERS =
-				java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
+	private static final String SHARED_FIRERS_KEY = "neofobric.bukkit.lifecycleFirers";
 
-	/** The lifecycle manager for a plugin, or null if it was never constructed through this bridge. */
-	static ForbricLifecycleEventManager lifecycleManagerOf(JavaPlugin plugin) {
-		return MANAGERS.get(plugin);
+	@SuppressWarnings("unchecked")
+	private static java.util.Map<JavaPlugin,
+			java.util.function.BiConsumer<String, io.papermc.paper.plugin.lifecycle.event.LifecycleEvent>>
+			firers() {
+		Object shared = System.getProperties().get(SHARED_FIRERS_KEY);
+		if (shared instanceof java.util.Map<?, ?> existing) {
+			return (java.util.Map<JavaPlugin,
+					java.util.function.BiConsumer<String, io.papermc.paper.plugin.lifecycle.event.LifecycleEvent>>)
+					existing;
+		}
+		// An identity map, and that is not a style choice: this is populated from inside JavaPlugin's
+		// constructor, where the plugin's own fields are still null and PluginBase.hashCode() — which reads
+		// getName() -> pluginMeta — would throw out of that constructor. Identity compares references and
+		// never calls the plugin's methods.
+		java.util.Map<JavaPlugin,
+				java.util.function.BiConsumer<String, io.papermc.paper.plugin.lifecycle.event.LifecycleEvent>>
+				created = java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
+		System.getProperties().put(SHARED_FIRERS_KEY, created);
+		return created;
+	}
+
+	/**
+	 * Fires one lifecycle event for a plugin, or null when its manager was never built through this bridge.
+	 *
+	 * <p>Asked by the loader, which runs in the other layer — the whole point of the property above.
+	 */
+	static java.util.function.BiConsumer<String, io.papermc.paper.plugin.lifecycle.event.LifecycleEvent>
+			lifecycleFirer(JavaPlugin plugin) {
+		return firers().get(plugin);
 	}
 
 	// ---- Not implemented -----------------------------------------------------------------------------------

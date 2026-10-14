@@ -6,6 +6,8 @@ package net.neoforbrickit.bukkit;
 import java.util.Collection;
 import java.util.stream.Stream;
 
+import net.neoforbrickit.bridge.util.ForbricLog;
+
 import io.papermc.paper.registry.RegistryAccess;
 import io.papermc.paper.registry.RegistryKey;
 import io.papermc.paper.registry.tag.Tag;
@@ -211,14 +213,36 @@ public final class ForbricRegistryAccess implements RegistryAccess {
 
         /** The game's item ids, as this bridge sees them, in the order the game keeps them. */
         private java.util.List<org.bukkit.NamespacedKey> keys() {
-            net.minecraft.core.RegistryAccess registries = ForbricRegistries.access();
+            Object registries = ForbricRegistries.access();
             if (registries == null) {
                 return java.util.List.of();
             }
-            return registries.lookupOrThrow(net.minecraft.core.registries.Registries.ITEM)
-                            .keySet().stream()
-                            .map(id -> new org.bukkit.NamespacedKey(id.getNamespace(), id.getPath()))
-                            .toList();
+            try {
+                // Reflection bridge: FML-Plugins layer cannot link net.minecraft.* directly. Ask game layer.
+                ClassLoader gameLoader = registries.getClass().getClassLoader();
+                Class<?> resourceKeyClass = Class.forName("net.minecraft.resources.ResourceKey", true, gameLoader);
+                Object itemRegistry = registries.getClass()
+                        .getMethod("lookupOrThrow", resourceKeyClass)
+                        .invoke(registries, Class.forName("net.minecraft.core.registries.Registries", true, gameLoader)
+                                .getField("ITEM").get(null));
+                @SuppressWarnings("unchecked")
+                java.util.Set<Object> keySet = (java.util.Set<Object>) itemRegistry.getClass()
+                        .getMethod("keySet").invoke(itemRegistry);
+                return keySet.stream()
+                        .map(id -> {
+                            try {
+                                String ns = (String) id.getClass().getMethod("getNamespace").invoke(id);
+                                String path = (String) id.getClass().getMethod("getPath").invoke(id);
+                                return new org.bukkit.NamespacedKey(ns, path);
+                            } catch (Exception e) {
+                                return null;
+                            }
+                        })
+                        .filter(java.util.Objects::nonNull)
+                        .toList();
+            } catch (Exception e) {
+                return java.util.List.of();
+            }
         }
 
         @Override
@@ -228,16 +252,35 @@ public final class ForbricRegistryAccess implements RegistryAccess {
             }
             // Whether the item exists is a question for the game's registry, not for a table here:
             // a mod-added item is as real as a vanilla one, and only the game knows it.
-            net.minecraft.core.RegistryAccess registries = ForbricRegistries.access();
+            Object registries = ForbricRegistries.access();
             if (registries == null) {
                 return null;
             }
-            net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.fromNamespaceAndPath(
-                            key.getNamespace(), key.getKey());
-            if (!registries.lookupOrThrow(net.minecraft.core.registries.Registries.ITEM).containsKey(id)) {
+            try {
+                // Build Identifier via reflection to avoid linking net.minecraft.resources.Identifier in FML-Plugins.
+                // Use the game layer's ClassLoader (from registries object) to load Minecraft classes.
+                ClassLoader gameLoader = registries.getClass().getClassLoader();
+                Class<?> identifierClass = Class.forName("net.minecraft.resources.Identifier", true, gameLoader);
+                Object id = identifierClass.getMethod("fromNamespaceAndPath", String.class, String.class)
+                        .invoke(null, key.getNamespace(), key.getKey());
+                
+                Class<?> resourceKeyClass = Class.forName("net.minecraft.resources.ResourceKey", true, gameLoader);
+                Object itemRegistry = registries.getClass()
+                        .getMethod("lookupOrThrow", resourceKeyClass)
+                        .invoke(registries, Class.forName("net.minecraft.core.registries.Registries", true, gameLoader)
+                                .getField("ITEM").get(null));
+                
+                boolean contains = (boolean) itemRegistry.getClass()
+                        .getMethod("containsKey", identifierClass).invoke(itemRegistry, id);
+                if (!contains) {
+                    return null;
+                }
+                // ForbricItemType.of expects an Identifier, but it's loaded in the game layer where Identifier is visible.
+                // Pass the id object; the bridge code in game layer will cast it.
+                return ForbricItemType.of(id);
+            } catch (Exception e) {
                 return null;
             }
-            return ForbricItemType.of(id);
         }
 
         @Override
@@ -305,39 +348,117 @@ public final class ForbricRegistryAccess implements RegistryAccess {
 
         static final ForbricSoundRegistry INSTANCE = new ForbricSoundRegistry();
 
+        /** Set by the first miss, so the evidence is printed once rather than per lookup. */
+        private static final java.util.concurrent.atomic.AtomicBoolean MISS_REPORTED =
+                        new java.util.concurrent.atomic.AtomicBoolean();
+
+        /** Counts entries into {@link #get}, so the first few can be traced. Measurement only. */
+        private static final java.util.concurrent.atomic.AtomicInteger TRACED =
+                        new java.util.concurrent.atomic.AtomicInteger();
+
         private ForbricSoundRegistry() {
         }
 
         /** The game's sound ids, in the order the game keeps them. */
         private java.util.List<org.bukkit.NamespacedKey> keys() {
-            net.minecraft.core.RegistryAccess registries = ForbricRegistries.access();
+            Object registries = ForbricRegistries.access();
             if (registries == null) {
                 return java.util.List.of();
             }
-            return registries.lookupOrThrow(net.minecraft.core.registries.Registries.SOUND_EVENT)
-                            .keySet().stream()
-                            .map(id -> new org.bukkit.NamespacedKey(id.getNamespace(), id.getPath()))
-                            .toList();
+            try {
+                ClassLoader gameLoader = registries.getClass().getClassLoader();
+                Class<?> resourceKeyClass = Class.forName("net.minecraft.resources.ResourceKey", true, gameLoader);
+                Object soundRegistry = registries.getClass()
+                        .getMethod("lookupOrThrow", resourceKeyClass)
+                        .invoke(registries, Class.forName("net.minecraft.core.registries.Registries", true, gameLoader)
+                                .getField("SOUND_EVENT").get(null));
+                @SuppressWarnings("unchecked")
+                java.util.Set<Object> keySet = (java.util.Set<Object>) soundRegistry.getClass()
+                        .getMethod("keySet").invoke(soundRegistry);
+                return keySet.stream()
+                        .map(id -> {
+                            try {
+                                String ns = (String) id.getClass().getMethod("getNamespace").invoke(id);
+                                String path = (String) id.getClass().getMethod("getPath").invoke(id);
+                                return new org.bukkit.NamespacedKey(ns, path);
+                            } catch (Exception e) {
+                                return null;
+                            }
+                        })
+                        .filter(java.util.Objects::nonNull)
+                        .toList();
+            } catch (Exception e) {
+                return java.util.List.of();
+            }
         }
 
         @Override
         public org.bukkit.Sound get(org.bukkit.NamespacedKey key) {
+            // Unconditional trace, first three calls only. This is a measurement, not a fix: the miss branch
+            // below has not been reached in two runs, so the question is whether this method is entered at all
+            // and what it is handed. Removed once the answer is in.
+            if (TRACED.getAndIncrement() < 3) {
+                System.err.println("[NeoFobric/Bukkit] SOUND GET key=" + key
+                        + " registries=" + (ForbricRegistries.access() != null));
+            }
             if (key == null) {
                 return null;
             }
             // Asked of the game, like every other registry here: whether a sound exists is a fact about
             // the running server, and a mod's sound is as real as a vanilla one.
-            net.minecraft.core.RegistryAccess registries = ForbricRegistries.access();
+            Object registries = ForbricRegistries.access();
             if (registries == null) {
                 return null;
             }
-            net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.fromNamespaceAndPath(
-                            key.getNamespace(), key.getKey());
-            if (!registries.lookupOrThrow(net.minecraft.core.registries.Registries.SOUND_EVENT)
-                            .containsKey(id)) {
+            try {
+                // Use the game layer's ClassLoader to load Minecraft classes: Class.forName with no loader
+                // defaults to the caller's loader, which is FML-Plugins (URLClassLoader) and cannot see Minecraft.
+                // The registries object comes from the game layer, so its ClassLoader can resolve game classes.
+                ClassLoader gameLoader = registries.getClass().getClassLoader();
+                Class<?> identifierClass = Class.forName("net.minecraft.resources.Identifier", true, gameLoader);
+                Object id = identifierClass.getMethod("fromNamespaceAndPath", String.class, String.class)
+                        .invoke(null, key.getNamespace(), key.getKey());
+                
+                Class<?> resourceKeyClass = Class.forName("net.minecraft.resources.ResourceKey", true, gameLoader);
+                Object soundRegistry = registries.getClass()
+                        .getMethod("lookupOrThrow", resourceKeyClass)
+                        .invoke(registries, Class.forName("net.minecraft.core.registries.Registries", true, gameLoader)
+                                .getField("SOUND_EVENT").get(null));
+                
+                boolean contains = (boolean) soundRegistry.getClass()
+                        .getMethod("containsKey", identifierClass).invoke(soundRegistry, id);
+                if (!contains) {
+                    // Sound.<clinit> asks for ~2000 hard-coded ids and dies on the first miss, so the first miss is
+                    // worth evidence rather than a silent null.
+                    //
+                    // Written with System.err rather than ForbricLog, and with no format string: this runs from
+                    // inside a static initialiser on whatever thread first touches Sound, and both the logger
+                    // bridge and %-formatting are two more things that can fail there and turn this into a second
+                    // silent miss. Everything below is a plain concatenation for the same reason.
+                    if (MISS_REPORTED.compareAndSet(false, true)) {
+                        var sample = new StringBuilder();
+                        @SuppressWarnings("unchecked")
+                        java.util.Set<Object> allKeys = (java.util.Set<Object>) soundRegistry.getClass()
+                                .getMethod("keySet").invoke(soundRegistry);
+                        allKeys.stream().limit(8).forEach(k -> {
+                            try {
+                                sample.append(' ').append(k);
+                            } catch (Exception ignore) {}
+                        });
+                        System.err.println("[NeoFobric/Bukkit] SOUND MISS id=" + id
+                                + " containsKey=false size=" + allKeys.size()
+                                + " first=" + sample);
+                    }
+                    return null;
+                }
+                return ForbricSound.of(key);
+            } catch (Exception e) {
+                if (TRACED.getAndIncrement() < 2) {
+                    System.err.println("[NeoFobric/Bukkit] SOUND GET reflection failed for key=" + key);
+                    e.printStackTrace(System.err);
+                }
                 return null;
             }
-            return ForbricSound.of(key);
         }
 
         @Override

@@ -7,7 +7,7 @@ import io.papermc.paper.plugin.lifecycle.event.LifecycleEvent;
 import io.papermc.paper.plugin.lifecycle.event.LifecycleEventOwner;
 import io.papermc.paper.plugin.lifecycle.event.handler.LifecycleEventHandler;
 import io.papermc.paper.plugin.lifecycle.event.handler.configuration.MonitorLifecycleEventHandlerConfiguration;
-import org.cn.xiaofan.bukkit.ForbricHandlerConfiguration;
+import net.neoforbrickit.bukkit.ForbricHandlerConfiguration;
 
 /**
  * One lifecycle event type a handler may register against as a monitor.

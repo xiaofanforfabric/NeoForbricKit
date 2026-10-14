@@ -39,6 +39,36 @@ sourceSets {
             srcDirs rootProject.file('src/client/java')
         }
     }
+    // NeoFobric: the Bukkit/Paper plugin bridge.
+    //
+    // It lives in its own source set, and NOT in `main`, for two reasons.
+    //
+    // 1. It has to be compiled by THIS project. The bridge names net.minecraft.*, and this project is
+    //    the only one that has the Minecraft classes — they are not a dependency here but 4839 .java
+    //    files sitting in src/main/java/net/minecraft/. A separate Gradle project would have to depend
+    //    on `:neoforge`, and the compile-time link from main into the bridge would close a cycle.
+    //
+    // 2. Its packages must be owned by exactly ONE FML module. FML builds a JPMS module layer and
+    //    refuses a package two modules claim:
+    //      Module minecraft contains package net.neoforbrickit.bridge.transform,
+    //      module neoforge exports package net.neoforbrickit.bridge.transform to minecraft
+    //    That is what happens when the bridge sits in `main`: the ModModel named "minecraft"
+    //    (`commonMod`, below) packs sourceSets.main into minecraft-server-patched.jar — the `minecraft`
+    //    module — while universalJar packs the same classes again because it excludes net/minecraft/**,
+    //    com/** and mcp/** and nothing else. Keeping the bridge out of `main` keeps `commonMod` clean
+    //    (verified: `:neoforge:jar` contains zero net/neoforbrickit entries), and the explicit
+    //    joinedJar.from(sourceSets.bridge.output) further down puts the classes in universal.jar only.
+    //
+    // The ModModel listing (joinedMod.sourceSet sourceSets.bridge) is NOT what does this — ModModel
+    // only feeds MDG's dev-run classpath. The jar wiring is the joinedJar.from(...) below.
+    bridge {
+        java {
+            srcDirs rootProject.file('projects/bukkitbridge/src/main/java')
+        }
+        resources {
+            srcDirs rootProject.file('projects/bukkitbridge/src/main/resources')
+        }
+    }
 }
 
 java {
@@ -74,11 +104,103 @@ checkJarCompatibility {
 // We don't want to include client in non-client runs,
 // however the name of the ModModel must be minecraft for FML to work.
 // Since we need both mods to be named minecraft we create them manually.
+//
+// NeoFobric: `commonMod` deliberately lists only sourceSets.main. A ModModel only describes what MDG
+// puts on a dev RUN's classpath, so neither model decides what ends up in which jar — but keeping the
+// bridge off `commonMod` documents which files are whose: `commonMod` is the model for the `minecraft`
+// module, and the bridge is not part of it. The actual module split is enforced by the jar wiring:
+// `:neoforge:jar` (sourceSets.main, packed into minecraft-server-patched.jar) carries no bridge
+// classes, and joinedJar.from(sourceSets.bridge.output) puts them in universal.jar — the `neoforge`
+// module. A dedicated server still gets the bridge, because it loads universal.jar.
 ext.commonMod = objects.newInstance(ModModel, "minecraft")
 commonMod.sourceSet sourceSets.main
 ext.joinedMod = objects.newInstance(ModModel, "minecraft")
 joinedMod.sourceSet sourceSets.main
 joinedMod.sourceSet sourceSets.client
+joinedMod.sourceSet sourceSets.bridge
+
+// NeoFobric: the ModModel above only tells MDG which class FOLDERS to put on the dev-run classpath
+// (see ModDevGradle's RunUtils). It does NOT contribute anything to the jars: `joinedJar` is built
+// from `jar` (sourceSets.main) plus `clientJar` (sourceSets.client) and nothing else, so a bridge
+// source set that is merely listed on a ModModel silently never reaches universal.jar. Fold its jar
+// into joinedJar explicitly. universalJar copies joinedJar and only excludes net/minecraft/**, com/**
+// and mcp/** — the bridge is not among them, which is intended: universal.jar is the `neoforge`
+// system mod, so the bridge's packages belong to the `neoforge` JPMS module and are claimed by no
+// other. (That is the whole point of keeping the bridge out of sourceSets.main: `commonMod` packs
+// sourceSets.main into minecraft-server-patched.jar, the `minecraft` module.)
+tasks.named('joinedJar', Jar).configure { joinedJar ->
+    // sourceSets.bridge.output, not a `bridgeJar` task: Gradle registers a Jar task only for `main`
+    // and for source sets backing a named feature. Use the class and resource directories directly.
+    //
+    // The service declarations are filtered OUT here and shipped by :bukkitbridge-services instead.
+    // They have to be off the module layer entirely — see the comment above the ServiceLoader block in
+    // dependencies{} — and leaving them here would put a copy back on it.
+    joinedJar.from(sourceSets.bridge.output) {
+        exclude 'META-INF/services/io.papermc.paper.**'
+        exclude 'META-INF/services/org.bukkit.plugin.PluginLoader'
+    }
+    joinedJar.dependsOn(tasks.named('bridgeClasses'))
+}
+
+// NeoFobric: the same bridge classes again, this time as a jar for FML's Jar-in-Jar.
+//
+// The bridge has to be reachable from TWO loaders, and which one matters depends on who is asking:
+//
+//  * the game layer (TransformingClassLoader, where universal.jar lands) runs the bridge — that is the
+//    loader BridgeBootstrap and every plugin-facing class must come from, and it can see net.minecraft.*;
+//  * the "FML Plugins" layer (a plain URLClassLoader, where JiJ jars land) is the one Paper's own
+//    static initialisers consult, because `ServerBuildInfo.class.getClassLoader()` is that loader —
+//    and it canNOT see net.minecraft.* (measured, not assumed: the diagnostic in BukkitBridgeLauncher
+//    prints "net.minecraft NOT reachable from that loader").
+//
+// ServiceLoader needs the provider CLASS to be loadable from the asking loader, so the classes have to
+// exist there too. They arrive as their own JiJ jar, which also carries the META-INF/services
+// declarations — those must sit in the same jar as the interface for FML's per-package module lookup
+// (ModuleClassLoader.enumerateResources maps META-INF/services to ONE module) to find them.
+//
+// Lazy resolution is what makes this safe: defineClass does not resolve the net.minecraft.* references
+// in the method bodies, so the plugins-layer copy loads and instantiates fine. Calls that do reach
+// Minecraft are answered by the game-layer copy, which is the one the bridge holds a reference to.
+final bridgeJar = tasks.register('bridgeJar', Jar) {
+    it.archiveClassifier.set('bridge')
+    it.destinationDirectory.set(layout.buildDirectory.dir('libs'))
+    it.manifest {
+        // JarJar refuses a local file dependency without one: the module name is what keeps the embed
+        // from colliding with another mod's library of the same filename. Same value the source set's
+        // packages live under, so the FML module and this jar agree on what they are.
+        attributes('Automatic-Module-Name': 'net.neoforbrickit.bukkitbridge')
+    }
+    // The classes AND the declarations, in one jar. They have to travel together: FML's
+    // ModuleClassLoader resolves a resource by mapping its containing package to a single module, and
+    // every service file shares the META-INF/services pseudo-package — so the module that answers is
+    // whichever owns that package, and it can only answer with files it actually contains.
+    it.from(sourceSets.bridge.output)
+    it.dependsOn(tasks.named('bridgeClasses'))
+}
+
+// The bridge goes into META-INF/jarjar/ through JarJar's inputFiles, as a file collection carrying
+// builtBy — the same shape the plugin's own Maven jars take, minus the coordinates we cannot invent.
+//
+// JarJar.configuration(cfg) is NOT usable here: it ends with `dependsOn(cfg)`, and depending on a
+// resolvable Configuration by instance (rather than by name) is rejected while the task is being
+// created — which is exactly when configureEach runs, and when universalJar's dependencies resolve.
+// Feeding inputFiles directly sidesteps that, and the metadata pass reads the file, not a component.
+tasks.withType(net.neoforged.moddevgradle.tasks.JarJar).configureEach { jarJar ->
+    jarJar.inputFiles.from(bridgeJar)
+}
+
+// NeoFobric: the bridge's META-INF/services declarations are deliberately absent from this jar.
+//
+// They ship in their own project (:bukkitbridge-services) and reach the runtime through libraries(...),
+// which puts them on the JVM's -classpath. FML gives every jar its own JPMS module and its
+// ModuleClassLoader resolves a resource by mapping the resource's containing PACKAGE to a single module
+// and reading from that module alone. Every service file shares the META-INF/services pseudo-package, so
+// exactly one module can answer — and the Paper API jar claims it while shipping no service files, which
+// makes ServiceLoader return nothing and Paper's Optional.orElseThrow kill the bridge at Bukkit.setServer.
+// On the -classpath the declarations sit outside the module layer, where ModuleClassLoader's
+// fallbackClassLoader branch — merged with the module-local result — does find them.
+//
+// The classes stay here, in universal.jar, on the game layer: that is what plugins must see.
 
 neoDev {
     mods {
@@ -146,6 +268,31 @@ dependencies {
 
     compileOnly "org.jetbrains:annotations:${project.jetbrains_annotations_version}"
 
+    // NeoFobric: the Bukkit/Paper plugin bridge's dependencies, on the BRIDGE source set's own
+    // configurations (see sourceSets.bridge). Paper's API and the adventure/snakeyaml/bungeecord jars
+    // its signatures name reach the runtime through libraries(...) and the installer's embedded maven
+    // directory; ASM is what BukkitInteractInjector rewrites two game classes with.
+    bridgeCompileOnly('io.papermc.paper:paper-api:26.2.build.133-stable')
+    for (var asmModule : ["org.ow2.asm:asm", "org.ow2.asm:asm-tree", "org.ow2.asm:asm-commons"]) {
+        bridgeCompileOnly(asmModule) {
+            version {
+                strictly project.asm_version
+            }
+        }
+    }
+
+    // The bridge compiles against the patched Minecraft classes and the FML SPI.
+    //
+    // MDG does not put Minecraft on a CONFIGURATION — it adds it to the compileJava TASK's classpath
+    // (see NeoDevPlugin's per-source-set setup). So a hand-made source set cannot inherit it with
+    // extendsFrom; the task's classpath has to be extended instead, in the block below. Only the two
+    // bridge-specific dependencies are declared here.
+    //
+    // Deliberately NOT sourceSets.main.output: that would make compileBridgeJava depend on
+    // :neoforge:classes, and the main compile depends on the bridge's types for nothing (those calls
+    // are reflective — see ServerLifecycleHooks.invokeBukkitHook), so the edge would be a cycle for no
+    // benefit.
+
     userdevCompileOnly jarJar("io.github.llamalad7:mixinextras-neoforge:${project.mixin_extras_version}")
     // NeoFobric: in development, NeoForge loads from class folders, so the JiJ expansion that
     // provides MixinExtras in production installs does not happen. MixinExtras carries an
@@ -181,31 +328,46 @@ dependencies {
     // resolves it from PaperMC's repository, which settings.gradle adds to
     // dependencyResolutionManagement — and NeoDevPlugin collects every repository there into the
     // installer profile's repository list, so the coordinates below resolve on a user's machine too.
-    // Pinned to the version the bridge was written against.
     //
-    // The bridge jar goes through a plain-file artifact, not a project dependency: this configuration
-    // extends `api`, so `project(':bukkitbridge')` would add :bukkitbridge:classes to
-    // :neoforge:compileJava, and :bukkitbridge:compileJava already depends on :neoforge:compileJava
-    // (it compiles against the patched Minecraft classes :neoforge emits) — a cycle. The bridge's
-    // classes are reached reflectively from the server lifecycle (see invokeBukkitHook in
-    // ServerLifecycleHooks), so :neoforge needs no compile-time view of them at all.
-    libraries(project(path: ':bukkitbridge', configuration: 'deployJar'))
-    libraries('io.papermc.paper:paper-api:26.2.build.133-stable')
+    // NeoFobric: these reach the runtime through jarJar, NOT through libraries(...). Both end up on
+    // every classpath the game uses, but they land on DIFFERENT class loaders, and the bridge needs
+    // the game-layer one:
+    //
+    //   libraries(...)  ->  launcherProfileClasspath  ->  the JVM's -classpath  ->  AppClassLoader
+    //   jarJar(...)     ->  META-INF/jarjar/ in universal.jar  ->  FML expands it  ->  the game layer
+    //
+    // Paper's own static initialisers look providers up with
+    //     ServiceLoader.load(ServerBuildInfo.class, ServerBuildInfo.class.getClassLoader())
+    // (ServerBuildInfo$1Holder.<clinit>, and the same shape in RegistryAccess and the rest), which
+    // walks only the class loader that DEFINED the Paper API interface. With paper-api on -classpath
+    // that loader is AppClassLoader, whose classpath is the -classpath argument and nothing else —
+    // universal.jar is not on it, so the bridge's own META-INF/services entries are invisible and
+    // buildInfo() throws NoSuchElementException. Bukkit.setServer() calls getVersionMessage() which
+    // calls buildInfo(), so the whole bridge then fails to start.
+    //
+    // Through jarJar the interface is defined by the game layer, which IS where the bridge lives, so
+    // the lookup finds net.neoforbrickit.bukkit.ForbricServerBuildInfo and its siblings.
+    //
+    // Pinned to the version the bridge was written against.
+    jarJar('io.papermc.paper:paper-api:26.2.build.133-stable')
     // The adventure component library paper-api's signatures name, and snakeyaml (PluginDescriptionFile's
     // static initialiser builds a Loader through it, and Minecraft does not ship it). Resolved from
     // Central, which is already a repository.
-    libraries('org.yaml:snakeyaml:2.2')
-    libraries('net.kyori:adventure-api:5.2.0')
-    libraries('net.kyori:adventure-key:5.2.0')
-    libraries('net.kyori:adventure-text-minimessage:5.2.0')
-    libraries('net.kyori:adventure-text-serializer-gson:5.2.0')
-    libraries('net.kyori:adventure-text-serializer-json:5.2.0')
-    libraries('net.kyori:adventure-text-serializer-legacy:5.2.0')
-    libraries('net.kyori:adventure-text-serializer-plain:5.2.0')
-    libraries('net.kyori:adventure-text-logger-slf4j:5.2.0')
-    libraries('net.kyori:option:1.1.0')
+    jarJar('org.yaml:snakeyaml:2.2')
+    jarJar('net.kyori:adventure-api:5.2.0')
+    jarJar('net.kyori:adventure-key:5.2.0')
+    jarJar('net.kyori:adventure-text-minimessage:5.2.0')
+    jarJar('net.kyori:adventure-text-serializer-gson:5.2.0')
+    jarJar('net.kyori:adventure-text-serializer-json:5.2.0')
+    jarJar('net.kyori:adventure-text-serializer-legacy:5.2.0')
+    jarJar('net.kyori:adventure-text-serializer-plain:5.2.0')
+    jarJar('net.kyori:adventure-text-logger-slf4j:5.2.0')
+    jarJar('net.kyori:option:1.1.0')
     // `+build.N` qualifiers are served by Paper's Maven only; Central answers 404.
-    libraries('net.md-5:bungeecord-chat:1.21-R0.2-deprecated+build.21')
+    jarJar('net.md-5:bungeecord-chat:1.21-R0.2-deprecated+build.21')
+
+    // NeoFobric: the bridge's service declarations are NOT here. They ship inside the bridge's own
+    // JiJ jar so that they sit in the same FML module as the Paper API they name — see bridgeJar below.
 
     // Must be implementation instead of compileOnly so that running dependent projects such as tests will trigger (re)compilation of coremods.
     // (Only needed when compiling through IntelliJ non-delegated builds - otherwise `compileOnly` would work).
@@ -253,6 +415,8 @@ tasks.named('installerJar', Zip).configure {
         into "maven/net/fabricmc/fabric-loader/${fabricLoaderVersion}/"
         rename { String fileName -> "fabric-loader-${fabricLoaderVersion}.jar" }
     }
+    // NeoFobric: the bridge travels as its own JiJ jar (see bridgeJar below), so the installer has
+    // nothing extra to embed for it.
 }
 
 // NeoFobric: the profile tasks list libraries as IdentifiedFiles, whose file inputs do not carry
@@ -265,6 +429,8 @@ tasks.withType(net.neoforged.neodev.installer.CreateLauncherProfile).configureEa
     dependsOn configurations.launcherProfileClasspath
 }
 
+// NeoFobric: the Bukkit bridge jar is in libraries(...) as a bare file (see the comment there for why
+// it cannot be a project dependency — it would close a compile cycle). A bare file carries no task
 // Select runtimeElements rather than universalJar from the main source set
 // If you don't believe it... try to remove this block, and run the following command:
 // gradlew :neoforge:dependencyInsight --configuration clientRuntimeClasspath --dependency net.neoforged:neoforge --scan
@@ -490,6 +656,31 @@ tasks.register('generateFinalizeSpawnTargets', GenerateFinalizeSpawnTargets.clas
 tasks.withType(JavaCompile.class).configureEach {
     // Increase memory used during compilation, to avoid OutOfMemoryErrors
     options.forkOptions.memoryMaximumSize = '2g'
+}
+
+// NeoFobric: the bridge's srcDirs do NOT contain the Minecraft sources.
+//
+// This fork puts the decompiled Minecraft sources INSIDE sourceSets.main: 4839 of the ~5700 .java
+// files compileJava sees are ${rootDir}/projects/neoforge/src/main/java/net/minecraft/**. That is why
+// `main` compiles against net.minecraft.* with no Minecraft jar anywhere on its classpath, and why a
+// hand-made source set whose srcDirs point at the bridge tree alone reports "程序包 net.minecraft.server 不存在".
+//
+// The fix is to compile the bridge against main's OUTPUT (which contains all 7443 Minecraft classes)
+// instead of against main's sources. Pointing srcDirs at the Minecraft source tree would recompile it
+// a second time; taking the compiled output costs nothing and keeps the dependency strictly one-way:
+//
+//   compileBridgeJava  ->  mainClasses        (bridge reads Minecraft + NeoForge API)
+//   (nothing)          ->  bridgeClasses      (main calls the bridge reflectively)
+//
+// That one-way edge is what keeps `commonMod` (the ModModel named "minecraft", built from
+// sourceSets.main) free of the bridge's packages, so they are owned by exactly one FML module.
+tasks.named('compileBridgeJava', JavaCompile).configure { bridgeCompile ->
+    def mainCompile = tasks.named('compileJava', JavaCompile)
+    bridgeCompile.dependsOn mainCompile
+    // Read the configuration-derived classpath (bridgeCompileOnly: paper-api, ASM) BEFORE replacing it:
+    // assigning to `classpath` throws away whatever sourceSets.bridge contributed.
+    def bridgeDeps = bridgeCompile.classpath
+    bridgeCompile.classpath = files(bridgeDeps, sourceSets.main.output, mainCompile.map { it.classpath })
 }
 
 tasks.withType(Javadoc.class).configureEach {

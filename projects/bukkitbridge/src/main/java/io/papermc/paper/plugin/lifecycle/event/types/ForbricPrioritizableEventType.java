@@ -7,7 +7,7 @@ import io.papermc.paper.plugin.lifecycle.event.LifecycleEvent;
 import io.papermc.paper.plugin.lifecycle.event.LifecycleEventOwner;
 import io.papermc.paper.plugin.lifecycle.event.handler.LifecycleEventHandler;
 import io.papermc.paper.plugin.lifecycle.event.handler.configuration.PrioritizedLifecycleEventHandlerConfiguration;
-import org.cn.xiaofan.bukkit.ForbricHandlerConfiguration;
+import net.neoforbrickit.bukkit.ForbricHandlerConfiguration;
 
 /**
  * One lifecycle event type that handlers may register against with a priority.

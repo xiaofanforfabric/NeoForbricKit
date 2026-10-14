@@ -3,7 +3,7 @@
  */
 package io.papermc.paper.command.brigadier.argument;
 
-import org.cn.xiaofan.bukkit.ForbricArgumentTypes;
+import net.neoforbrickit.bukkit.ForbricArgumentTypes;
 
 /**
  * The argument types {@code ArgumentTypes} hands out.

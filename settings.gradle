@@ -84,10 +84,12 @@ project(":tests").projectDir = file("tests")
 include ':fabricbridge'
 project(':fabricbridge').projectDir = file('projects/fabricbridge')
 
-// NeoFobric: bridge subproject that runs Bukkit/Paper plugins on the server. Carried from the
-// Forbric project's kernel (org.cn.xiaofan.bukkit) with only its kernel-side seams adapted.
-include ':bukkitbridge'
-project(':bukkitbridge').projectDir = file('projects/bukkitbridge')
+// NeoFobric: the Bukkit/Paper bridge is NOT a subproject. Its sources live in
+// projects/bukkitbridge/src/main and are compiled into :neoforge's main source set (see the srcDirs
+// in projects/neoforge/build.gradle). A separate project there would have to depend on :neoforge for
+// the net.minecraft.* classes it names, while :neoforge depends on it for the runtime — a cycle that
+// no amount of configuration can remove. The directory keeps the bridge's own README and its COPY /
+// ADAPT account.
 
 include ':testframework'
 include ':coremods'

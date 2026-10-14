@@ -122,11 +122,11 @@ public class ServerLifecycleHooks {
         // the bridge wraps the server every World and Player a plugin asks for is reached through, and
         // before this there is nothing to wrap.
         //
-        // Reached reflectively, on purpose. A direct call would make :neoforge:compileJava depend on
-        // :bukkitbridge:classes, and :bukkitbridge:compileJava already depends on :neoforge:compileJava
-        // (it compiles against the patched Minecraft classes :neoforge emits) — a build cycle. A
-        // reflective call names no bridge type, so it closes nothing; the class is on the runtime
-        // classpath because libraries(...) puts the bridge jar on the launcher profile.
+        // Reflective, and not by choice: the bridge is a separate source set of this project (see
+        // sourceSets.bridge), and the two source sets cannot see each other's symbols — the bridge
+        // compiles against Minecraft, the server lifecycle calls the bridge, and a compile dependency
+        // either way is a cycle Gradle rejects. A string closes neither edge. The class IS on the
+        // runtime classpath: it ships in the universal jar.
         invokeBukkitHook("startBukkitBridge", server);
     }
 
@@ -141,8 +141,8 @@ public class ServerLifecycleHooks {
     public static void handleServerStopped(final MinecraftServer server) {
         // NeoFobric: shut the Bukkit bridge down first, running every plugin's onDisable while the server
         // object is still alive - a plugin that touches a world in onDisable must find one. Reflectively
-        // (see handleServerStarted for why), and guarded because a failure here must not leave the
-        // server's own shutdown half done.
+        // (see handleServerStarted), and guarded because a failure here must not leave the server's own
+        // shutdown half done.
         invokeBukkitHook("stopBukkitBridge", null);
         NeoForge.EVENT_BUS.post(new ServerStoppedEvent(server));
         currentServer = null;
@@ -296,17 +296,16 @@ public class ServerLifecycleHooks {
 
     /**
      * NeoFobric: records the game directory with the Bukkit bridge, so that when the server starts the
-     * bridge knows where {@code plugins} and the Paper-API cache live. Called from CommonModLoader
-     * during registry initialization, reflectively for the same build-cycle reason as
-     * {@link #invokeBukkitHook}.
+     * bridge knows where {@code plugins} and the Paper-API jars live. Called from CommonModLoader during
+     * registry initialization, reflectively for the same build-cycle reason as {@link #invokeBukkitHook}.
      */
     public static void setBukkitBridgeGameDirectory() {
         try {
-            Class<?> launcher = Class.forName("net.forbric.kernel.boot.BukkitBridgeLauncher");
+            Class<?> launcher = Class.forName("net.neoforbrickit.bridge.boot.BukkitBridgeLauncher");
             launcher.getMethod("setGameDirectory", java.nio.file.Path.class)
                     .invoke(null, net.neoforged.fml.loading.FMLPaths.GAMEDIR.get());
         } catch (ClassNotFoundException absent) {
-            // The bridge is not installed. That is not an error.
+            // The bridge is not in this build. That is not an error.
         } catch (Throwable failure) {
             LOGGER.error("[NeoFobric/Bukkit] could not record the game directory with the plugin bridge", failure);
         }
@@ -315,28 +314,46 @@ public class ServerLifecycleHooks {
     /**
      * NeoFobric: calls a static method on the Bukkit bridge without naming the class.
      *
-     * <p>Reflection is not ceremony here — it is what keeps the build acyclic. {@code :neoforge} and
-     * {@code :bukkitbridge} cannot see each other at compile time: the bridge compiles against the
-     * patched Minecraft classes {@code :neoforge} emits, and {@code :neoforge} would have to compile
-     * against the bridge to call it directly. A name in a string closes neither edge; the class is
-     * present at runtime because {@code libraries(...)} puts the bridge jar on the launcher profile.
+     * <p>Reflection is not ceremony here — it is what keeps the build acyclic. The bridge is a separate
+     * source set of this project ({@code sourceSets.bridge}), which exists so that its packages are owned
+     * by exactly one FML module; the two source sets cannot name each other's types, because the bridge
+     * compiles against Minecraft while the server lifecycle calls the bridge, and a compile dependency
+     * either way is a cycle. A method name in a string closes neither edge; the class is present at
+     * runtime because the universal jar carries it.
      *
-     * <p>Never fatal: a missing bridge (the switch is off, or a plain build without the bridge) is the
-     * normal case, and a bridge that throws costs the Bukkit plugins and nothing else.
+     * <p>Never fatal: a build without the bridge (the switch is off) is the normal case, and a bridge
+     * that throws costs the Bukkit plugins and nothing else.
      */
     private static void invokeBukkitHook(String method, Object argument) {
         try {
-            Class<?> hooks = Class.forName("net.forbric.kernel.boot.BukkitBridgeHooks");
-            var target = argument == null
-                    ? hooks.getMethod(method)
-                    : hooks.getMethod(method, net.minecraft.server.MinecraftServer.class);
+            Class<?> hooks = Class.forName("net.neoforbrickit.bridge.boot.BukkitBridgeHooks");
+            java.lang.reflect.Method target;
             if (argument == null) {
+                target = hooks.getMethod(method);
                 target.invoke(null);
             } else {
+                // Do NOT look the method up by an exact parameter type. The bridge deliberately types its
+                // parameter as Object - its javadoc says the facade is the only place the game type is
+                // named - so getMethod(method, MinecraftServer.class) finds nothing and the bridge
+                // silently never starts. Pick the arity-matched overload whose parameter can accept the
+                // argument instead, which also survives the bridge widening or narrowing that type.
+                target = null;
+                for (var candidate : hooks.getMethods()) {
+                    if (!candidate.getName().equals(method) || candidate.getParameterCount() != 1) {
+                        continue;
+                    }
+                    if (candidate.getParameterTypes()[0].isInstance(argument)) {
+                        target = candidate;
+                        break;
+                    }
+                }
+                if (target == null) {
+                    throw new NoSuchMethodException(method + "(" + argument.getClass().getName() + ")");
+                }
                 target.invoke(null, argument);
             }
         } catch (ClassNotFoundException absent) {
-            // The bridge is not installed. That is not an error.
+            // The bridge is not in this build. That is not an error.
         } catch (Throwable failure) {
             Throwable cause = failure instanceof java.lang.reflect.InvocationTargetException wrapped
                     ? wrapped.getCause() : failure;

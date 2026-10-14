@@ -51,15 +51,12 @@ public abstract class CommonModLoader {
         ModLoader.runInitTask("Registry initialization", syncExecutor, periodicTask, () -> {
             // NeoFobric: hand the Bukkit bridge the game directory, so that when the server starts
             // (ServerLifecycleHooks#handleServerStarted) it knows where <gameDir>/plugins and the
-            // Paper-API cache live. Recorded here rather than read back from user.dir: a launcher may
-            // start the process anywhere, and the two differ as soon as it does. The bridge's own jar
-            // and Paper's API are on the classpath from the start (libraries(...) in
-            // projects/neoforge/build.gradle), so there is nothing to append here — unlike Forbric,
-            // whose kernel built its own class loader and appended the downloaded API at boot.
+            // Paper-API jars live. Recorded here rather than read back from user.dir: a launcher may
+            // start the process anywhere, and the two differ as soon as it does.
             //
-            // Reflective, like the lifecycle hooks in ServerLifecycleHooks: a direct call would make
-            // :neoforge:compileJava depend on :bukkitbridge, which already depends on :neoforge. Set
-            // through the same helper so there is one place that knows the class name.
+            // Reflective, like the hooks in ServerLifecycleHooks: the bridge is a separate source set of
+            // this project (sourceSets.bridge) and the two cannot name each other's types without
+            // closing a compile cycle.
             net.neoforged.neoforge.server.ServerLifecycleHooks.setBukkitBridgeGameDirectory();
             // NeoFobric: open the built-in registries before the NewRegistry events fire. A Fabric mod's
             // mixin can reach the built-in registries from inside those events - wover registers its

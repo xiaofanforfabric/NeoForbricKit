@@ -43,9 +43,9 @@ public final class TwoLayerClassLoader extends ClassLoader {
     private final ClassLoader gameLayer;
 
     /**
-     * Public because the boot-side facade ({@code BukkitBridgeHooks}, which shares the API layer with this
-     * class but is compiled before it exists on any classpath) reaches this constructor by reflection.
-     * Not API for plugins: nothing in a plugin jar has business building one of these.
+     * Public because the boot-side facade ({@code BukkitBridgeHooks}) reaches this constructor by reflection,
+     * and that facade exists precisely so it cannot name this class. Not API for plugins: nothing in a plugin
+     * jar has business building one of these.
      */
     public TwoLayerClassLoader(ClassLoader apiLayer, ClassLoader gameLayer) {
         // Parented to the API layer so that JDK classes and anything the API layer delegates upward are
@@ -61,15 +61,30 @@ public final class TwoLayerClassLoader extends ClassLoader {
      * <p>API layer first, game layer second. Neither is asked with {@code resolve} — the caller decides
      * when to link, and passing it through to a {@code ModuleClassLoader} that ignores it would hide a
      * failure to link rather than surface one.
+     *
+     * <p><b>The first failure is caught as {@link Throwable}, not as {@code ClassNotFoundException}.</b> A
+     * layer can fail to supply a class with a {@code NoClassDefFoundError} — an FML {@code ModuleClassLoader}
+     * that owns a package without owning every class in it does exactly that — and a fallback that caught only
+     * the checked exception would refuse to ask the other layer for a class the other layer has. When both
+     * layers fail, both failures are reported: "neither layer has it" and "the first layer broke in a way that
+     * hid the second layer's answer" are different diagnoses and the log must not merge them.
      */
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        Throwable apiFailure = null;
         try {
             return apiLayer.loadClass(name);
-        } catch (ClassNotFoundException notInApi) {
-            // Well-known: io.papermc / org.bukkit / kyori are API-only, net.minecraft / com.mojang are
-            // game-only, so this branch is taken exactly once per name and only for the game half.
+        } catch (Throwable notInApi) {
+            apiFailure = notInApi;
+        }
+        try {
             return gameLayer.loadClass(name);
+        } catch (Throwable notInGame) {
+            if (apiFailure != null) notInGame.addSuppressed(apiFailure);
+            if (notInGame instanceof ClassNotFoundException notFound) throw notFound;
+            if (notInGame instanceof RuntimeException runtime) throw runtime;
+            if (notInGame instanceof Error error) throw error;
+            throw new ClassNotFoundException(name, notInGame);
         }
     }
 
@@ -101,5 +116,15 @@ public final class TwoLayerClassLoader extends ClassLoader {
     public URL getResource(String name) {
         URL fromApi = apiLayer.getResource(name);
         return fromApi != null ? fromApi : gameLayer.getResource(name);
+    }
+
+    /**
+     * Names both layers, so a log line that prints a plugin's parent says which loaders are behind it instead
+     * of {@code TwoLayerClassLoader@1a2b3c}. Which layers those are is the whole question when a plugin cannot
+     * link a class, and the default {@code toString} answers none of it.
+     */
+    @Override
+    public String toString() {
+        return "TwoLayerClassLoader[api=" + apiLayer + ", game=" + gameLayer + "]";
     }
 }

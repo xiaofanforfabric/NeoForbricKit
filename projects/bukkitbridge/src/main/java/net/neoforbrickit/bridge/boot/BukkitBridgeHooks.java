@@ -56,7 +56,14 @@ public final class BukkitBridgeHooks {
         }
         try {
             Path gameDir = BukkitBridgeLauncher.gameDirectory();
-            handle = BukkitBridgeLauncher.start(pluginParentLoader(), gameDir, server);
+            // Two loaders, kept apart on purpose. The bridge's OWN classes stay on the layer that carries the
+            // game: its statics are reachable from the call sites the transformer injects into the game's
+            // classes, and those resolve through THAT loader — a second copy of the bridge would split them.
+            // Only the PLUGINS get the layer pair: the API they were compiled against, plus the game they run
+            // on, because under FML neither layer can see the other.
+            ClassLoader bridgeLayer = BukkitBridgeHooks.class.getClassLoader();
+            ClassLoader pluginParent = pluginParentLoader(bridgeLayer);
+            handle = BukkitBridgeLauncher.start(bridgeLayer, pluginParent, gameDir, server);
             if (handle == null) {
                 ForbricLog.debug("[NeoFobric/Bukkit] the bridge did not start; Bukkit plugins stay unloaded");
             }
@@ -67,55 +74,132 @@ public final class BukkitBridgeHooks {
     }
 
     /**
-     * The loader every plugin is parented to: the one that carries the patched game classes AND the
-     * Bukkit API, so a plugin sees the same {@code net.minecraft.*} and {@code org.bukkit.*} the bridge
-     * does (and, because it is the game layer, shares the registries, the server and every static the
-     * game keeps there).
+     * The loader every plugin is parented to: whichever pair of layers between them carries paper-api and the
+     * patched game.
      *
-     * <p><b>Resolved through FML on every call, never captured at class-init.</b> This is the lesson the
-     * Fabric bridge learned the hard way (see {@code BridgedLauncher#targetClassLoader}): FML swaps
-     * {@code FMLLoader.currentClassLoader} as it boots, and a value read once - even as a static
-     * initialiser - can be a loader that was correct at the time and is not the game layer by the time
-     * plugins load. Querying FML gives whatever is current, which by server-start is the game layer.
+     * <p><b>Which layer is which is asked, not assumed.</b> The measurement is
+     * {@code io.papermc.paper.ServerBuildInfo}'s own class loader, and it is NOT this class's loader: the run
+     * this replaces printed {@code ServerBuildInfo defined by java.net.URLClassLoader@66eb985d} next to
+     * {@code bridge defined by ...TransformingClassLoader@6ce90bc5}. Assuming the two were the same made
+     * {@code apiLayer == gameLayer}, skipped the two-layer parent below, and handed the plugins the game layer
+     * alone — which is exactly the loader that cannot supply
+     * {@code io.papermc.paper.plugin.lifecycle.event.types.LifecycleEventType}, the NoClassDefFoundError that
+     * left every plugin unloaded.
      *
-     * <p>Falls back to this class's own loader when FML cannot be reached (a unit test, or the bridge
-     * loaded standalone): that loader is where this class came from, so it is at worst as narrow as the
-     * original choice and still sees {@code org.bukkit}.
+     * <p><b>Resolved through FML on every call, never captured at class-init.</b> FML swaps
+     * {@code FMLLoader.currentClassLoader} as it boots, and a value read once can be a loader that was correct
+     * at the time and is not the game layer by the time plugins load.
+     *
+     * @param bridgeLayer the loader that defined this class, and the one the bridge's own classes execute from
+     * @return the plugins' parent: a two-layer loader when the two halves live in different layers, the game
+     *         layer alone when one layer carries both, and never a silent downgrade to one layer when the pair
+     *         cannot be built
      */
-    private static ClassLoader pluginParentLoader() {
-        ClassLoader apiLayer = BukkitBridgeHooks.class.getClassLoader();
+    private static ClassLoader pluginParentLoader(ClassLoader bridgeLayer) {
+        ClassLoader gameLayer = fmlGameLayer();
+        ClassLoader apiLayer = apiLayerLoader(gameLayer != null ? gameLayer : bridgeLayer);
+
+        // Unconditional, and the three loaders are the whole diagnosis of this seam: which layer has the API,
+        // which has the game, and which defined the bridge are exactly the facts a class-loading failure is
+        // read against — and none of them is visible from a stack trace.
+        ForbricLog.info("[NeoFobric/Bukkit] plugin parent: bridge=%s api=%s game=%s",
+                bridgeLayer, apiLayer, gameLayer);
+
+        if (gameLayer == null) {
+            // Not on FML (a unit test, or the bridge loaded standalone): there is only one layer, and it is
+            // whichever one defined the API classes.
+            return apiLayer != null ? apiLayer : bridgeLayer;
+        }
+        if (apiLayer == null || apiLayer == gameLayer) {
+            ForbricLog.info("[NeoFobric/Bukkit] one layer carries both halves; plugins are parented to it alone");
+            return gameLayer;
+        }
+        try {
+            // Both layers, because neither reaches the other: the API layer has no net.minecraft.*, and the
+            // game layer has no io.papermc.* — paper-api ships as a Jar-in-Jar and loads on FML's
+            // "FML Plugins" layer. Built reflectively because the class lives in the bridge proper, which
+            // boot-side code cannot name.
+            return newTwoLayerLoader(apiLayer, gameLayer, bridgeLayer);
+        } catch (Throwable failed) {
+            // Never silent. Falling back to one layer reproduces the NoClassDefFoundError the pair exists to
+            // prevent, and swallowing the reason here made that indistinguishable from "the pair was never
+            // needed" — which is how this bug stayed hidden behind a working-looking startup log.
+            ForbricLog.warn("[NeoFobric/Bukkit] could not build the two-layer plugin parent (%s); plugins get %s "
+                    + "alone and any plugin naming io.papermc.* will fail", String.valueOf(failed), gameLayer);
+            return gameLayer;
+        }
+    }
+
+    /**
+     * The loader that actually DEFINES paper-api's classes, asked of an API class rather than assumed from this
+     * class's own loader — see {@link #pluginParentLoader(ClassLoader)} for why those two differ.
+     *
+     * <p>Several probes, because which API class is reachable first is not guaranteed; any one of them answers
+     * the only question asked here, which is which loader owns the API.
+     */
+    private static ClassLoader apiLayerLoader(ClassLoader lookup) {
+        for (String probe : new String[] {
+                "io.papermc.paper.ServerBuildInfo",
+                "org.bukkit.Bukkit",
+                "net.kyori.adventure.text.Component" }) {
+            try {
+                ClassLoader owner = Class.forName(probe, false, lookup).getClassLoader();
+                if (owner != null) return owner;
+            } catch (Throwable notHere) {
+                // Try the next probe: a bridge with none of them has no API to reach at all.
+            }
+        }
+        return null;
+    }
+
+    /** FML's current loader — the game layer by server-start — or null when this is not running under FML. */
+    private static ClassLoader fmlGameLayer() {
         try {
             var fmlloader = Class.forName("net.neoforged.fml.loading.FMLLoader");
             var current = fmlloader.getMethod("getCurrent").invoke(null);
             var loader = current.getClass().getMethod("getCurrentClassLoader").invoke(current);
-            if (loader instanceof ClassLoader gameLayer && gameLayer != apiLayer) {
-                // Both layers, because a plugin needs classes from both and neither can see the other.
-                // The API layer alone has no net.minecraft.*; the game layer alone has no io.papermc.*,
-                // because this bridge now ships as a Jar-in-Jar and therefore loads on the "FML Plugins"
-                // layer rather than the game layer. See TwoLayerClassLoader.
-                //
-                // Built reflectively because the class lives in the bridge proper, which is on apiLayer
-                // and cannot be named from boot-side code.
-                return newTwoLayerLoader(apiLayer, gameLayer);
-            }
+            return loader instanceof ClassLoader gameLayer ? gameLayer : null;
         } catch (Throwable unreachable) {
-            // Not on FML (tests / standalone): fall through to the API layer.
+            return null;
         }
-        return apiLayer;
     }
 
     /**
      * Builds the two-layer parent through the bridge's own class, by name.
      *
-     * <p>Reflection, not ceremony: this file is boot-side and is loaded by the same layer as the API, so
-     * it cannot name {@code net.neoforbrickit.bukkit.TwoLayerClassLoader} without that class being on the
-     * boot classpath too. Its constructor is package-private for that reason — this call is the only
-     * entrance, and its shape is pinned by the two-argument signature below.
+     * <p>Reflection, not ceremony: this file is boot-side and cannot name
+     * {@code net.neoforbrickit.bukkit.TwoLayerClassLoader} without that class being on the boot classpath too.
+     *
+     * <p>The lookup is tried on more than one layer, because one package's classes are not guaranteed to
+     * resolve from a single one of them: the run this replaces had {@code net.neoforbrickit.bukkit.*} answered
+     * by the API layer while {@code net.neoforbrickit.bridge.boot.*} came from the game layer. Picking a layer
+     * and hoping is what made the pair silently unavailable; trying each, and failing loudly when none has it,
+     * cannot end that way.
      */
-    private static ClassLoader newTwoLayerLoader(ClassLoader apiLayer, ClassLoader gameLayer) throws Exception {
-        Class<?> loaderClass = Class.forName("net.neoforbrickit.bukkit.TwoLayerClassLoader", true, apiLayer);
+    private static ClassLoader newTwoLayerLoader(ClassLoader apiLayer, ClassLoader gameLayer, ClassLoader bridgeLayer)
+            throws Exception {
+        String name = "net.neoforbrickit.bukkit.TwoLayerClassLoader";
+        Class<?> loaderClass = null;
+        Throwable lastFailure = null;
+        for (ClassLoader candidate : new ClassLoader[] { apiLayer, bridgeLayer, gameLayer }) {
+            if (candidate == null) continue;
+            try {
+                loaderClass = Class.forName(name, true, candidate);
+                break;
+            } catch (Throwable notHere) {
+                lastFailure = notHere;
+            }
+        }
+        if (loaderClass == null) {
+            throw new ClassNotFoundException(name, lastFailure);
+        }
         var constructor = loaderClass.getDeclaredConstructor(ClassLoader.class, ClassLoader.class);
-        constructor.setAccessible(true);
+        try {
+            constructor.setAccessible(true);
+        } catch (Throwable notPermitted) {
+            // A public constructor in an open package needs no flag; a layer that refuses the flag would
+            // otherwise make this look like a missing class.
+        }
         return (ClassLoader) constructor.newInstance(apiLayer, gameLayer);
     }
 

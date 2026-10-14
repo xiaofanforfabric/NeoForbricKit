@@ -174,8 +174,13 @@ public final class BridgeBootstrap {
 				server.enablePlugin(handle);
 				logger.info("enabled " + handle.description().getFullName() + " from " + jar.getFileName());
 			} catch (IOException | InvalidDescriptionException | ReflectiveOperationException
-					| RuntimeException failure) {
-				// One jar's problem stays that jar's. The next one may be the one the user cares about.
+					| RuntimeException | Error failure) {
+				// Error as well as Exception, and the Error case is the one this loop was missing: a plugin whose
+				// main class names a class its parent loader cannot supply fails with NoClassDefFoundError, and an
+				// Error escaping this loop takes the WHOLE bridge down — the launcher then reports "the plugin
+				// bridge could not start", and the plugins enabled before this jar are abandoned: never disabled,
+				// with their commands left in the dispatcher. One jar's problem stays that jar's, whatever kind of
+				// problem it is, and the next jar may be the one the user actually cares about.
 				logger.log(Level.SEVERE, "could not load " + jar.getFileName() + ": " + failure, failure);
 			}		}
 

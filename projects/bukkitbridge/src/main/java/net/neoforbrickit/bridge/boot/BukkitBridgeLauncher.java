@@ -113,12 +113,19 @@ public final class BukkitBridgeLauncher {
 	/**
 	 * Starts the bridge against {@code gameDir}, loading plugins from the {@code plugins} folder beside it.
 	 *
-	 * @param loader   the game-side loader, which must already own the API jars and the bridge jar
-	 * @param gameDir  the game directory; plugins live in {@code <gameDir>/plugins} and the API cache in
-	 *                 {@code <gameDir>/.neofobric/}
+	 * @param bridgeLoader the loader the bridge's OWN classes are defined by — the game layer. Kept apart from
+	 *                     {@code pluginParent} on purpose: the bridge's statics (its interact hook, its
+	 *                     registries) are reachable from the call sites the transformer injects into the game's
+	 *                     classes, and those call sites resolve through THIS loader. Loading the bridge into the
+	 *                     layer pair as well would give the game a second copy of those statics.
+	 * @param pluginParent the loader the PLUGINS are parented to. Not the same thing: a plugin needs paper-api
+	 *                     and the patched game, which under FML are siblings, so this is usually a two-layer
+	 *                     loader rather than either one alone. See {@code TwoLayerClassLoader}.
+	 * @param gameDir      the game directory; plugins live in {@code <gameDir>/plugins} and the API cache in
+	 *                     {@code <gameDir>/.neofobric/}
 	 * @return an opaque handle to keep alive for the life of the server, or {@code null} if the bridge did not start
 	 */
-	public static Object start(ClassLoader loader, Path gameDir, Object server) {
+	public static Object start(ClassLoader bridgeLoader, ClassLoader pluginParent, Path gameDir, Object server) {
 		try {
 			// Diagnose the service lookup before touching the API. Paper's providers are found by
 			// `ServiceLoader.load(iface, iface.getClassLoader())` from inside Paper's own static
@@ -126,12 +133,14 @@ public final class BukkitBridgeLauncher {
 			// which loaders can see the declaration and the provider class — have each been wrong once.
 			// Printing all three makes the next reading conclusive instead of inferred.
 			diagnoseServiceLoader();
-			Class<?> runtime = Class.forName(ENTRY, true, loader);
+			Class<?> runtime = Class.forName(ENTRY, true, bridgeLoader);
 			// Four arguments now: the bridge wraps the running server, and a bridge that cannot see one
 			// can answer no world and no player. Passed as Object because this is boot-side code and must
 			// not name a game type; the bridge narrows it and refuses by name if handed something else.
+			// The ClassLoader argument is the PLUGIN parent, which is deliberately not the loader the
+			// bridge itself was loaded from — see the parameters above.
 			Method start = runtime.getMethod("start", Path.class, Path.class, ClassLoader.class, Object.class);
-			Object handle = start.invoke(null, gameDir.resolve("plugins"), gameDir, loader, server);
+			Object handle = start.invoke(null, gameDir.resolve("plugins"), gameDir, pluginParent, server);
 			ForbricLog.info("[NeoFobric/Bukkit] plugin bridge started (plugins: %s)", gameDir.resolve("plugins"));
 			return handle;
 		} catch (ClassNotFoundException absent) {

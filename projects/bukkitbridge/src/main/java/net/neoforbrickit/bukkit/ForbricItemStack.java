@@ -427,11 +427,19 @@ final class ForbricItemStack extends org.bukkit.inventory.ItemStack {
 
         Integer maxDamage = stack.get(net.minecraft.core.component.DataComponents.MAX_DAMAGE);
         Integer damage = stack.get(net.minecraft.core.component.DataComponents.DAMAGE);
-        if (maxDamage != null || damage != null) {
-            return new ForbricDamageableMeta(name, lore, container, 0, null,
-                            damage == null ? 0 : damage, damage != null, maxDamage);
-        }
-        return new ForbricItemMeta(name, lore, container, 0, null);
+        ForbricItemMeta meta = maxDamage != null || damage != null
+                        ? new ForbricDamageableMeta(name, lore, container, 0, null,
+                                        damage == null ? 0 : damage, damage != null, maxDamage)
+                        : new ForbricItemMeta(name, lore, container, 0, null);
+        // Custom model data and unbreakable, read into the snapshot the same way the name and the lore are;
+        // setItemMeta writes them back. A plugin that sets one and reads it before writing must see what it
+        // set, which is the snapshot rule this class documents at length.
+        net.minecraft.world.item.component.CustomModelData modelData =
+                        stack.get(net.minecraft.core.component.DataComponents.CUSTOM_MODEL_DATA);
+        meta.readCustomModelData(modelData == null || modelData.floats().isEmpty()
+                        ? null : Math.round(modelData.floats().getFirst()));
+        meta.readUnbreakable(stack.get(net.minecraft.core.component.DataComponents.UNBREAKABLE) != null);
+        return meta;
     }
 
     /**
@@ -485,6 +493,16 @@ final class ForbricItemStack extends org.bukkit.inventory.ItemStack {
         // that replaced the whole meta rather than editing the one it was given consistent.
         stack.set(net.minecraft.core.component.DataComponents.CUSTOM_DATA,
                         net.minecraft.world.item.component.CustomData.of(meta.container().tag()));
+
+        // Custom model data and unbreakable, the two components behind the legacy ItemMeta accessors. Both
+        // are cleared when the snapshot says "not set", so removing them takes effect the same way.
+        Integer modelData = meta.customModelDataSnapshot();
+        stack.set(net.minecraft.core.component.DataComponents.CUSTOM_MODEL_DATA,
+                        modelData == null ? null : new net.minecraft.world.item.component.CustomModelData(
+                                        java.util.List.of((float) modelData), java.util.List.of(),
+                                        java.util.List.of(), java.util.List.of()));
+        stack.set(net.minecraft.core.component.DataComponents.UNBREAKABLE,
+                        meta.unbreakableSnapshot() ? net.minecraft.util.Unit.INSTANCE : null);
 
         if (meta instanceof ForbricDamageableMeta damageable) {
             stack.set(net.minecraft.core.component.DataComponents.DAMAGE, damageable.getDamage());

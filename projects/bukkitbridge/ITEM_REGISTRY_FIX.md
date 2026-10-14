@@ -71,4 +71,52 @@ OK   stack.setItemMeta(meta) / asOne() / clone() / getMaxStackSize() / isSimilar
 | `Server.createInventory()` | `ServerImpl.notYet` | 打开 GUI 菜单 |
 | `ItemStack.serialize()/deserializeBytes()` | `ForbricItemCodec` | 跨层 `NoClassDefFoundError: net/minecraft/core/RegistryAccess` —— 与本次同一个病根，需要同样的"游戏层半身"处理 |
 
-**关于 `ForbricItemMeta`**：文件头写着 `*** GENERATED FILE — DO NOT EDIT ***`，由 `tools/gen_stub.py` + `tools/stubs/ForbricItemMeta.table` 生成，而这两个文件都不在仓库里（`.gitignore` 忽略 `*.py` 与 `/tools/*`）。所以 `setCustomModelData` 这类新增应当加进那张表再重新生成，否则下次生成会把就地修改冲掉。
+**关于 `ForbricItemMeta`**：文件头写着 `*** GENERATED FILE — DO NOT EDIT ***`，由 `tools/gen_stub.py` + `tools/stubs/ForbricItemMeta.table` 生成，而这两个文件都不在仓库里（`.gitignore` 忽略 `*.py` 与 `/tools/*`）。
+
+## 第二轮：`setCustomModelData` / `setUnbreakable`
+
+第一轮修好注册表后再跑探针，"造自定义物品"的常见写法仍然炸在：
+
+```
+FAIL meta.setCustomModelData(1)
+  java.lang.UnsupportedOperationException: [Forbric/Bukkit] ItemMeta.setCustomModelData() is not implemented by this bridge yet
+FAIL ItemStack.of(...).editMeta(meta -> ...)      ← 同一个原因，Paper 的 editMeta 内部就调它
+FAIL inventory.setItem(0, stack)                  ← 同上（探针在 lambda 里设了 CMD）
+```
+
+自定义贴图物品正是靠 custom model data，所以这一条不补，插件的给物品命令还是过不去。按选定的方案**就地修改生成文件**（改动点见下）：
+
+| 位置 | 改动 |
+|---|---|
+| `ForbricItemMeta`（字段 + 快照读写） | 新增 `customModelData`（`Integer`，null = 无该组件）与 `unbreakable`（`boolean`）；四个包内方法 `readCustomModelData/readUnbreakable/customModelDataSnapshot/unbreakableSnapshot` |
+| `ForbricItemMeta.has/get/setCustomModelData` | 传统整数 API。`get` 在未设置时按 Bukkit 契约抛 `IllegalStateException`；`set(null)` 清除。`getCustomModelDataComponent`/`setCustomModelDataComponent`（Paper 新的浮点/字符串组件 API）仍是 `notYet` |
+| `ForbricItemMeta.is/setUnbreakable` | 直接读写快照 |
+| `ForbricItemStack.getItemMeta()` | 读 `CUSTOM_MODEL_DATA`（取 `floats` 首位 ↔ 传统整数，与 Paper 自身实现一致）与 `UNBREAKABLE`（组件存在 ↔ true） |
+| `ForbricItemStack.setItemMeta()` | 写回两者；快照为"未设置"时把组件清成 null |
+
+**需要回填到生成表**（`tools/stubs/ForbricItemMeta.table`，本仓库没有）：`has/get/setCustomModelData`、`is/setUnbreakable` 这五个方法要标记为"手写实现"，并附上上面新增的字段与快照方法；否则下次重新生成会把它们变回 `notYet`。
+
+验证（实机，同一个物品上写入再回读）：
+
+```
+OK  meta.setCustomModelData(1) -> String set
+OK  meta.setUnbreakable(true)  -> String set
+OK  read.hasCustomModelData()  -> Boolean true
+OK  read.getCustomModelData()  -> Integer 1
+OK  read.isUnbreakable()       -> Boolean true
+OK  read.hasDisplayName()      -> Boolean true
+OK  read pdc get(probe:key)    -> String v
+OK  ItemStack.of(...).editMeta(meta -> ...) -> Boolean true
+```
+
+至此"造自定义物品"这条链路（Material → ItemType → ItemStack → meta 名称/CMD/不可破坏/PDC → 写回）是通的。
+
+## 仍然没实现（下一轮）
+
+| 缺失 | 位置 | 备注 |
+|---|---|---|
+| `Server.getItemFactory()`、`Server.createInventory()` | `ServerImpl.notYet` | `Bukkit.getItemFactory().createItemStack("...")`、打开 GUI 都走这里 |
+| `ItemStack.serialize()/deserializeBytes()` | `ForbricItemCodec` + `ForbricItemStack.componentNotYet` | `serialize` 明说"needs the Bukkit-to-game component mapping"；`deserializeBytes` 是跨层 `NoClassDefFoundError: net/minecraft/core/RegistryAccess` |
+| `ItemMeta` 的组件式 CMD（`get/setCustomModelDataComponent`） | `ForbricItemMeta` | Paper 新 API，浮点/字符串/颜色 |
+
+**`ForbricItemCodec` 那条的诊断**：整个类在 **FML Plugins 层**被加载（调用链 `Paper ItemStack.deserializeBytes → ForbricApiBridge.deserializeItem → ForbricItemCodec.decode → buffer`），而它的方法体需要 `net.minecraft.network.RegistryFriendlyByteBuf` / `RegistryAccess`；类能加载（解析是懒的），一执行 `buffer()` 就 `NoClassDefFoundError`。修法与本次相同：API 层的入口（`ForbricApiBridge` 的物品读写入口）要转发给游戏层的半身，是下一轮的工作量。

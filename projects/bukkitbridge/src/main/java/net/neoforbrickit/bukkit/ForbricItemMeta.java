@@ -66,6 +66,17 @@ class ForbricItemMeta implements org.bukkit.inventory.meta.ItemMeta {
     /** The item's plain-text name, kept separately because the API exposes both spellings. */
     private String itemName;
 
+    /**
+     * Paper's legacy integer custom model data, or null when the item has none.
+     *
+     * <p>The game keeps this as {@code minecraft:custom_model_data} — a record of four lists — and the
+     * legacy integer API is its first float, which is the mapping Paper's own server uses.
+     */
+    private Integer customModelData;
+
+    /** Whether the item refuses damage, from the game's {@code minecraft:unbreakable} component. */
+    private boolean unbreakable;
+
     ForbricItemMeta(net.kyori.adventure.text.Component displayName,
             java.util.List<net.kyori.adventure.text.Component> lore,
             ForbricPersistentDataContainer persistentData, int version, String itemName) {
@@ -91,6 +102,26 @@ class ForbricItemMeta implements org.bukkit.inventory.meta.ItemMeta {
     /** The container itself, which is shared with the item rather than copied. */
     ForbricPersistentDataContainer container() {
         return persistentData;
+    }
+
+    /** Records the custom model data read from the item; null means the component is absent. */
+    void readCustomModelData(Integer value) {
+        this.customModelData = value;
+    }
+
+    /** Records whether the item is unbreakable, as read from the item. */
+    void readUnbreakable(boolean value) {
+        this.unbreakable = value;
+    }
+
+    /** The snapshot's custom model data, for {@code ForbricItemStack.setItemMeta} to write back. */
+    Integer customModelDataSnapshot() {
+        return customModelData;
+    }
+
+    /** The snapshot's unbreakable flag, for {@code ForbricItemStack.setItemMeta} to write back. */
+    boolean unbreakableSnapshot() {
+        return unbreakable;
     }
 
     private static UnsupportedOperationException notYet(String what) {
@@ -348,12 +379,16 @@ class ForbricItemMeta implements org.bukkit.inventory.meta.ItemMeta {
 
 	@Override
 	public boolean hasCustomModelData() {
-		throw notYet("hasCustomModelData");
+		return customModelData != null;
 	}
 
 	@Override
 	public int getCustomModelData() {
-		throw notYet("getCustomModelData");
+		if (customModelData == null) {
+			// Bukkit's contract: reading a value that was never set is an error, not a zero.
+			throw new IllegalStateException("[Forbric/Bukkit] this item has no custom model data");
+		}
+		return customModelData;
 	}
 
 	@Override
@@ -363,7 +398,8 @@ class ForbricItemMeta implements org.bukkit.inventory.meta.ItemMeta {
 
 	@Override
 	public void setCustomModelData(java.lang.Integer arg0) {
-		throw notYet("setCustomModelData");
+		// Null clears it, which is what the API documents.
+		this.customModelData = arg0;
 	}
 
 	@Override
@@ -493,12 +529,12 @@ class ForbricItemMeta implements org.bukkit.inventory.meta.ItemMeta {
 
 	@Override
 	public boolean isUnbreakable() {
-		throw notYet("isUnbreakable");
+		return unbreakable;
 	}
 
 	@Override
 	public void setUnbreakable(boolean arg0) {
-		throw notYet("setUnbreakable");
+		this.unbreakable = arg0;
 	}
 
 	@Override

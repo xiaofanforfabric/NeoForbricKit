@@ -174,9 +174,15 @@ final class ForbricPlayer implements org.bukkit.entity.Player {
         @Override
         public org.bukkit.Location getEyeLocation() {
                 net.minecraft.world.phys.Vec3 eye = player.getEyePosition();
-                return new org.bukkit.Location(ForbricWorld.of(player.level(), server),
+                org.bukkit.Location answer = new org.bukkit.Location(
+                                ForbricWorld.of(player.level(), server),
                                 eye.x(), eye.y(), eye.z(),
                                 player.getYRot(), player.getXRot());
+                net.neoforbrickit.bridge.util.ForbricLog.debug(
+                        "[Forbric/Bukkit] getEyeLocation gameYRot=%s gameXRot=%s -> locYaw=%s locPitch=%s dir=%s",
+                        player.getYRot(), player.getXRot(), answer.getYaw(), answer.getPitch(),
+                        answer.getDirection());
+                return answer;
         }
 
         /** The server this player is on. */

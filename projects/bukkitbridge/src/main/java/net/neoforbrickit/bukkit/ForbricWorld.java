@@ -239,14 +239,25 @@ final class ForbricWorld implements org.bukkit.World {
 				position.x(), position.y(), position.z());
 		net.minecraft.world.phys.Vec3 to = from.add(
 				direction.getX() * maxDistance, direction.getY() * maxDistance, direction.getZ() * maxDistance);
+		// Diagnostic for "the ray does not reach" reports. Three causes look identical from the caller:
+		// a short maxDistance, a direction that is not unit length (so scaling it does not give the
+		// range), and a clip that stops early. Printing both ends tells them apart in one run.
+		net.neoforbrickit.bridge.util.ForbricLog.debug(
+				"[Forbric/Bukkit] rayTraceBlocks from=%s to=%s maxDistance=%s dirLen=%s",
+				from, to, maxDistance, direction.length());
 		net.minecraft.world.level.ClipContext context = new net.minecraft.world.level.ClipContext(from, to,
 				ignorePassableBlocks ? net.minecraft.world.level.ClipContext.Block.OUTLINE
 						: net.minecraft.world.level.ClipContext.Block.COLLIDER,
 				clipFluid(fluidMode), net.minecraft.world.phys.shapes.CollisionContext.empty());
 		net.minecraft.world.phys.BlockHitResult hit = level.clip(context);
 		if (hit.getType() != net.minecraft.world.phys.HitResult.Type.BLOCK) {
+			net.neoforbrickit.bridge.util.ForbricLog.debug(
+					"[Forbric/Bukkit] rayTraceBlocks MISS (clip found no block in that segment)");
 			return null;
 		}
+		net.neoforbrickit.bridge.util.ForbricLog.debug(
+				"[Forbric/Bukkit] rayTraceBlocks HIT pos=%s distanceFromOrigin=%s",
+				hit.getBlockPos(), hit.getLocation().distanceTo(from));
 		net.minecraft.core.BlockPos pos = hit.getBlockPos();
 		org.bukkit.block.Block block = ForbricBlock.at(this, pos.getX(), pos.getY(), pos.getZ());
 		if (filter != null && !filter.test(block)) {

@@ -13,6 +13,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
 
+import net.neoforbrickit.bridge.util.ForbricLog;
+
 import org.bukkit.plugin.InvalidDescriptionException;
 
 /**
@@ -182,9 +184,13 @@ public final class BridgeBootstrap {
 				// with their commands left in the dispatcher. One jar's problem stays that jar's, whatever kind of
 				// problem it is, and the next jar may be the one the user actually cares about.
 				logger.log(Level.SEVERE, "could not load " + jar.getFileName() + ": " + failure, failure);
+				// And through ForbricLog, because `logger` above is a java.util.logging logger whose
+				// ConsoleHandler writes to System.err: an operator reading logs/latest.log never saw this
+				// line, which is the one that says which jar failed and why.
+				ForbricLog.error("[Forbric/Bukkit] could not load " + jar.getFileName(), failure);
 			}		}
 
-		logger.info("bridge ready: " + loaded.size() + " plugin(s) enabled");
+		ForbricLog.info("[Forbric/Bukkit] bridge ready: %s plugin(s) enabled", loaded.size());
 	}
 
 	/** Disables every plugin, in reverse enable order. */

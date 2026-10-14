@@ -20,14 +20,19 @@ import java.util.UUID;
  * the game has. Inventing a UUID here would let a plugin key a map by it and quietly lose the entry on the next
  * call.
  */
-final class ForbricCommandSender implements org.bukkit.command.CommandSender {
+class ForbricCommandSender implements org.bukkit.command.CommandSender {
 
     private final net.minecraft.commands.CommandSourceStack nms;
     private final ServerImpl server;
     /** The player behind this sender, or null for the console and other non-player sources. */
     private final net.minecraft.server.level.ServerPlayer player;
 
-    private ForbricCommandSender(net.minecraft.commands.CommandSourceStack nms, ServerImpl server,
+    /**
+     * Package-private, and the class no longer final, for one reason: {@link ForbricConsoleSender} is this class
+     * plus Bukkit's {@code ConsoleCommandSender} marker, so that {@code Bukkit.getConsoleSender()} answers with
+     * the type plugins actually test for.
+     */
+    ForbricCommandSender(net.minecraft.commands.CommandSourceStack nms, ServerImpl server,
                     net.minecraft.server.level.ServerPlayer player) {
         this.nms = nms;
         this.server = server;

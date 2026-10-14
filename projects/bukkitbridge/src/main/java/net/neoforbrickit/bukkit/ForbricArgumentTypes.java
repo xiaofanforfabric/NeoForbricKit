@@ -63,16 +63,47 @@ public final class ForbricArgumentTypes {
      * against the second server.
      */
     public static void install(ServerImpl server) {
-        instance = new ForbricArgumentTypes(server);
+        ForbricArgumentTypes created = new ForbricArgumentTypes(server);
+        instance = created;
+        // Published for the OTHER copy of this class, which is the one a plugin reaches. Paper instantiates the
+        // VanillaArgumentProvider through ServiceLoader -- using the interface's own loader, FML's plugins layer
+        // -- and a plugin building its Brigadier tree calls ArgumentTypes.players() from inside its COMMANDS
+        // handler. That copy cannot see this static field, so it answered "asked for before the bridge started"
+        // and THREW; the plugin's whole registration died with it, leaving a command that was absent from tab
+        // completion and did nothing when typed while the plugin logged "enabled".
+        //
+        // A system property is process-wide -- the same channel ForbricRegistries uses. The published value is
+        // this object, and the other layer calls its methods through reflection: the methods build
+        // net.minecraft.* types, so they must run on the class that can see Minecraft, and the object carries
+        // that class with it.
+        System.getProperties().put(SHARED_INSTANCE_KEY, created);
         // Before any plugin can build a command: a selector argument that is not in the game's
         // argument-type map makes the command packet throw when a player joins, and the join dies
         // with "Invalid player data".
         ForbricSelectorArguments.install();
     }
 
+    /** Where the instance is published for the bridge's other class-loader layer. */
+    private static final String SHARED_INSTANCE_KEY = "neofobric.bukkit.argumentTypes";
+
     /** The instance for the running server, or null when the bridge has not started. */
     public static ForbricArgumentTypes current() {
         return instance;
+    }
+
+    /**
+     * The same instance as an opaque object, for the layer whose {@code ForbricArgumentTypes} is a different
+     * class.
+     *
+     * <p>Typed {@code Object} on purpose: the two layers define one class of this name each, so the other layer
+     * cannot cast the value to its own copy (a ClassCastException) and could not call these methods even if it
+     * could, because they link {@code net.minecraft.commands.arguments.*}. It reflects instead.
+     */
+    public static Object sharedInstance() {
+        if (instance != null) {
+            return instance;
+        }
+        return System.getProperties().get(SHARED_INSTANCE_KEY);
     }
 
     /** The server these arguments resolve against. */

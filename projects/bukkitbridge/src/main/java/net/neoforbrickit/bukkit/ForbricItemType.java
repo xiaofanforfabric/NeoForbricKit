@@ -36,8 +36,12 @@ final class ForbricItemType implements org.bukkit.inventory.ItemType {
      * <p>Cached because two {@code ItemType}s for the same id must be equal and ideally identical —
      * a plugin compares them and puts them in sets. The cache is bounded by the item registry, which
      * is fixed once the world has loaded.
+     *
+     * <p>Accepts Object to allow FML-Plugins layer to call this without linking Identifier. The
+     * object is cast back to Identifier here in the game layer where that class is visible.
      */
-    static ForbricItemType of(Identifier id) {
+    static ForbricItemType of(Object idObj) {
+        Identifier id = (Identifier) idObj;
         return CACHE.computeIfAbsent(id, ForbricItemType::new);
     }
 

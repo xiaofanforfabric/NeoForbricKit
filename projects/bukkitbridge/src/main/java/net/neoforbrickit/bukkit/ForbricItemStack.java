@@ -187,11 +187,7 @@ final class ForbricItemStack extends org.bukkit.inventory.ItemStack {
         }
         // A mod item has no Material in this API version; AIR is the closest true answer, and the
         // id is still available through getType()'s sibling on the registry side.
-        org.bukkit.Material answer = modItemId != null ? org.bukkit.Material.AIR : material;
-        net.neoforbrickit.bridge.util.ForbricLog.debug(
-                "[Forbric/Bukkit] getType NO-GAME-STACK modItemId=%s material=%s -> %s",
-                modItemId, material, answer);
-        return answer;
+        return modItemId != null ? org.bukkit.Material.AIR : material;
     }
 
     /**
@@ -280,10 +276,26 @@ final class ForbricItemStack extends org.bukkit.inventory.ItemStack {
      * <p>Zero is allowed and means the same as Bukkit's: a stack of nothing. It is not turned into
      * air here, because a plugin that sets 0 and then sets 5 again is expressing one item that is
      * momentarily empty, and collapsing that to air would lose the type.
+     *
+     * <p><b>Written through to the game stack, not just kept here.</b> A wrapper handed out by
+     * {@code PlayerInventory.getItemInMainHand()} holds the live game stack, and a plugin's habit
+     * -- {@code hand.setAmount(hand.getAmount() - 1)}, or {@code setAmount(0)} to consume a
+     * one-shot item -- is written back by every server it runs on. Keeping the change in this
+     * object alone would make the write a no-op against the world: the plugin reads the count
+     * back and sees it fall, while the item the player holds never changes.
+     *
+     * <p>Guarded on {@code game} being non-null, so a stack built from a material alone stays a
+     * plain field write. This is the one place a mutation reaches the world; the fields stay the
+     * source of truth for a stack the game has never seen.
      */
     @Override
     public void setAmount(int amount) {
         this.amount = amount;
+        if (game != null) {
+            // setCount, not toGame(): toGame reads `amount` back into the stack, which would undo
+            // the write this method is making when the two disagree.
+            game.setCount(amount);
+        }
     }
 
     /** The largest count this item stacks to, asked of the game so it matches what the world does. */

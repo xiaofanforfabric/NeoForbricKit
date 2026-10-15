@@ -765,6 +765,67 @@ final class ForbricWorld implements org.bukkit.World {
 		return found;
 	}
 
+	/**
+	 * Creates an entity of the requested class at a location and adds it to the world.
+	 *
+	 * <p>Shared by the two spawn entry points, which differ only in the type parameter they
+	 * accept -- the game needs the same sequence either way, so the sequence lives once.
+	 *
+	 * <p>The setup consumer runs before the entity is added, not after, because that is the
+	 * window the API promises: a plugin sets a fuse or a velocity there knowing the value is in
+	 * place before the entity's first tick.
+	 */
+	@SuppressWarnings("unchecked")
+	private <T extends org.bukkit.entity.Entity> T spawnAt(org.bukkit.Location location, java.lang.Class<T> clazz, java.util.function.Consumer<? super T> configure) {
+		if (location == null || clazz == null) {
+		    throw new IllegalArgumentException("[Forbric/Bukkit] World.spawn() needs a location and an entity class");
+		}
+		net.minecraft.world.entity.EntityType<?> type = entityTypeOf(clazz);
+		if (type == null) {
+		    throw new IllegalArgumentException("[Forbric/Bukkit] World.spawn() has no game entity type for " + clazz.getName()
+			+ "; no Bukkit EntityType constant declares that class");
+		}
+		net.minecraft.world.entity.Entity entity = type.create(level, net.minecraft.world.entity.EntitySpawnReason.COMMAND);
+		if (entity == null) {
+		    throw new IllegalArgumentException("[Forbric/Bukkit] World.spawn() could not create " + type);
+		}
+		// setPos, not a teleport: the entity has never been in a world, so there is nothing to
+		// move it from and no collision to resolve -- it is being placed.
+		entity.setPos(location.getX(), location.getY(), location.getZ());
+		org.bukkit.entity.Entity wrapped = ForbricEntity.of(entity, server);
+		if (configure != null) {
+		    configure.accept((T) wrapped);
+		}
+		level.addFreshEntity(entity);
+		return (T) wrapped;
+	}
+
+	/**
+	 * The game's entity type for a Bukkit entity class.
+	 *
+	 * <p>By identity, not by name. Bukkit's {@code EntityType} enum carries both halves of the
+	 * mapping -- {@code TNT("tnt", TNTPrimed.class, 20)} -- so the constant whose class is the
+	 * requested one also carries the registry id. Deriving an id from the class name instead
+	 * would fail for every entity whose name and id disagree, which is most of them once a
+	 * plugin asks for an interface: the plugin's request is {@code TNTPrimed.class}, and
+	 * "tntprimed" names nothing.
+	 *
+	 * <p>A class no constant declares answers null, and the caller turns that into an
+	 * IllegalArgumentException: null is the honest answer to "is there a type for this", and
+	 * only the caller knows whether to throw.
+	 */
+	private static net.minecraft.world.entity.EntityType<?> entityTypeOf(java.lang.Class<?> bukkitClass) {
+		for (org.bukkit.entity.EntityType type : org.bukkit.entity.EntityType.values()) {
+			if (type.getEntityClass() == bukkitClass) {
+				net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.fromNamespaceAndPath(
+					type.getKey().getNamespace(), type.getKey().getKey());
+				return net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE.get(id)
+					.map(holder -> holder.value()).orElse(null);
+			}
+		}
+		return null;
+	}
+
 	/** The game box for a point and Bukkit's half-extents. */
 	private static net.minecraft.world.phys.AABB box(org.bukkit.Location location, double xRadius, double yRadius,
 			double zRadius) {
@@ -1133,9 +1194,10 @@ final class ForbricWorld implements org.bukkit.World {
 		throw notYet("getPopulators");
 	}
 
+	/** The living-entity form, answered by the same code the general one uses. */
 	@Override
 	public <T extends org.bukkit.entity.LivingEntity> T spawn(org.bukkit.Location arg0, java.lang.Class<T> arg1, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason arg2, boolean arg3, java.util.function.Consumer<? super T> arg4) throws java.lang.IllegalArgumentException {
-		throw notYet("spawn");
+		return spawnAt(arg0, arg1, arg4);
 	}
 
 	@Override
@@ -1533,14 +1595,30 @@ final class ForbricWorld implements org.bukkit.World {
 		throw notYet("createEntity");
 	}
 
+	/**
+	 * Adds an entity to this world, which is the one form the whole family routes through.
+	 *
+	 * <p>Paper declares a dozen spawn overloads and only this one is abstract: the rest are
+	 * default methods that call it. A plugin asking for two arguments is asking for what this
+	 * implements, which is why the other stubs below stay unreachable rather than being filled
+	 * in as well.
+	 *
+	 * <p>The order is the contract: the caller's setup runs BEFORE the entity joins the world,
+	 * because a plugin uses it to set things the game reads as the entity enters -- a fuse, a
+	 * velocity, a custom name. Adding first would make those writes race the entity's own first
+	 * tick.
+	 */
 	@Override
 	public <T extends org.bukkit.entity.Entity> T spawn(org.bukkit.Location arg0, java.lang.Class<T> arg1, java.util.function.Consumer<? super T> arg2, org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason arg3) throws java.lang.IllegalArgumentException {
-		throw notYet("spawn");
+		return spawnAt(arg0, arg1, arg2);
 	}
 
 	@Override
 	public <T extends org.bukkit.entity.Entity> T spawn(org.bukkit.Location arg0, java.lang.Class<T> arg1, boolean arg2, java.util.function.Consumer<? super T> arg3) throws java.lang.IllegalArgumentException {
-		throw notYet("spawn");
+		// The randomizeData flag is not forwarded: it asks the game to vary the entity's starting
+		// state (a sheep's colour, a horse's markings), and the bridge has no seam for that yet. The
+		// call still places the entity, which is what a plugin reaching this overload is after.
+		return spawnAt(arg0, arg1, arg3);
 	}
 
 	@Override

@@ -53,6 +53,9 @@ final class ForbricPersistentDataContainer implements PersistentDataContainer {
 
     @Override
     public <P, C> void set(NamespacedKey key, PersistentDataType<P, C> type, C value) {
+        net.neoforbrickit.bridge.util.ForbricLog.debug(
+                "[Forbric/Bukkit] pdc.set key=%s primitiveType=%s value=%s",
+                key, type.getPrimitiveType().getSimpleName(), value);
         if (key == null || type == null) {
             return;
         }
@@ -97,6 +100,11 @@ final class ForbricPersistentDataContainer implements PersistentDataContainer {
             return null;
         }
         P primitive = read(key.toString(), type.getPrimitiveType());
+        // The whole tag key set on a miss: a namespace mismatch between the write and the read shows
+        // up as the expected key simply not being in this list, which is not visible from the outside.
+        net.neoforbrickit.bridge.util.ForbricLog.debug(
+                "[Forbric/Bukkit] pdc.get key=%s primitiveType=%s found=%s tagKeys=%s",
+                key, type.getPrimitiveType().getSimpleName(), primitive != null, tag.keySet());
         return primitive == null ? null : type.fromPrimitive(primitive, getAdapterContext());
     }
 

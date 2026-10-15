@@ -513,7 +513,8 @@ final class ForbricPlayerInventory implements org.bukkit.inventory.PlayerInvento
     /** The main hand's item. */
     @Override
     public org.bukkit.inventory.ItemStack getItemInMainHand() {
-        return ForbricItemStack.of(inventory().getSelectedItem());
+        net.minecraft.world.item.ItemStack selected = inventory().getSelectedItem();
+        return ForbricItemStack.of(selected);
     }
 
     /** Sets the main hand's item. */

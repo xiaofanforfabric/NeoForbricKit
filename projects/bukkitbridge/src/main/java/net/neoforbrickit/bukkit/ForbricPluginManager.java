@@ -318,6 +318,29 @@ final class ForbricPluginManager implements org.bukkit.plugin.PluginManager {
         // Bukkit's ordering: HIGHEST first (it is declared first in EventPriority), then by registration order
         // for equal priorities. A stable sort keeps that second guarantee.
         forThisEvent.sort(java.util.Comparator.comparingInt(r -> r.priority().ordinal()));
+        if (event instanceof org.bukkit.event.player.PlayerInteractEvent interact) {
+            org.bukkit.entity.Player who = interact.getPlayer();
+            org.bukkit.inventory.ItemStack heldItem;
+            String read = null;
+            try {
+                heldItem = who.getInventory().getItemInMainHand();
+            } catch (Throwable thrown) {
+                heldItem = null;
+                read = thrown.toString();
+            }
+            net.neoforbrickit.bridge.util.ForbricLog.debug(
+                    "[Forbric/Bukkit] event player=%s inventory=%s hand=%s item=%s%s",
+                    who.getClass().getName(), who.getInventory().getClass().getName(),
+                    interact.getHand(), heldItem,
+                    read == null ? "" : " THREW " + read);
+        }
+        net.neoforbrickit.bridge.util.ForbricLog.debug(
+                "[Forbric/Bukkit] callEvent %s registrations=%d matched=%d handlers=%s",
+                event.getClass().getSimpleName(), registrations.size(), forThisEvent.size(),
+                forThisEvent.stream()
+                        .map(r -> r.priority() + "/"
+                                + r.listener().getClass().getSimpleName())
+                        .toList());
         for (Registration registration : forThisEvent) {
             if (event instanceof org.bukkit.event.Cancellable cancellable
                             && cancellable.isCancelled() && !registration.ignoreCancelled()) {

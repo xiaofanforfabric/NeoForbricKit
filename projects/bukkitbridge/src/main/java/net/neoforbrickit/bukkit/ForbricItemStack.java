@@ -187,7 +187,11 @@ final class ForbricItemStack extends org.bukkit.inventory.ItemStack {
         }
         // A mod item has no Material in this API version; AIR is the closest true answer, and the
         // id is still available through getType()'s sibling on the registry side.
-        return modItemId != null ? org.bukkit.Material.AIR : material;
+        org.bukkit.Material answer = modItemId != null ? org.bukkit.Material.AIR : material;
+        net.neoforbrickit.bridge.util.ForbricLog.debug(
+                "[Forbric/Bukkit] getType NO-GAME-STACK modItemId=%s material=%s -> %s",
+                modItemId, material, answer);
+        return answer;
     }
 
     /**
@@ -396,9 +400,15 @@ final class ForbricItemStack extends org.bukkit.inventory.ItemStack {
     @Override
     public org.bukkit.inventory.meta.ItemMeta getItemMeta() {
         net.minecraft.world.item.ItemStack stack = toGame();
-        if (stack == net.minecraft.world.item.ItemStack.EMPTY || stack.isEmpty()) {
+        net.neoforbrickit.bridge.util.ForbricLog.debug(
+                "[Forbric/Bukkit] getItemMeta toGame=%s empty=%s amount=%d gameField=%s",
+                stack == null ? null : stack.getItem(),
+                stack == null || stack.isEmpty(), amount, game);
+        if (stack == null || stack == net.minecraft.world.item.ItemStack.EMPTY || stack.isEmpty()) {
             // An air item has no components to read and no meta a plugin could usefully edit. Bukkit
             // answers null here on every server.
+            net.neoforbrickit.bridge.util.ForbricLog.debug(
+                    "[Forbric/Bukkit] getItemMeta -> NULL (the plugin sees no meta and reads no mode)");
             return null;
         }
         net.kyori.adventure.text.Component name = ForbricComponentBridge.toAdventure(

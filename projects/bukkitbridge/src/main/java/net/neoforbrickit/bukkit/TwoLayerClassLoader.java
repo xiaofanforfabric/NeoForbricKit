@@ -68,9 +68,41 @@ public final class TwoLayerClassLoader extends ClassLoader {
      * the checked exception would refuse to ask the other layer for a class the other layer has. When both
      * layers fail, both failures are reported: "neither layer has it" and "the first layer broke in a way that
      * hid the second layer's answer" are different diagnoses and the log must not merge them.
+         * <p><b>Bridge-owned names are the exception to that order.</b> They are asked of the game layer
+         * first — see {@link #isBridgeOwned} and the reasoning in {@link #loadClass(String, boolean)}:
+         * a copy defined by the plugins layer cannot link, because that layer has no {@code net.minecraft.*}.
      */
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        // Bridge-owned names are asked of the GAME layer first, and the order is load-bearing.
+        //
+        // These classes exist in BOTH layers, because the bridge travels as a Jar-in-Jar so Paper's own
+        // ServiceLoader can reach its provider. The plugins layer has no net.minecraft.* (measured, not
+        // assumed: the diagnostic prints "net.minecraft NOT reachable from that loader"), and a class
+        // DEFINED there cannot be linked or initialised. A plugin that asks for one by name therefore gets
+        //
+        //     NoClassDefFoundError: net/minecraft/world/entity/Entity
+        //
+        // from a class that plainly exists -- reported by the plugin as "could not find CraftPlayer".
+        //
+        // It surfaces only on the initialising lookup: {@code Class.forName(name, false, loader)} returns
+        // the unlinked class and looks fine, while {@code Class.forName(name)} -- which is what a plugin
+        // writes -- links it and throws. That difference is what hid this for so long.
+        //
+        // Game-first also keeps ONE Class object per bridge type. A plugin handed a player by the game
+        // layer must cast it to the same CraftPlayer the bridge instantiated, not to a JiJ copy.
+        if (isBridgeOwned(name)) {
+            try {
+                return gameLayer.loadClass(name);
+            } catch (Throwable notInGame) {
+                // Fall through rather than fail: the provider shim lives in the plugins layer precisely
+                // so ServiceLoader can find it, and anything else the API layer owns is still answered.
+                net.neoforbrickit.bridge.util.ForbricLog.debug(
+                        "[NeoFobric/Bukkit] %s is not on the game layer (%s); asking the API layer",
+                        name, notInGame);
+            }
+        }
+
         Throwable apiFailure = null;
         try {
             return apiLayer.loadClass(name);
@@ -86,6 +118,16 @@ public final class TwoLayerClassLoader extends ClassLoader {
             if (notInGame instanceof Error error) throw error;
             throw new ClassNotFoundException(name, notInGame);
         }
+    }
+
+    /**
+     * Whether a name belongs to this bridge rather than to the API or to the game.
+     *
+     * <p>Both of these packages ship in the bridge's own jar, which is present in two layers at once;
+     * every other name has exactly one owner and keeps the API-first order above.
+     */
+    private static boolean isBridgeOwned(String name) {
+        return name.startsWith("net.neoforbrickit.") || name.startsWith("org.bukkit.craftbukkit.");
     }
 
     /**

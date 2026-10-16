@@ -1,0 +1,101 @@
+--- a/net/minecraft/network/protocol/common/custom/DiscardedPayload.java
++++ b/net/minecraft/network/protocol/common/custom/DiscardedPayload.java
+@@ -4,21 +_,88 @@
+ import net.minecraft.network.codec.StreamCodec;
+ import net.minecraft.resources.Identifier;
+ 
+-public record DiscardedPayload(Identifier id) implements CustomPacketPayload {
++/**
++ * A custom payload whose type this side does not have a codec for.
++ *
++ * <p>Vanilla keeps only the channel name and throws the body away — the type exists so an unknown
++ * packet can be answered without reading a size the sender chose. That is the right default for a
++ * peer that has nothing to say about the channel, but it makes plugin messaging impossible: a
++ * modded client sends its real data over a channel the server has no codec for <em>by design</em>,
++ * and a body discarded on arrival means a server-side plugin can never hear it.
++ *
++ * <p><b>Carried as a patch rather than worked around.</b> The body has to be part of the value — it
++ * is what the decoder produces and the encoder consumes, and a record's components are fixed at
++ * compile time, so neither a mixin nor a subclass can add it. The size limit is what keeps the
++ * guarantee vanilla cared about: the length is still bounded by {@code maxPayloadSize} before a
++ * byte is read, so an oversized payload is rejected rather than allocated.
++ *
++ * @param id   the channel the payload named
++ * @param data its body, empty when the sender sent none
++ */
++public record DiscardedPayload(Identifier id, byte[] data) implements CustomPacketPayload {
++    /**
++     * The unnamed-body form, which is what every existing call site constructs.
++     *
++     * <p>Kept because the record gained a component: code that only wants to describe an unknown
++     * channel must keep compiling and keep meaning "a payload with no body".
++     */
++    public DiscardedPayload(Identifier id) {
++        this(id, new byte[0]);
++    }
++
+     public static <T extends FriendlyByteBuf> StreamCodec<T, DiscardedPayload> codec(Identifier id, int maxPayloadSize) {
+-        return CustomPacketPayload.codec((payload, buf) -> {}, buf -> {
+-            int length = buf.readableBytes();
+-            if (length >= 0 && length <= maxPayloadSize) {
+-                buf.skipBytes(length);
+-                return new DiscardedPayload(id);
+-            } else {
+-                throw new IllegalArgumentException("Payload may not be larger than " + maxPayloadSize + " bytes");
+-            }
+-        });
++        return CustomPacketPayload.codec(
++            // Write the body, so a payload that arrived from a peer can be passed on or echoed.
++            // An empty array writes nothing, which is byte-for-byte what vanilla sent.
++            (payload, buf) -> buf.writeBytes(payload.data),
++            buf -> {
++                int length = buf.readableBytes();
++                if (length >= 0 && length <= maxPayloadSize) {
++                    // Read rather than skip: the bytes ARE the message a plugin is waiting for.
++                    // The limit above is still checked first, so nothing unbounded is allocated.
++                    byte[] data = new byte[length];
++                    buf.readBytes(data);
++                    return new DiscardedPayload(id, data);
++                } else {
++                    throw new IllegalArgumentException("Payload may not be larger than " + maxPayloadSize + " bytes");
++                }
++            });
+     }
+ 
+     @Override
+     public CustomPacketPayload.Type<DiscardedPayload> type() {
+         return new CustomPacketPayload.Type<>(this.id);
++    }
++
++    /**
++     * {@inheritDoc}
++     *
++     * <p>Overridden because the generated version compares {@code data} by reference, and two
++     * payloads that arrived on the same channel with the same bytes are the same value. The
++     * generated {@code hashCode} has the same defect, so it is replaced as well — a record whose
++     * {@code equals} does not agree with its {@code hashCode} is a broken map key.
++     */
++    @Override
++    public boolean equals(Object other) {
++        if (this == other) return true;
++        return other instanceof DiscardedPayload payload
++            && this.id.equals(payload.id)
++            && java.util.Arrays.equals(this.data, payload.data);
++    }
++
++    @Override
++    public int hashCode() {
++        return 31 * this.id.hashCode() + java.util.Arrays.hashCode(this.data);
++    }
++
++    /**
++     * {@inheritDoc}
++     *
++     * <p>The generated rendering would print the whole body, which for any real payload turns one
++     * log line into a wall of numbers.
++     */
++    @Override
++    public String toString() {
++        return "DiscardedPayload[id=" + this.id + ", data=" + this.data.length + " bytes]";
+     }
+ }

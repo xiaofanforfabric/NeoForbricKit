@@ -64,6 +64,15 @@ sourceSets {
     bridge {
         java {
             srcDirs rootProject.file('projects/bukkitbridge/src/main/java')
+            // Two files of the CraftBukkit compatibility layer do not compile on this source set's
+            // classpath even though :bukkitbridge:compileJava accepts them, and nothing references
+            // either: ForbricServicesManager (its SimpleRegistration generics and the @Override set
+            // resolve differently here) and org/bukkit/craftbukkit/entity/CraftLivingEntity (its
+            // org.bukkit.entity.LivingEntity parameter picks up a different type than CraftEntity
+            // expects). Excluding them keeps universal.jar buildable while the layer is unfinished;
+            // :bukkitbridge still compiles them, so they can be fixed without touching this file.
+            exclude 'net/neoforbrickit/bukkit/ForbricServicesManager.java'
+            exclude 'org/bukkit/craftbukkit/entity/CraftLivingEntity.java'
         }
         resources {
             srcDirs rootProject.file('projects/bukkitbridge/src/main/resources')

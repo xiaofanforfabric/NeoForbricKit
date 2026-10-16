@@ -925,7 +925,8 @@ public final class MixinJarPatcher {
         for (var name : candidates) {
             if (name.startsWith("java/") || name.startsWith("javax/") || name.startsWith("jdk/")
                     || name.startsWith("sun/") || name.startsWith("com/sun/")
-                    || resolver.apply(name) != null || allModJarClassNames().contains(name)) {
+                    || resolver.apply(name) != null || allModJarClassNames().contains(name)
+                    || fmlLayerClassNames().contains(name)) {
                 continue;
             }
             try {
@@ -959,7 +960,7 @@ public final class MixinJarPatcher {
         ctor.visitMaxs(1, 1);
         ctor.visitEnd();
         cls.visitEnd();
-        var writer = new ClassWriter(0);
+        var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         cls.accept(writer);
         return writer.toByteArray();
     }
@@ -984,6 +985,79 @@ public final class MixinJarPatcher {
         }
         MOD_JAR_CLASS_NAMES.compareAndSet(null, names);
         return MOD_JAR_CLASS_NAMES.get();
+    }
+
+    /** Class names carried by the NeoForge/FML jars of the install, jar-in-jar contents included. */
+    private static final java.util.concurrent.atomic.AtomicReference<java.util.Set<String>> FML_LAYER_CLASS_NAMES =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    /**
+     * {@return the class names FML's own layer provides, so a frame type they define is never stubbed}
+     *
+     * <p>NeoForge embeds libraries through jar-in-jar - {@code com.llamalad7.mixinextras} is the one that
+     * matters here - and FML puts them on the game layer as their own modules. At realigning time that
+     * layer does not exist yet, and neither {@code TargetResolver} (game content only) nor
+     * {@code allModJarClassNames} (the mods folder only) can see them, so a class such as
+     * {@code mixinextras.injector.wrapoperation.Operation} looked like it existed nowhere. Stubbing it
+     * then wrote that package into the Fabric composite module, and the JDK refused the layer:
+     *   Modules mixinextras.neoforge and neofobric.fabric.mods export package
+     *   com.llamalad7.mixinextras.injector.wrapoperation to module minecraft
+     * Reading the NeoForge jars here closes that gap: whatever the FML layer ships is off limits for stubs.
+     *
+     * <p>Scanned from {@code libraries/net/neoforged}, the same root {@code installedGameContent} uses, and
+     * only the jars whose name starts with {@code neoforge-} or {@code fml-} are read - the patched
+     * Minecraft jars next to them are already covered by the resolver. Nested {@code META-INF/jarjar}
+     * jars are followed one level, which is where mixinextras lives.
+     */
+    private static java.util.Set<String> fmlLayerClassNames() {
+        var cached = FML_LAYER_CLASS_NAMES.get();
+        if (cached != null) {
+            return cached;
+        }
+        var names = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        try {
+            var root = net.neoforged.fml.loading.FMLPaths.GAMEDIR.get().resolve("libraries")
+                    .resolve("net").resolve("neoforged");
+            if (Files.isDirectory(root)) {
+                try (var libs = Files.list(root)) {
+                    for (var lib : libs.toList()) {
+                        if (!Files.isDirectory(lib)) {
+                            continue;
+                        }
+                        try (var versions = Files.list(lib)) {
+                            for (var versionDir : versions.toList()) {
+                                if (!Files.isDirectory(versionDir)) {
+                                    continue;
+                                }
+                                try (var jars = Files.list(versionDir)) {
+                                    for (var jar : jars.toList()) {
+                                        var fileName = jar.getFileName().toString();
+                                        if (!fileName.endsWith(".jar") || !isFmlLayerJar(fileName)) {
+                                            continue;
+                                        }
+                                        collectJarClassNames(jar, names, 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            LOGGER.debug("[NeoFobric] Could not scan the FML layer jars for the frame type check", t);
+        }
+        FML_LAYER_CLASS_NAMES.compareAndSet(null, names);
+        return FML_LAYER_CLASS_NAMES.get();
+    }
+
+    /** {@return whether {@code fileName} names a jar the FML/NeoForge layer contributes} */
+    private static boolean isFmlLayerJar(String fileName) {
+        return fileName.startsWith("neoforge-") || fileName.startsWith("fml-")
+                || fileName.startsWith("loader-") || fileName.startsWith("core-")
+                // The jarjar modules ship under their own names (mixinextras-neoforge-0.5.5.jar and
+                // friends); they are the whole reason this scan exists, so they are matched by content
+                // rather than by a prefix list that would go stale.
+                || fileName.contains("mixinextras");
     }
 
     private static void collectJarClassNames(Path jarPath, java.util.Set<String> names, int nestedDepth) {
@@ -2780,9 +2854,7 @@ public final class MixinJarPatcher {
             return null;
         }
         LOGGER.info("[NeoFobric] Pointed the injections in {} at the method(s) NeoForge moved the body into: {}", internalName, moved);
-        var writer = new ClassWriter(0);
-        node.accept(writer);
-        return writer.toByteArray();
+        return writeClass(node);
     }
 
     /** The injection annotations whose {@code at} names a member: the ones a retarget can move. */
@@ -3652,9 +3724,7 @@ public final class MixinJarPatcher {
             return null;
         }
         LOGGER.info("[NeoFobric] Pointed the resource lookups in {} at FabricResourceHooks", jarPath.getFileName());
-        var writer = new ClassWriter(0);
-        node.accept(writer);
-        return writer.toByteArray();
+        return writeClass(node);
     }
 
     /**
@@ -3710,6 +3780,69 @@ public final class MixinJarPatcher {
         var writer = new ClassWriter(0);
         node.accept(writer);
         return writer.toByteArray();
+    }
+
+    /** Fabric API's registry-sync screen: it disconnects a client whose Fabric payload type it cannot reach. */
+    private static final String FABRIC_REGISTRY_SYNC_MANAGER = "net/fabricmc/fabric/impl/registry/sync/RegistrySyncManager";
+
+    /**
+     * Replaces the {@code disconnect} call in Fabric API's registry-sync screen with a hook that keeps the
+     * connection.
+     *
+     * <p>{@code RegistrySyncManager.configureClient} asks
+     * {@code ServerConfigurationNetworking.canSend(listener, RegistrySyncPayload.ID)} and, when the answer is
+     * false, disconnects with "This server requires Fabric API installed on your client!". That test fits a
+     * Fabric server, where a peer without the payload type cannot decode the registry dump - but this
+     * server's client is a <em>NeoForge</em> one, which syncs the registries its mods add through NeoForge's
+     * own channel. The Fabric payload type is registered only for a Fabric peer, and a server whose Fabric
+     * mods add no registry entries has nothing for the Fabric route to carry, so the answer is false for
+     * reasons that do not apply here and the client is refused for no benefit.
+     *
+     * <p>Only the {@code disconnect(Component)} call is rewritten. The method still returns immediately
+     * after it, so no {@code SyncConfigurationTask} is queued and NeoForge's own configuration handling
+     * continues; the registries the platform and its mods define travel the NeoForge route as before. The
+     * hook logs the reason and holds it for the player-join path, where the message can actually be shown -
+     * configuration is too early for a play-phase packet.
+     */
+    private static byte[] keepClientsRejectedByRegistrySync(byte[] classBytes, String entryName) {
+        if (!FABRIC_REGISTRY_SYNC_MANAGER.equals(entryName.replace(".class", ""))) {
+            return null;
+        }
+        ClassNode node;
+        try {
+            node = new ClassNode();
+            new ClassReader(classBytes).accept(node, 0);
+        } catch (Throwable t) {
+            return null;
+        }
+
+        var changed = false;
+        for (var method : node.methods) {
+            for (var insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+                if (!(insn instanceof org.objectweb.asm.tree.MethodInsnNode call)
+                        || !"net/minecraft/server/network/ServerConfigurationPacketListenerImpl".equals(call.owner)
+                        || !"disconnect".equals(call.name)
+                        || !"(Lnet/minecraft/network/chat/Component;)V".equals(call.desc)) {
+                    continue;
+                }
+                // The receiver (the listener) and the reason are both on the stack already, which is exactly
+                // the shape the hook takes, so only the call target changes.
+                call.setOpcode(Opcodes.INVOKESTATIC);
+                call.owner = "net/neoforged/neoforge/common/FabricRegistrySyncHooks";
+                call.name = "keepInsteadOfDisconnecting";
+                call.desc = "(Lnet/minecraft/server/network/ServerConfigurationPacketListenerImpl;"
+                        + "Lnet/minecraft/network/chat/Component;)V";
+                call.itf = false;
+                changed = true;
+            }
+        }
+
+        if (!changed) {
+            return null;
+        }
+        LOGGER.info("[NeoFobric] Fabric API's registry-sync screen now keeps the client instead of"
+                + " disconnecting it - a NeoForge client syncs the registries through NeoForge itself");
+        return writeClass(node);
     }
 
     /**
@@ -5460,6 +5593,11 @@ public final class MixinJarPatcher {
                     versionMoved = registryParseAnchorRetargeted;
                     patched.put(entry.getName(), versionMoved);
                 }
+                var registrySyncKept = keepClientsRejectedByRegistrySync(versionMoved, entry.getName());
+                if (registrySyncKept != null) {
+                    versionMoved = registrySyncKept;
+                    patched.put(entry.getName(), versionMoved);
+                }
                 var blockStateModelTypesRedirected = redirectFabricBlockStateModelTypes(versionMoved);
                 if (blockStateModelTypesRedirected != null) {
                     versionMoved = blockStateModelTypesRedirected;
@@ -6118,7 +6256,13 @@ public final class MixinJarPatcher {
     }
 
     private static byte[] writeClass(ClassNode node) {
-        var writer = new ClassWriter(0);
+        // COMPUTE_MAXS, not 0: several rewriters put an extra value on the stack (the resource-lookup
+        // redirect appends the jar path as a third argument), and a writer that keeps the old maxStack
+        // then emits a method the verifier rejects with "Operand stack overflow" at the inserted load.
+        // Only the max stack/locals are recomputed here; the stack map frames stay as they are, so
+        // COMPUTE_FRAMES (which would rewrite them and needs a class hierarchy to resolve types) is not
+        // needed and its cost is avoided.
+        var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         node.accept(writer);
         return writer.toByteArray();
     }

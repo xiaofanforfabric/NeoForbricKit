@@ -20,12 +20,14 @@ package net.neoforbrickit.bukkit;
  * {@code CommandSourceStack.getEntityOrThrow()} has to return one, and an argument resolver needs the game's own
  * entity back. A wrapper that keeps the {@code net.minecraft} object is the only thing that can satisfy both.
  */
-class ForbricEntity implements org.bukkit.entity.Entity {
+class ForbricEntity extends net.neoforbrickit.bukkit.entity.CraftEntity
+                implements org.bukkit.entity.Entity {
 
         private final net.minecraft.world.entity.Entity entity;
         private final ServerImpl server;
 
         ForbricEntity(net.minecraft.world.entity.Entity entity, ServerImpl server) {
+                super(entity);
                 this.entity = entity;
                 this.server = server;
         }

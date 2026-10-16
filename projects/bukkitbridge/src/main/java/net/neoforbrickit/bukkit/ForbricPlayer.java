@@ -30,10 +30,22 @@ package net.neoforbrickit.bukkit;
  * so {@link #getUniqueId()} is the only stable key. The name is offered for display and for the common case; a
  * plugin that stores anything should store the UUID.
  */
-final class ForbricPlayer implements org.bukkit.entity.Player {
+final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
+                implements org.bukkit.entity.Player {
 
         private final net.minecraft.server.level.ServerPlayer player;
         private final ServerImpl server;
+
+        /**
+         * The plugin channels each player's client has been told it may send on.
+         *
+         * <p>Keyed by the game's own player object rather than by this wrapper: a wrapper is
+         * built per call, so a set kept on the wrapper would be visible to exactly one caller and
+         * the client's registration would be lost the moment anything asked a second time. A weak
+         * key so a departed player's entry goes away with the player.
+         */
+        private static final java.util.Map<net.minecraft.server.level.ServerPlayer, java.util.Set<String>> CHANNELS =
+                        java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
         /**
          * Whatever this player has been granted at run time, in the order it was added.
@@ -47,6 +59,7 @@ final class ForbricPlayer implements org.bukkit.entity.Player {
                 java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
         private ForbricPlayer(net.minecraft.server.level.ServerPlayer player, ServerImpl server) {
+                super(player);
                 this.player = player;
                 this.server = server;
         }
@@ -1753,12 +1766,50 @@ final class ForbricPlayer implements org.bukkit.entity.Player {
 
 	@Override
 	public org.bukkit.GameMode getGameMode() {
-		throw notYet("getGameMode");
+		// Read from the game every time rather than cached: /gamemode, a command block, or another plugin can
+		// change it between two calls, and a plugin that cached it at join would act on a stale mode.
+		return gameMode(player.gameMode());
 	}
 
 	@Override
 	public void setGameMode(org.bukkit.GameMode arg0) {
-		throw notYet("setGameMode");
+		if (arg0 == null) {
+			// The API's own precondition, said here rather than a NullPointerException from inside the game.
+			throw new IllegalArgumentException("GameMode cannot be null");
+		}
+		net.minecraft.world.level.GameType type = gameType(arg0);
+		if (type == null) {
+			throw new IllegalArgumentException("Unsupported GameMode: " + arg0);
+		}
+		// setGameMode is what the game's own /gamemode uses: it re-sends the abilities packet, applies
+		// the spectator/creative flight rules, and updates the tracked mode other code reads.
+		player.setGameMode(type);
+	}
+
+	/**
+	 * The Bukkit spelling of one of the game's own game modes.
+	 *
+	 * <p>The two enums are not the same shape: the game's {@code DEFAULT_MODE} has no Bukkit counterpart
+	 * (it means "whatever the level says"), so it is reported as {@code SURVIVAL} — which is what the game
+	 * itself resolves it to for a player who has joined.
+	 */
+	private static org.bukkit.GameMode gameMode(net.minecraft.world.level.GameType type) {
+		return switch (type) {
+			case CREATIVE -> org.bukkit.GameMode.CREATIVE;
+			case ADVENTURE -> org.bukkit.GameMode.ADVENTURE;
+			case SPECTATOR -> org.bukkit.GameMode.SPECTATOR;
+			case SURVIVAL -> org.bukkit.GameMode.SURVIVAL;
+		};
+	}
+
+	/** The game's spelling of one of Bukkit's game modes, or null when Bukkit has a mode the game does not. */
+	private static net.minecraft.world.level.GameType gameType(org.bukkit.GameMode mode) {
+		return switch (mode) {
+			case CREATIVE -> net.minecraft.world.level.GameType.CREATIVE;
+			case ADVENTURE -> net.minecraft.world.level.GameType.ADVENTURE;
+			case SPECTATOR -> net.minecraft.world.level.GameType.SPECTATOR;
+			case SURVIVAL -> net.minecraft.world.level.GameType.SURVIVAL;
+		};
 	}
 
 	@Override
@@ -3457,13 +3508,77 @@ final class ForbricPlayer implements org.bukkit.entity.Player {
 	}
 
 	@Override
-	public void sendPluginMessage(org.bukkit.plugin.Plugin arg0, java.lang.String arg1, byte[] arg2) {
-		throw notYet("sendPluginMessage");
+	public void sendPluginMessage(org.bukkit.plugin.Plugin plugin, java.lang.String channel, byte[] message) {
+		java.util.Objects.requireNonNull(plugin, "plugin");
+		java.util.Objects.requireNonNull(channel, "channel");
+		java.util.Objects.requireNonNull(message, "message");
+		// The API's own contract: sending on a channel the plugin never registered is a plugin
+		// bug, and saying so here names the plugin rather than letting the game drop the packet
+		// silently.
+		if (!server.getMessenger().isOutgoingChannelRegistered(plugin, channel)) {
+			throw new IllegalArgumentException("Plugin " + plugin.getDescription().getFullName()
+					+ " does not have " + channel + " registered as an outgoing channel");
+		}
+		// A handle can outlive the connection; there is nowhere to send to then, and the API's
+		// answer to that is a silent return rather than an exception.
+		if (player.connection == null) {
+			return;
+		}
+		// DiscardedPayload rather than a registered payload type: the channel is unknown to the
+		// game by construction - that is what a plugin channel is - and the patch to
+		// DiscardedPayload is what keeps the body on the wire instead of throwing it away.
+		// Proof of transmission, at the one place the packet actually leaves the server. The
+		// receive side already logs every arriving payload, so without this the two directions
+		// are not comparable: "the client shows the wrong state" cannot be told apart from
+		// "the server never sent the state".
+		net.neoforbrickit.bridge.util.ForbricLog.info(
+				"[Forbric/Bukkit] sending plugin message %s to %s (%s bytes)",
+				channel, player.getScoreboardName(), message.length);
+		player.connection.send(new net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(
+				new net.minecraft.network.protocol.common.custom.DiscardedPayload(
+						net.minecraft.resources.Identifier.parse(channel), message)));
 	}
 
 	@Override
 	public java.util.Set<java.lang.String> getListeningPluginChannels() {
-		throw notYet("getListeningPluginChannels");
+		// A copy: the caller owns the returned set, and handing out the live one would let
+		// plugin code mutate the client's registration by accident.
+		java.util.Set<String> channels = channelSet();
+		synchronized (channels) {
+			return java.util.Collections.unmodifiableSet(new java.util.LinkedHashSet<>(channels));
+		}
+	}
+
+	/** This player's channel set, created on first use. */
+	private java.util.Set<String> channelSet() {
+		return CHANNELS.computeIfAbsent(player,
+				key -> java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>()));
+	}
+
+	/**
+	 * Registers a channel this player's client may send on.
+	 *
+	 * <p>Not part of the Bukkit API, and named so a plugin will not call it by accident:
+	 * Simple Voice Chat reaches it by reflecting on the CraftPlayer type for exactly this
+	 * name, which is how it asks the server to accept a channel without a round trip.
+	 */
+	public void addChannel(java.lang.String channel) {
+		java.util.Objects.requireNonNull(channel, "channel");
+		String corrected = org.bukkit.plugin.messaging.StandardMessenger.validateAndCorrectChannel(channel);
+		if (channelSet().add(corrected)) {
+			server.getPluginManager().callEvent(
+					new org.bukkit.event.player.PlayerRegisterChannelEvent(this, corrected));
+		}
+	}
+
+	/** The counterpart of {@link #addChannel(String)}, and reached the same way. */
+	public void removeChannel(java.lang.String channel) {
+		java.util.Objects.requireNonNull(channel, "channel");
+		String corrected = org.bukkit.plugin.messaging.StandardMessenger.validateAndCorrectChannel(channel);
+		if (channelSet().remove(corrected)) {
+			server.getPluginManager().callEvent(
+					new org.bukkit.event.player.PlayerUnregisterChannelEvent(this, corrected));
+		}
 	}
 
 	@Override

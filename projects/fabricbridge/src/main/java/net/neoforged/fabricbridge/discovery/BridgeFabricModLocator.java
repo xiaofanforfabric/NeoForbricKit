@@ -1266,12 +1266,26 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
      */
     private static java.util.Set<String> platformProvidedPackages(java.util.Collection<Path> fabricJars) {
         var fabricPackages = new java.util.HashSet<String>();
+        // Temporary diagnostic: how many jars are actually indexed, and whether the extracted fabric-api
+        // sub-modules (which carry the mixinextras classes) are part of that list.
+        var indexed = 0;
+        var fabricApiSubmodules = 0;
         for (var path : fabricJars) {
+            indexed++;
+            if (path.getFileName().toString().startsWith("fabric-")) {
+                fabricApiSubmodules++;
+            }
             try (var contents = JarContents.ofPath(path)) {
                 contents.visitContent((relativePath, resource) -> {
                     var packageName = packageOfEntry(relativePath);
                     if (packageName != null) {
                         fabricPackages.add(packageName);
+                        // Temporary diagnostic: which jar actually carries the mixinextras entries the
+                        // composite ends up claiming.
+                        if (packageName.startsWith("com.llamalad7")) {
+                            LOGGER.info("[NeoFobric] mixinextras entry in {}: {} ({})",
+                                    path.getFileName(), relativePath, packageName);
+                        }
                     }
                 });
             } catch (Exception e) {
@@ -1330,6 +1344,15 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
                 platform.add(packageName);
             }
         }
+        // Temporary diagnostic for the fabric-api / mixinextras split package: show what the intersection
+        // actually resolved to, so it is clear whether the mixinextras packages ever reach the filter.
+        LOGGER.info("[NeoFobric] platform packages: {} of {} candidate package(s); fmlSidePackages={}; "
+                        + "mixinextras candidates={}; mixinextras platform={}",
+                platform.size(), fabricPackages.size(), fmlSidePackages.size(),
+                fabricPackages.stream().filter(name -> name.startsWith("com.llamalad7")).sorted().toList(),
+                platform.stream().filter(name -> name.startsWith("com.llamalad7")).sorted().toList());
+        LOGGER.info("[NeoFobric] platform index: indexed {} jar(s) ({} of them fabric-* sub-modules)",
+                indexed, fabricApiSubmodules);
         return platform;
     }
 
@@ -1399,7 +1422,19 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
      */
     private static boolean isPlatformNamespace(String packageName) {
         return packageName.equals("net.neoforged") || packageName.startsWith("net.neoforged.")
-                || packageName.equals("cpw.mods") || packageName.startsWith("cpw.mods.");
+                || packageName.equals("cpw.mods") || packageName.startsWith("cpw.mods.")
+                // MixinExtras ships inside the NeoForge universal jar as a JiJ module, so FML puts it on
+                // the game layer as its own module (mixinextras.neoforge) on every install. Fabric API's
+                // modules embed a handful of individual MixinExtras classes (fabric-entity-events-v1 packs
+                // com/llamalad7/mixinextras/injector/wrapoperation/Operation.class, fabric-rendering-v1 packs
+                // the sugar refs) instead of the whole library. Those few classes make the composite export
+                // the same package as mixinextras.neoforge and the JDK refuses the layer:
+                //   Modules neofobric.fabric.mods and mixinextras.neoforge export package
+                //   com.llamalad7.mixinextras.injector.wrapoperation to module net.neoforged.fml.generated
+                // The platform's copy is complete and on the classpath already, so the composite must not
+                // claim any of it - same rule as the NeoForge namespace above.
+                || packageName.equals("com.llamalad7.mixinextras")
+                || packageName.startsWith("com.llamalad7.mixinextras.");
     }
 
     /**
@@ -1925,10 +1960,41 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             // 合并在这一个模块里，包共享是这里的既定设计。
             var packages = new java.util.HashSet<String>();
             contents.visitContent((path, resource) -> collectPackage(packages, path));
+            // Temporary diagnostic: locate the delegate that contributes the mixinextras classes, plus any
+            // nested jar path inside it, so the source is unambiguous.
+            if (contents instanceof CompositeJarContents compositeContents) {
+                LOGGER.info("[NeoFobric] composite has {} delegate(s)", compositeContents.getDelegates().size());
+                for (var delegate : compositeContents.getDelegates()) {
+                    LOGGER.info("[NeoFobric] composite delegate: {}", delegate.getPrimaryPath());
+                    delegate.visitContent((relativePath, resource) -> {
+                        if (relativePath.contains("llamalad7")) {
+                            LOGGER.info("[NeoFobric] composite delegate {} carries: {}",
+                                    delegate.getPrimaryPath() == null ? "?" : delegate.getPrimaryPath().getFileName(),
+                                    relativePath);
+                        }
+                    });
+                }
+            }
             for (var modulePackage : builder.build().packages()) {
+                // scanAutomaticModule already claimed every package that has classes, the platform-owned ones
+                // included. Those must stay out of the descriptor as well: the composite may not export a
+                // package that mixinextras.neoforge (or neoforge) contains, or the JDK refuses the layer with
+                //   Module mixinextras.neoforge contains package ..., module neofobric.fabric.mods exports
+                //   package ... to mixinextras.neoforge
+                // The class-level filter already removed the duplicate classes, so what remains here is a new
+                // class the platform cannot see; report it through strandedClasses like collectPackage does.
+                if (platformPackages.contains(modulePackage)) {
+                    continue;
+                }
                 packages.add(modulePackage);
             }
             builder.packages(packages);
+            // Temporary diagnostic: what the descriptor ends up claiming. The mixinextras packages must not
+            // appear here, and the platformOwner flag must be true, or the JDK still sees a split package.
+            LOGGER.info("[NeoFobric] composite descriptor: {} package(s); platformOwned={}; "
+                            + "mixinextras declared={}",
+                    packages.size(), platformPackages.size(),
+                    packages.stream().filter(name -> name.startsWith("com.llamalad7")).sorted().toList());
             if (!strandedClasses.isEmpty()) {
                 LOGGER.warn("[NeoFobric] Dropped {} class(es) that live in a platform-owned package and"
                                 + " therefore cannot be loaded from the Fabric composite module: {}",

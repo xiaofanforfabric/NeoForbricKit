@@ -1,3 +1,4 @@
 net.neoforbrickit.bridge.transform.BukkitInteractInjector
 net.neoforbrickit.bridge.transform.BukkitMessageInjector
 net.neoforbrickit.bridge.transform.BukkitChannelInjector
+net.neoforbrickit.bridge.transform.BukkitPlayerEventInjector

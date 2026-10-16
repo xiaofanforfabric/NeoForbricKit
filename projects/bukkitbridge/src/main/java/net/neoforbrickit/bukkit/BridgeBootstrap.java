@@ -205,6 +205,10 @@ public final class BridgeBootstrap {
 			}
 		}
 		loaded.clear();
+		// The scheduler timers last: a plugin disabled just above may have left a task queued, and those
+		// tasks hold a reference to a plugin that is no longer enabled. Stopping the timers after the
+		// plugins (rather than before) lets a plugin's own onDisable cancel what it scheduled.
+		server.shutdownSchedulers();
 		// The server stays registered, and deliberately so: a plugin's shutdown code still calls
 		// Bukkit.getXxx(), and a null field would turn a clean disable into the NullPointerException this
 		// bridge exists to avoid. Nothing has to be done to keep it - Bukkit holds the instance in its own

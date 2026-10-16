@@ -205,11 +205,21 @@ public final class BridgeBootstrap {
 			}
 		}
 		loaded.clear();
-                // Unregister last, and only after every plugin has had its onDisable: a plugin's shutdown code
-                // still calls Bukkit.getXxx(), and clearing the field first would turn a clean disable into the
-                // same NullPointerException this bridge exists to avoid. Never reset to null, either — a stale
-                // bridge is friendlier to a plugin that runs late than an absent one.
-                org.bukkit.Bukkit.setServer(server);
+		// The server stays registered, and deliberately so: a plugin's shutdown code still calls
+		// Bukkit.getXxx(), and a null field would turn a clean disable into the NullPointerException this
+		// bridge exists to avoid. Nothing has to be done to keep it - Bukkit holds the instance in its own
+		// static field, so "not clearing it" is the whole of the requirement.
+		//
+		// The call that used to sit here was Bukkit.setServer(server), under a comment about unregistering
+		// late. It could only ever fail: setServer sets the singleton and throws
+		// UnsupportedOperationException("Cannot redefine singleton Server") when it is already set, which it
+		// always is by this point (the bridge set it at startup). Every shutdown logged
+		//
+		//   [NeoFobric/Bukkit] the plugin bridge did not stop cleanly: java.lang.UnsupportedOperationException:
+		//   Cannot redefine singleton Server
+		//
+		// and that message reads as "the bridge cannot shut down" rather than "a line here was a no-op that
+		// misfired", which is exactly the kind of report it produced.
 	}
 
 	/** The plugins this bridge enabled, in order, as a snapshot. */

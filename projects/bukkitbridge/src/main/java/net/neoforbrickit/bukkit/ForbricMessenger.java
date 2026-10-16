@@ -58,6 +58,18 @@ final class ForbricMessenger implements Messenger {
 		return channel.toLowerCase(java.util.Locale.ROOT).startsWith("minecraft:");
 	}
 
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>Idempotent: registering a channel twice is a no-op, not an error. Bukkit's own
+	 * {@code SimplePluginManager} stores the channel in a set and a second call changes nothing, and
+	 * plugins do call it twice in the wild — the pattern is "register on enable" followed by a
+	 * re-registration after a config reload, or the same channel named in two places in one
+	 * {@code onEnable}. Treating the second call as a fault takes the plugin down (or, when the
+	 * plugin's own {@code onEnable} throws, the whole {@code PluginManager} path that called it),
+	 * which is exactly what the reporter of this bug saw. Nothing is left unregistered by
+	 * returning quietly: the channel is already in the set.
+	 */
 	@Override
 	public synchronized void registerOutgoingPluginChannel(Plugin plugin, String channel) {
 		Objects.requireNonNull(plugin, "plugin");
@@ -66,7 +78,15 @@ final class ForbricMessenger implements Messenger {
 			throw new IllegalArgumentException("Plugin " + plugin.getDescription().getFullName()
 					+ " cannot send on reserved channel '" + channel + "'");
 		}
-		outgoing.computeIfAbsent(plugin, key -> new LinkedHashSet<>()).add(channel);
+		Set<String> channels = outgoing.computeIfAbsent(plugin, key -> new LinkedHashSet<>());
+		if (!channels.add(channel)) {
+			// Said out loud, once per repeat: a silent no-op is indistinguishable from "the
+			// registration was lost", which is the failure mode this bridge has been bitten by.
+			net.neoforbrickit.bridge.util.ForbricLog.info(
+					"[Forbric/Bukkit] plugin %s registered outgoing channel %s again; already registered,"
+							+ " nothing to do",
+					plugin.getDescription().getFullName(), channel);
+		}
 	}
 
 	@Override
@@ -87,6 +107,16 @@ final class ForbricMessenger implements Messenger {
 		outgoing.remove(plugin);
 	}
 
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>Idempotent for the same reason as
+	 * {@link #registerOutgoingPluginChannel(Plugin, String)}: the listener lands in a set, so a
+	 * repeat registration is the same registration, and the API's return value is the handle a
+	 * plugin uses to unregister it. Returning that same handle from a second call — rather than
+	 * refusing — keeps {@code unregisterIncomingPluginChannel(plugin, channel, registration)} valid
+	 * for whichever call the plugin kept.
+	 */
 	@Override
 	public synchronized PluginMessageListenerRegistration registerIncomingPluginChannel(
 			Plugin plugin, String channel, PluginMessageListener listener) {
@@ -97,9 +127,14 @@ final class ForbricMessenger implements Messenger {
 			throw new IllegalArgumentException("Plugin " + plugin.getDescription().getFullName()
 					+ " cannot listen on reserved channel '" + channel + "'");
 		}
-		incoming.computeIfAbsent(channel, key -> new LinkedHashMap<>())
+		if (!incoming.computeIfAbsent(channel, key -> new LinkedHashMap<>())
 				.computeIfAbsent(plugin, key -> new LinkedHashSet<>())
-				.add(listener);
+				.add(listener)) {
+			net.neoforbrickit.bridge.util.ForbricLog.info(
+					"[Forbric/Bukkit] plugin %s registered a listener for incoming channel %s again;"
+							+ " already registered, nothing to do",
+					plugin.getDescription().getFullName(), channel);
+		}
 		return new PluginMessageListenerRegistration(this, plugin, channel, listener);
 	}
 

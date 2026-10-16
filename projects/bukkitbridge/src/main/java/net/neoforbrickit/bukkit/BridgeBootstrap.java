@@ -8,7 +8,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.logging.ConsoleHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -126,13 +125,33 @@ public final class BridgeBootstrap {
 		return bridge;
 	}
 
-	/** A logger that writes to the console at INFO, so a plugin's own logging is visible while this is built. */
+	/**
+	 * The logger every plugin receives, and the one the bridge itself reports through.
+	 *
+	 * <p><b>Routed into log4j, not JUL's console.</b> This used to install a plain
+	 * {@link java.util.logging.ConsoleHandler}, which formats with JUL's {@code SimpleFormatter} and writes to
+	 * {@code System.err}. A plugin's {@code getLogger().info(...)} then appeared as
+	 * {@code 信息: some message} — no timestamp, no thread, no logger name, the level localised — and never
+	 * reached {@code logs/latest.log} at all, because {@code System.err} is the console only. An operator
+	 * reading the log a bug report ships saw the bridge's own lines and none of the plugin's.
+	 *
+	 * <p>{@link BridgeLogHandler} forwards each record to {@link ForbricLog}, which already speaks log4j
+	 * reflectively, so plugin lines get the platform's own layout (timestamp, thread, level) and land in the
+	 * same file as everything else.
+	 *
+	 * <p>{@code useParentHandlers(false)} stays: the JUL root logger's own handler would otherwise print the
+	 * same line a second time in JUL's format, which is the bug being fixed.
+	 *
+	 * <p>A per-plugin {@link org.bukkit.plugin.PluginLogger} would additionally add the {@code [PluginName]}
+	 * prefix, and is what a reference server uses. It is not done here because that constructor reads
+	 * {@code plugin.getServer()}, which is only assigned by {@code JavaPlugin.init} — the same call whose
+	 * logger argument would have to be the PluginLogger. Every plugin sharing this one logger is therefore the
+	 * shape this bridge can support without replacing the field reflectively after init.
+	 */
 	private static Logger createLogger() {
 		Logger logger = Logger.getLogger("Forbric.Bukkit");
 		logger.setUseParentHandlers(false);
-		ConsoleHandler handler = new ConsoleHandler();
-		handler.setLevel(Level.ALL);
-		logger.addHandler(handler);
+		logger.addHandler(BridgeLogHandler.INSTANCE);
 		logger.setLevel(Level.ALL);
 		return logger;
 	}

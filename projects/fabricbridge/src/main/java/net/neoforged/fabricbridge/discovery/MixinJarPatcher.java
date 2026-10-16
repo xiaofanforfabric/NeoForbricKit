@@ -559,7 +559,7 @@ public final class MixinJarPatcher {
             }
             var writer = new ClassWriter(0);
             node.accept(writer);
-            LOGGER.info("[NeoFobric] Moved Fabric channels {} in {}", renames.keySet(), entryName);
+            LOGGER.debug("[NeoFobric] Moved Fabric channels {} in {}", renames.keySet(), entryName);
             return writer.toByteArray();
         } catch (Throwable t) {
             LOGGER.warn("[NeoFobric] Could not move Fabric channels in {}", entryName, t);
@@ -625,7 +625,7 @@ public final class MixinJarPatcher {
             }
             var writer = new ClassWriter(0);
             node.accept(writer);
-            LOGGER.info("[NeoFobric] Guarded foreign-build packs' Fabric overlay conditions in {}", entryName);
+            LOGGER.debug("[NeoFobric] Guarded foreign-build packs' Fabric overlay conditions in {}", entryName);
             return writer.toByteArray();
         } catch (Throwable t) {
             LOGGER.warn("[NeoFobric] Could not guard the Fabric overlay conditions in {}", entryName, t);
@@ -667,7 +667,7 @@ public final class MixinJarPatcher {
             }
             var writer = new ClassWriter(0);
             node.accept(writer);
-            LOGGER.info("[NeoFobric] Retargeted the moved entity type constants in {}", entryName);
+            LOGGER.debug("[NeoFobric] Retargeted the moved entity type constants in {}", entryName);
             return writer.toByteArray();
         } catch (Throwable t) {
             LOGGER.warn("[NeoFobric] Could not retarget the moved entity type constants in {}", entryName, t);
@@ -751,7 +751,7 @@ public final class MixinJarPatcher {
             }
             var writer = new ClassWriter(0);
             node.accept(writer);
-            LOGGER.info("[NeoFobric] Pointed the registry-load parse anchor at the Codec receiver in {}", entryName);
+            LOGGER.debug("[NeoFobric] Pointed the registry-load parse anchor at the Codec receiver in {}", entryName);
             return writer.toByteArray();
         } catch (Throwable t) {
             LOGGER.warn("[NeoFobric] Could not point the registry-load parse anchor in {}", entryName, t);
@@ -838,7 +838,7 @@ public final class MixinJarPatcher {
         }
         var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         node.accept(writer);
-        LOGGER.info("[NeoFobric] Injected the CTM probe into {}", entryName);
+        LOGGER.debug("[NeoFobric] Injected the CTM probe into {}", entryName);
         return writer.toByteArray();
     }
 
@@ -943,7 +943,7 @@ public final class MixinJarPatcher {
             }
             patched.put(entryName, generateStubClass(name));
             entries.add(entryName);
-            LOGGER.info("[NeoFobric] Stubbed the absent frame type {} in {} so the platform's frame computation can resolve it",
+            LOGGER.debug("[NeoFobric] Stubbed the absent frame type {} in {} so the platform's frame computation can resolve it",
                     name, jarPath.getFileName());
         }
     }
@@ -1281,13 +1281,13 @@ public final class MixinJarPatcher {
             }
         }
         if (!rewritten.isEmpty()) {
-            LOGGER.info("[NeoFobric] Pointed the <init> selector(s) of {} in {} at the constructor that "
+            LOGGER.debug("[NeoFobric] Pointed the <init> selector(s) of {} in {} at the constructor that "
                     + "carries the body: {}{}", rewritten, entryName, fullDescriptor,
                     pinned.isEmpty() ? "" : "; left alone, their arguments pin the constructor: " + pinned);
             return writeClass(node);
         }
         if (!pinned.isEmpty()) {
-            LOGGER.info("[NeoFobric] Left the <init> selector(s) of {} in {} alone - their arguments pin the "
+            LOGGER.debug("[NeoFobric] Left the <init> selector(s) of {} in {} alone - their arguments pin the "
                     + "constructor they target", pinned, entryName);
         }
         return null;
@@ -1428,7 +1428,7 @@ public final class MixinJarPatcher {
         if (rewritten == classBytes) {
             return null; // Nothing in this class references the moved names.
         }
-        LOGGER.info("[NeoFobric] Pointed a loader-specific reference at the build that loads in {}", entryName);
+        LOGGER.debug("[NeoFobric] Pointed a loader-specific reference at the build that loads in {}", entryName);
         return rewritten;
     }
 
@@ -1463,7 +1463,7 @@ public final class MixinJarPatcher {
 
         var writer = new ClassWriter(0);
         node.accept(writer);
-        LOGGER.info("[NeoFobric] Realigned stale Mixin annotation targets in {}", entryName);
+        LOGGER.debug("[NeoFobric] Realigned stale Mixin annotation targets in {}", entryName);
         return writer.toByteArray();
     }
 
@@ -1648,7 +1648,7 @@ public final class MixinJarPatcher {
             }
 
             widenHandler(handler, inject, delegatee, targetParams);
-            LOGGER.info("[NeoFobric] Widened constructor-injection handler {}#{} from {} to the widened constructor {}{}",
+            LOGGER.debug("[NeoFobric] Widened constructor-injection handler {}#{} from {} to the widened constructor {}{}",
                     node.name.replace('/', '.'), handler.name, shortDesc, node.name, delegatee.desc);
             changed = true;
         }
@@ -1893,7 +1893,7 @@ public final class MixinJarPatcher {
                     }
                     writeStringValue(at, "value", "TAIL");
                     removeValue(at, "ordinal");
-                    LOGGER.info("[NeoFobric] Lifted @At(RETURN, ordinal) onto @At(TAIL) on {}#{} - the ordinal points past every return the target has",
+                    LOGGER.debug("[NeoFobric] Lifted @At(RETURN, ordinal) onto @At(TAIL) on {}#{} - the ordinal points past every return the target has",
                             entryName.replace('/', '.'), method.name);
                     changed = true;
                 }
@@ -2384,7 +2384,7 @@ public final class MixinJarPatcher {
             // in the whole mod set, and an "Appended 0" line for each of them buries the log and costs real
             // time (these runs emit tens of thousands of log lines).
             if (missing.length > 0) {
-                LOGGER.info("[NeoFobric] Appended {} missing trailing parameter(s) to @Inject handler {}#{} (target {}.{})",
+                LOGGER.debug("[NeoFobric] Appended {} missing trailing parameter(s) to @Inject handler {}#{} (target {}.{})",
                         missing.length, node.name.replace('/', '.'), handler.name,
                         targetClass.name.replace('/', '.'), longerTarget.name);
             } else {
@@ -2853,7 +2853,7 @@ public final class MixinJarPatcher {
         if (!changed) {
             return null;
         }
-        LOGGER.info("[NeoFobric] Pointed the injections in {} at the method(s) NeoForge moved the body into: {}", internalName, moved);
+        LOGGER.debug("[NeoFobric] Pointed the injections in {} at the method(s) NeoForge moved the body into: {}", internalName, moved);
         return writeClass(node);
     }
 
@@ -2919,7 +2919,7 @@ public final class MixinJarPatcher {
         }
         var internalName = entryName.substring(0, entryName.length() - ".class".length());
         if (KEEP_INERT_MIXINS.contains(internalName)) {
-            LOGGER.info("[NeoFobric] Leaving the injections in {} inert on purpose - the platform covers what they"
+            LOGGER.debug("[NeoFobric] Leaving the injections in {} inert on purpose - the platform covers what they"
                     + " would install, and reviving them breaks it", internalName);
             return null;
         }
@@ -3723,7 +3723,7 @@ public final class MixinJarPatcher {
         if (!changed) {
             return null;
         }
-        LOGGER.info("[NeoFobric] Pointed the resource lookups in {} at FabricResourceHooks", jarPath.getFileName());
+        LOGGER.debug("[NeoFobric] Pointed the resource lookups in {} at FabricResourceHooks", jarPath.getFileName());
         return writeClass(node);
     }
 
@@ -3881,7 +3881,7 @@ public final class MixinJarPatcher {
         }
 
         if (!changed) {
-            LOGGER.info("[NeoFobric] {} no longer names addDetailsToTooltip; the vanilla tooltip order scan"
+            LOGGER.debug("[NeoFobric] {} no longer names addDetailsToTooltip; the vanilla tooltip order scan"
                     + " needs checking against NeoForge's ItemStack", FABRIC_TOOLTIP_ORDER_SCANNER.replace('/', '.'));
             return null;
         }
@@ -4065,7 +4065,7 @@ public final class MixinJarPatcher {
                 continue;
             }
 
-            LOGGER.info("[NeoFobric] Widened @WrapOperation handler {}#{} for {}.{}{}", node.name.replace('/', '.'),
+            LOGGER.debug("[NeoFobric] Widened @WrapOperation handler {}#{} for {}.{}{}", node.name.replace('/', '.'),
                     handler.name, wrappedOwner.name.replace('/', '.'), name, wrapped.desc);
             changed = true;
         }
@@ -5195,7 +5195,7 @@ public final class MixinJarPatcher {
             changed = true;
         }
         if (changed) {
-            LOGGER.info("[NeoFobric] Renamed colliding accessor member(s) {} in {}",
+            LOGGER.debug("[NeoFobric] Renamed colliding accessor member(s) {} in {}",
                     plan.keySet(), mixin.name.replace('/', '.'));
         }
         return changed;
@@ -5272,7 +5272,7 @@ public final class MixinJarPatcher {
         if (!changed) {
             return null;
         }
-        LOGGER.info("[NeoFobric] Moved the call site(s) of a renamed accessor member in {}", entryName);
+        LOGGER.debug("[NeoFobric] Moved the call site(s) of a renamed accessor member in {}", entryName);
         return writeClass(node);
     }
 
@@ -5371,7 +5371,7 @@ public final class MixinJarPatcher {
             LOGGER.warn("[NeoFobric] Could not read the FML side's overwrites", t);
             result = java.util.Map.of();
         }
-        LOGGER.info("[NeoFobric] Read {} mixin class(es) from {} NeoForge jar(s): {} class(es)/{} member(s) are overwritten and stay private",
+        LOGGER.debug("[NeoFobric] Read {} mixin class(es) from {} NeoForge jar(s): {} class(es)/{} member(s) are overwritten and stay private",
                 collected.size(), jars, result.size(), overwrites);
         if (jars > 0) {
             // Only a real answer is cached: an empty listing (a jar whose parent is not the mods folder) must
@@ -5439,7 +5439,7 @@ public final class MixinJarPatcher {
                     ? platformNamespaceShadingPlan(zip, resolver)
                     : java.util.Map.<String, String>of();
             if (!platformShading.isEmpty()) {
-                LOGGER.info("[NeoFobric] Shading {} platform-namespace class(es) of {} - the platform does not provide "
+                LOGGER.debug("[NeoFobric] Shading {} platform-namespace class(es) of {} - the platform does not provide "
                         + "those (or provides less), so the jar's own copies are kept under {}: {}",
                         platformShading.size(), jarPath.getFileName(), SHADED_PREFIX,
                         platformShading.keySet().stream().limit(4).map(n -> n + " -> " + SHADED_PREFIX + n)
@@ -5472,7 +5472,7 @@ public final class MixinJarPatcher {
                         patched.put("fabric-model-loading-api-v1.mixins.json", withEntry.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         entries.add(mixinClassPath);
                         patched.put(mixinClassPath, generateBridgeModelDiscoveryMixin(false));
-                        LOGGER.info("[NeoFobric] Injected BridgeModelDiscoveryMixin into {}", jarPath.getFileName());
+                        LOGGER.debug("[NeoFobric] Injected BridgeModelDiscoveryMixin into {}", jarPath.getFileName());
                     }
                 }
                 if (entry.getName().equals("create.client.mixins.json")) {
@@ -5485,7 +5485,7 @@ public final class MixinJarPatcher {
                         var mixinClassPath = "com/zurrtum/create/client/mixin/BridgeCreatePartialModelMixin.class";
                         entries.add(mixinClassPath);
                         patched.put(mixinClassPath, generateBridgeModelDiscoveryMixin(true));
-                        LOGGER.info("[NeoFobric] Injected BridgeCreatePartialModelMixin into {}", jarPath.getFileName());
+                        LOGGER.debug("[NeoFobric] Injected BridgeCreatePartialModelMixin into {}", jarPath.getFileName());
                     }
                 }
                 if (!platformShading.isEmpty() && !entry.getName().endsWith(".class")) {
@@ -5501,7 +5501,7 @@ public final class MixinJarPatcher {
                     }
                     if (!rewritten.equals(text)) {
                         patched.put(entry.getName(), rewritten.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                        LOGGER.info("[NeoFobric] Moved the shaded classes in {}", entry.getName());
+                        LOGGER.debug("[NeoFobric] Moved the shaded classes in {}", entry.getName());
                     }
                 }
                 if (!entry.getName().endsWith(".class")) {
@@ -5773,7 +5773,7 @@ public final class MixinJarPatcher {
             var found = net.neoforged.fabricbridge.transform.MixinAccessScanner.findPrivateMembers(allClasses, resolver,
                     platformOverwrites(jarPath));
             var members = found.values().stream().mapToInt(java.util.Set::size).sum();
-            LOGGER.info("[NeoFobric] Access scan of {}: {} classes ({}, mixins), {} class(es)/{} member(s) to widen",
+            LOGGER.debug("[NeoFobric] Access scan of {}: {} classes ({}, mixins), {} class(es)/{} member(s) to widen",
                     jarPath.getFileName(), allClasses.size(), mixinClasses.size(), found.size(), members);
             if (!found.isEmpty()) {
                 net.neoforged.fabricbridge.transform.NeoFobricClassTweakerProcessor.registerWidenedMembers(found);
@@ -5856,7 +5856,7 @@ public final class MixinJarPatcher {
         }
 
         for (var name : patched.keySet()) {
-            LOGGER.info("[NeoFobric] Realigned Mixin handler(s) in {} of {}", name, jarPath.getFileName());
+            LOGGER.debug("[NeoFobric] Realigned Mixin handler(s) in {} of {}", name, jarPath.getFileName());
         }
         writePatchCache(jarPath, stamp, true);
         return patchedPath;

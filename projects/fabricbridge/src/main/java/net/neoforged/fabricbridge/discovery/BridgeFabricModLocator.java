@@ -310,7 +310,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
                     contentsList.add(JarContents.ofPath(libraryJar));
                     contentFilters.add(null);
                     context.addLocated(libraryJar);
-                    LOGGER.info("[NeoFobric] Integrated {} into the Fabric game library for mixin support", libraryJar.getFileName());
+                    LOGGER.debug("[NeoFobric] Integrated {} into the Fabric game library for mixin support", libraryJar.getFileName());
                 } catch (Exception e) {
                     LOGGER.error("[NeoFobric] Failed to integrate {} into the Fabric game library", libraryJar, e);
                 }
@@ -357,7 +357,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
                             realignedJars.put(path, effective);
                             patchedJars.put(path, effective);
                         }
-                        LOGGER.info("[NeoFobric] Patched {} in {} ms", path.getFileName(),
+                        LOGGER.debug("[NeoFobric] Patched {} in {} ms", path.getFileName(),
                                 (System.nanoTime() - jarStarted) / 1_000_000L);
                     } catch (Throwable t) {
                         LOGGER.error("[NeoFobric] Failed to patch {}", path.getFileName(), t);
@@ -668,7 +668,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
         if (path.getFileName().toString().endsWith(MixinJarPatcher.PATCHED_SUFFIX)) {
             try {
                 Files.deleteIfExists(path);
-                LOGGER.info("[NeoFobric] Removed the stale realigned copy {} (regenerated from its original)", path.getFileName());
+                LOGGER.debug("[NeoFobric] Removed the stale realigned copy {} (regenerated from its original)", path.getFileName());
             } catch (IOException e) {
                 LOGGER.warn("[NeoFobric] Could not remove the stale realigned copy {} - ignoring it", path, e);
             }
@@ -688,7 +688,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             // requires any 0.9.x version of sodium, which is missing", because the installed Sodium is the
             // NeoForge build).
             if (jar.readFile("META-INF/neoforge.mods.toml") != null) {
-                LOGGER.info("[NeoFobric] Leaving {} to FML - it declares META-INF/neoforge.mods.toml",
+                LOGGER.debug("[NeoFobric] Leaving {} to FML - it declares META-INF/neoforge.mods.toml",
                         path.getFileName());
                 FabricJarRegistry.markForeignModPath(path);
                 noteFmlSidePackages(path);
@@ -700,7 +700,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             // jar as an old Forge build while the bridge never picks it up either, so the mod never loads.
             byte[] metadata = jar.readFile(FabricJarRegistry.FABRIC_MOD_JSON);
             if (metadata == null && jar.readFile("META-INF/mods.toml") != null) {
-                LOGGER.info("[NeoFobric] Leaving {} to FML - it declares META-INF/mods.toml and no fabric.mod.json",
+                LOGGER.debug("[NeoFobric] Leaving {} to FML - it declares META-INF/mods.toml and no fabric.mod.json",
                         path.getFileName());
                 FabricJarRegistry.markForeignModPath(path);
                 noteFmlSidePackages(path);
@@ -738,8 +738,9 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             info = info.withBundledBy(bundledBy);
         }
         fabricJars.put(path, info);
-        LOGGER.info("[NeoFobric] Found Fabric mod {} {} ({})", info.modId(), info.version(), path);
-
+        // debug: one line per jar in the mods folder, so 50 jars means 50 lines before anything has
+        // happened. It is in logs/debug.log for the case where a mod is missing from the composite.
+        LOGGER.debug("[NeoFobric] Found Fabric mod {} {} ({})", info.modId(), info.version(), path);
         // Extract nested jars to the cache and examine them as well.
         for (var nestedJar : info.nestedJarPaths()) {
             try {
@@ -1352,12 +1353,12 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
         }
         // Temporary diagnostic for the fabric-api / mixinextras split package: show what the intersection
         // actually resolved to, so it is clear whether the mixinextras packages ever reach the filter.
-        LOGGER.info("[NeoFobric] platform packages: {} of {} candidate package(s); fmlSidePackages={}; "
+        LOGGER.debug("[NeoFobric] platform packages: {} of {} candidate package(s); fmlSidePackages={}; "
                         + "mixinextras candidates={}; mixinextras platform={}",
                 platform.size(), fabricPackages.size(), fmlSidePackages.size(),
                 fabricPackages.stream().filter(name -> name.startsWith("com.llamalad7")).sorted().toList(),
                 platform.stream().filter(name -> name.startsWith("com.llamalad7")).sorted().toList());
-        LOGGER.info("[NeoFobric] platform index: indexed {} jar(s) ({} of them fabric-* sub-modules)",
+        LOGGER.debug("[NeoFobric] platform index: indexed {} jar(s) ({} of them fabric-* sub-modules)",
                 indexed, fabricApiSubmodules);
         return platform;
     }
@@ -1712,7 +1713,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
                 }
             }
         }
-        LOGGER.info("[NeoFobric] Game content roots for mixin target resolution (in resolution order): {}", found);
+        LOGGER.debug("[NeoFobric] Game content roots for mixin target resolution (in resolution order): {}", found);
         return found;
     }
 
@@ -1834,7 +1835,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
 
         cached = java.util.List.copyOf(found);
         vanillaDataRoots = cached;
-        LOGGER.info("[NeoFobric] Classpath entries carrying Minecraft's data: {}", cached);
+        LOGGER.debug("[NeoFobric] Classpath entries carrying Minecraft's data: {}", cached);
         return cached;
     }
 
@@ -1893,7 +1894,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
                 if (replaced > 0) {
                     realignedJars.put(parent, target);
                     injected += replaced;
-                    LOGGER.info("[NeoFobric] Carried {} rewritten nested jar(s) inside {}", replaced,
+                    LOGGER.debug("[NeoFobric] Carried {} rewritten nested jar(s) inside {}", replaced,
                             target.getFileName());
                 }
             } catch (Exception e) {
@@ -2021,12 +2022,12 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             // Temporary diagnostic: locate the delegate that contributes the mixinextras classes, plus any
             // nested jar path inside it, so the source is unambiguous.
             if (contents instanceof CompositeJarContents compositeContents) {
-                LOGGER.info("[NeoFobric] composite has {} delegate(s)", compositeContents.getDelegates().size());
+                LOGGER.debug("[NeoFobric] composite has {} delegate(s)", compositeContents.getDelegates().size());
                 for (var delegate : compositeContents.getDelegates()) {
-                    LOGGER.info("[NeoFobric] composite delegate: {}", delegate.getPrimaryPath());
+                    LOGGER.debug("[NeoFobric] composite delegate: {}", delegate.getPrimaryPath());
                     delegate.visitContent((relativePath, resource) -> {
                         if (relativePath.contains("llamalad7")) {
-                            LOGGER.info("[NeoFobric] composite delegate {} carries: {}",
+                            LOGGER.debug("[NeoFobric] composite delegate {} carries: {}",
                                     delegate.getPrimaryPath() == null ? "?" : delegate.getPrimaryPath().getFileName(),
                                     relativePath);
                         }
@@ -2049,7 +2050,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             builder.packages(packages);
             // Temporary diagnostic: what the descriptor ends up claiming. The mixinextras packages must not
             // appear here, and the platformOwner flag must be true, or the JDK still sees a split package.
-            LOGGER.info("[NeoFobric] composite descriptor: {} package(s); platformOwned={}; "
+            LOGGER.debug("[NeoFobric] composite descriptor: {} package(s); platformOwned={}; "
                             + "mixinextras declared={}",
                     packages.size(), platformPackages.size(),
                     packages.stream().filter(name -> name.startsWith("com.llamalad7")).sorted().toList());

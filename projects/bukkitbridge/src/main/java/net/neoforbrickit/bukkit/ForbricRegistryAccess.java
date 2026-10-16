@@ -355,7 +355,13 @@ public final class ForbricRegistryAccess implements RegistryAccess {
         private static final java.util.concurrent.atomic.AtomicBoolean MISS_REPORTED =
                         new java.util.concurrent.atomic.AtomicBoolean();
 
-        /** Counts entries into {@link #get}, so the first few can be traced. Measurement only. */
+        /**
+         * Set by the first reflective failure, so the stack is printed once rather than per lookup.
+         *
+         * <p>An {@code AtomicInteger} rather than a boolean because {@link #get} runs from {@code Sound}'s static
+         * initialiser, on whatever thread first touches the class, and two of them racing for one log line is a
+         * noise problem worth an atomic to avoid. {@code 0} means "not yet reported".
+         */
         private static final java.util.concurrent.atomic.AtomicInteger TRACED =
                         new java.util.concurrent.atomic.AtomicInteger();
 
@@ -397,13 +403,6 @@ public final class ForbricRegistryAccess implements RegistryAccess {
 
         @Override
         public org.bukkit.Sound get(org.bukkit.NamespacedKey key) {
-            // Unconditional trace, first three calls only. This is a measurement, not a fix: the miss branch
-            // below has not been reached in two runs, so the question is whether this method is entered at all
-            // and what it is handed. Removed once the answer is in.
-            if (TRACED.getAndIncrement() < 3) {
-                System.err.println("[NeoFobric/Bukkit] SOUND GET key=" + key
-                        + " registries=" + (ForbricRegistries.access() != null));
-            }
             if (key == null) {
                 return null;
             }
@@ -431,34 +430,27 @@ public final class ForbricRegistryAccess implements RegistryAccess {
                 boolean contains = (boolean) soundRegistry.getClass()
                         .getMethod("containsKey", identifierClass).invoke(soundRegistry, id);
                 if (!contains) {
-                    // Sound.<clinit> asks for ~2000 hard-coded ids and dies on the first miss, so the first miss is
-                    // worth evidence rather than a silent null.
+                    // Sound.<clinit> asks for ~2000 hard-coded ids, so a miss here is worth reporting once: a
+                    // plugin asking for a sound the game does not have is a plugin bug, but a bridge that cannot
+                    // see the registry at all would report the same way, and one line each is how the two are told
+                    // apart. Reported once rather than per lookup, because Sound's own initialiser would otherwise
+                    // produce two thousand of them.
                     //
-                    // Written with System.err rather than ForbricLog, and with no format string: this runs from
-                    // inside a static initialiser on whatever thread first touches Sound, and both the logger
-                    // bridge and %-formatting are two more things that can fail there and turn this into a second
-                    // silent miss. Everything below is a plain concatenation for the same reason.
+                    // ForbricLog.warn rather than a throw: an absent sound is a legitimate null answer, the same
+                    // one Bukkit documents for any name that is not in a registry.
                     if (MISS_REPORTED.compareAndSet(false, true)) {
-                        var sample = new StringBuilder();
-                        @SuppressWarnings("unchecked")
-                        java.util.Set<Object> allKeys = (java.util.Set<Object>) soundRegistry.getClass()
-                                .getMethod("keySet").invoke(soundRegistry);
-                        allKeys.stream().limit(8).forEach(k -> {
-                            try {
-                                sample.append(' ').append(k);
-                            } catch (Exception ignore) {}
-                        });
-                        System.err.println("[NeoFobric/Bukkit] SOUND MISS id=" + id
-                                + " containsKey=false size=" + allKeys.size()
-                                + " first=" + sample);
+                        net.neoforbrickit.bridge.util.ForbricLog.warn(
+                                "[Forbric/Bukkit] no sound is registered under %s; answering null", id);
                     }
                     return null;
                 }
                 return ForbricSound.of(key);
             } catch (Exception e) {
-                if (TRACED.getAndIncrement() < 2) {
-                    System.err.println("[NeoFobric/Bukkit] SOUND GET reflection failed for key=" + key);
-                    e.printStackTrace(System.err);
+                // A reflective miss, not an absent sound: the game's registry could not be walked at all. Worth a
+                // line with the stack, because the cause is never in this method, but only once.
+                if (TRACED.compareAndSet(0, -1)) {
+                    net.neoforbrickit.bridge.util.ForbricLog.warn(
+                            "[Forbric/Bukkit] could not read the game's sound registry; sounds will not resolve", e);
                 }
                 return null;
             }

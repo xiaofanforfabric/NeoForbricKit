@@ -47,16 +47,38 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
         private static final java.util.Map<net.minecraft.server.level.ServerPlayer, java.util.Set<String>> CHANNELS =
                         java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
-        /**
-         * Whatever this player has been granted at run time, in the order it was added.
-         *
-         * <p>Per wrapper, because a wrapper is built per call — see {@link #of}. A plugin that adds an
-         * attachment holds the wrapper it added it to and reads it back through the same one, which is the only
-         * usage the API describes; one that stores the attachment and re-reads through a NEW wrapper gets the
-         * attachment's own {@code getPermissions()} back, which is the documented way to do that.
-         */
-        private final java.util.List<org.bukkit.permissions.PermissionAttachment> attachments =
-                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+	/**
+	 * The per-player metadata every plugin shares.
+	 *
+	 * <p><b>Static, and keyed by the game's player, for a reason that is easy to get wrong.</b> A wrapper is
+	 * built per call (see {@link #of}), so a store held on the wrapper would be visible to exactly one caller
+	 * and a plugin would read back what it had written only if it held the same wrapper. The API's whole point
+	 * is the opposite: one plugin writes a value and a different plugin, through a different wrapper it built
+	 * itself, reads it. {@code %vanished%} is precisely that shape — a vanish plugin sets the marker, TAB
+	 * looks it up — and it cannot work with per-wrapper state.
+	 *
+	 * <p>{@link org.bukkit.metadata.MetadataStoreBase} rather than a map of our own, because it is the
+	 * semantics the API documents and plugins are already written against: one value per plugin per key,
+	 * several plugins may set the same key without overwriting each other, and {@code getMetadata} returns
+	 * all of them in one list. Reimplementing that here would be a second, subtly different version of a
+	 * contract plugins already depend on.
+	 *
+	 * <p>Weak keys, like {@link #CHANNELS}: metadata is not persisted anywhere and a departed player's
+	 * entry is unreachable the moment the game drops its own player object.
+	 */
+	private static final org.bukkit.metadata.MetadataStore<net.minecraft.server.level.ServerPlayer> METADATA =
+			new ForbricMetadataStore();
+
+	/**
+	 * Whatever this player has been granted at run time, in the order it was added.
+	 *
+	 * <p>Per wrapper, because a wrapper is built per call — see {@link #of}. A plugin that adds an
+	 * attachment holds the wrapper it added it to and reads it back through the same one, which is the only
+	 * usage the API describes; one that stores the attachment and re-reads through a NEW wrapper gets the
+	 * attachment's own {@code getPermissions()} back, which is the documented way to do that.
+	 */
+	private final java.util.List<org.bukkit.permissions.PermissionAttachment> attachments =
+			java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
         private ForbricPlayer(net.minecraft.server.level.ServerPlayer player, ServerImpl server) {
                 super(player);
@@ -1326,7 +1348,23 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public int getPing() {
-		throw notYet("getPing");
+		// The server's own measurement of this player's round trip, in milliseconds. It is what the tab list
+		// shows and what every "is this player lagging" plugin reads, so it has to be the real number rather
+		// than a constant: the connection keeps it up to date from the keep-alive exchange, and the same
+		// value is what vanilla puts in the player list packet.
+		//
+		// Reached through the listener rather than through the player, because that is where the field lives;
+		// `connection` is public on ServerPlayer (and the field on the listener has been widened), and
+		// `latency()` is a public getter, so this is two plain calls with nothing reflective in between.
+		//
+		// Answered before the listener exists, and that is a real case: the wrapper can be built for a player
+		// whose connection has not been attached yet, and asking then would throw out of a method plugins
+		// call in a loop. 0 is the honest answer for "no measurement yet", and it is also what vanilla
+		// reports for a player who has just joined.
+		if (player.connection == null) {
+			return 0;
+		}
+		return player.connection.latency();
 	}
 
 	@Override
@@ -3194,22 +3232,22 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public void setMetadata(java.lang.String arg0, org.bukkit.metadata.MetadataValue arg1) {
-		throw notYet("setMetadata");
+		METADATA.setMetadata(player, arg0, arg1);
 	}
 
 	@Override
 	public java.util.List<org.bukkit.metadata.MetadataValue> getMetadata(java.lang.String arg0) {
-		throw notYet("getMetadata");
+		return METADATA.getMetadata(player, arg0);
 	}
 
 	@Override
 	public boolean hasMetadata(java.lang.String arg0) {
-		throw notYet("hasMetadata");
+		return METADATA.hasMetadata(player, arg0);
 	}
 
 	@Override
 	public void removeMetadata(java.lang.String arg0, org.bukkit.plugin.Plugin arg1) {
-		throw notYet("removeMetadata");
+		METADATA.removeMetadata(player, arg0, arg1);
 	}
 
 	@Override

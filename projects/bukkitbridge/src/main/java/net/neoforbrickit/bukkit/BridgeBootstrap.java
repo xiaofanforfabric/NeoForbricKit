@@ -41,6 +41,15 @@ public final class BridgeBootstrap {
 	private final ClassLoader hostLoader;
 	private final List<PluginHandle> loaded = new ArrayList<>();
 
+	/**
+	 * The group every plugin's class loader joins, so one plugin's classes are reachable from another.
+	 *
+	 * <p>Holds a supplier over {@link #loaded} rather than a copy: loaders are created one at a time while
+	 * this folder is walked, so a snapshot taken now would be missing every plugin loaded afterwards — which,
+	 * for a plugin loaded last, is all of them.
+	 */
+	private final ForbricClassLoaderGroup classLoaderGroup = new ForbricClassLoaderGroup(() -> loaded);
+
 	private BridgeBootstrap(Path pluginsFolder, Logger logger, ServerImpl server, ClassLoader hostLoader) {
 		this.pluginsFolder = pluginsFolder;
 		this.logger = logger;
@@ -191,7 +200,7 @@ public final class BridgeBootstrap {
 		for (Path jar : jars) {
 			try {
 
-				PluginHandle handle = PluginHandle.load(jar, hostLoader, dataFolder, logger, server);
+				PluginHandle handle = PluginHandle.load(jar, hostLoader, dataFolder, logger, server, classLoaderGroup);
 				loaded.add(handle);
 				server.enablePlugin(handle);
 				logger.info("enabled " + handle.description().getFullName() + " from " + jar.getFileName());

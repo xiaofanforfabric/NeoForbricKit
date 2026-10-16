@@ -1195,17 +1195,31 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public double[] getTPS() {
-		throw notYet("getTPS");
+		// Ticks per second over the recent past. Vanilla keeps the last 100 tick durations in a ring buffer
+		// (tickTimesNanos, slot = tickCount % 100), so we can answer this from data that is already being
+		// collected -- no sampling of our own, and no plugin-visible difference from a real Paper server.
+		//
+		// One tick is scheduled every 50ms, i.e. 50_000_000ns, so a slot that took `n` nanoseconds
+		// corresponds to 20 * (50_000_000 / n) ticks in that second. Slots are capped at 20: a tick that
+		// finished early does not let the server run two ticks in the same window, and Paper reports the
+		// same ceiling. Unused slots read 0 until the ring buffer has been filled once, and must not divide.
+		long[] tickNanos = minecraft.getTickTimesNanos();
+		double[] tps = new double[tickNanos.length];
+		for (int i = 0; i < tickNanos.length; i++) {
+			long nanos = tickNanos[i];
+			tps[i] = nanos <= 0L ? 20.0 : Math.min(20.0, 2.0e10 / nanos);
+		}
+		return tps;
 	}
 
 	@Override
 	public long[] getTickTimes() {
-		throw notYet("getTickTimes");
+		return minecraft.getTickTimesNanos();
 	}
 
 	@Override
 	public double getAverageTickTime() {
-		throw notYet("getAverageTickTime");
+		return minecraft.getAverageTickTimeNanos() / 1.0e6;
 	}
 
 	/**
@@ -1358,7 +1372,9 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public int getCurrentTick() {
-		throw notYet("getCurrentTick");
+		// The server's own tick counter, exposed verbatim. It never resets, so plugins that store it see the
+		// same monotonic value they would on Paper.
+		return minecraft.getTickCount();
 	}
 
 	@Override

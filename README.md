@@ -1,4 +1,4 @@
-# NeoFobric
+# NeoForbricKit
 
 **中文（默认）** | [English](#english)
 
@@ -6,6 +6,90 @@
 > A loaders experiment built purely for fun: a pile of garbage — but it has to be a *better* pile of garbage than Forbric's.
 
 对照物 / For comparison: <https://github.com/Ray-T-r/Minecraft-Forbric-mod-loader>
+
+---
+
+## 先说清楚：这是什么，以及它和上游的关系
+
+**本仓库 = `NeoForbricKit`，fork 自 [`NeoForbric`](https://github.com/Lonmo0208/NeoForbric)。**
+`NeoForbric` 是上游，这里在它的基础上又加了一层：**CraftBukkit / Paper 插件支持**。
+本仓库的卖点就是这一层 —— 具体见下面「插件支持」一节。
+
+**为什么有些地方还叫 `NeoForbric` / `neoforge`：** 因为这是**直接 fork**，
+fork 时保留了上游的包名（`net.neoforged.*`）、制品名（`neoforge-*`）和模块名。
+改名会牵动整条工具链（安装器、补丁、启动器、`mods.toml` 解析），收益不成比例，
+所以**只改了产品名**。看到 `neoforge-26.2.0.129-26.2-NeoFobric-universal.jar`
+这种名字时，它就是本仓库构建出来的东西，不是官方 NeoForge 的制品。
+
+**本仓库面向服务端。** 上游 `NeoForbric` 同时提供客户端与服务端；本仓库是
+**服务端向**的产物（插件支持只在服务端有意义），**不建议用本仓库去构建客户端** ——
+要客户端请用上游。**客户端代码与相关描述仍原样保留在仓库里**（fork 带来的），
+那是上游的东西，不是本仓库的方向。
+
+> **⚠️ 关于作者：这个项目的代码绝大部分由 AI 写的。**
+> 具体说，是由 **GitHub Copilot**（Claude / GPT / DeepSeek 等模型，视会话而定）
+> 在人类给出的方向下产出的。人类负责：定目标、验收、跑真实测试、以及事后
+> 收拾 AI 闯的祸。**所以请预期 AI 代码的典型毛病**：
+> - 逻辑看着自洽、边界条件没想全；
+> - 注释写得比代码还长，而且**注释与实现不符**（AI 爱写"理想版"描述）；
+> - **幻觉式改动** —— 凭空引用不存在的 API、凭印象写方法名、把"看起来对"
+>   当成"验证过"；
+> - 修一个坑顺手挖两个。
+>
+> **这不是免责声明式的客套，是本项目的真实风险画像。** 我们发现过好几类
+> "编译通过、启动通过、日志无异常，但行为是错的"的问题 —— 这类问题**只有实机
+> 测试能抓**。所以下面那些"实测跑通"的记录才是本项目最硬的证据；README 里
+> 没写"实测"的地方，请一律当作**未验证**。
+
+---
+
+## 插件支持（本仓库的卖点）
+
+**除了 Fabric 桥，本仓库还内置了一层 CraftBukkit / Paper 兼容 —— 让 Paper 插件
+能直接跑在 NeoForge 上。**
+
+底座是 NeoForge，所以 NeoForge 模组照常工作；Fabric 桥让 Fabric 模组也能跑；
+**这一层则让 `plugins/` 目录里的 Paper 插件也能加载**。三者共存于同一个进程。
+
+已经实现的部分（**都是实机验证过的**，不是"设计上应该能"）：
+
+- **`org.bukkit.*` API 的真实实现** —— 不是空壳。`Bukkit.getServer()`、
+  `ServerImpl`、`World`、`Player`、`Entity`、`ItemStack`、命令系统、事件系统
+  都是真接进游戏状态的。
+- **CraftBukkit 形状的类**（`org.bukkit.craftbukkit.*`）—— 很多插件会
+  `Class.forName("org.bukkit.craftbukkit.entity.CraftPlayer")` 或直接 import，
+  这些类按插件期望的包名存在，能真的拿到 NMS 句柄。
+- **插件命令树** —— 插件注册的命令会转成 Brigadier 节点，`/kit`、`/orbitalstrike`
+  这类命令能执行、能补全，参数类型（含 `@e` / `@p` 选择器）已注册。
+- **插件消息通道（plugin channels）** —— 这一块踩坑最多，见下。
+- **插件服务（ServicesManager）**、**调度器**（同步/异步任务）、
+  **权限**、**聊天/消息**等日常 API。
+
+### 插件消息通道：为什么需要专门处理
+
+Paper 插件发插件消息走的是 `minecraft:register` 这套通道协商，而 **NeoForge 也
+用同一个 id 做自己的通道协商 —— 两者格式不同**。直接混用会让连接断掉。本仓库的
+处理是：把 Fabric 的通道常量挪到独立的 id 上，让两边各走各的；同时在配置阶段
+**主动把 Bukkit 插件声明的通道公告给客户端**，否则 Fabric 客户端会以为服务端
+不接受这些通道，`ClientPacketDistributor.sendToServer` 直接抛
+`UnsupportedOperationException` —— 表现就是 **Simple Voice Chat 报"服务端不
+接受语音聊天包"**。
+
+**这条修完之后的实测结果**：SVC 能完成握手（`Successfully authenticated` /
+`successfully connected to voice chat`），插件的客户端 ↔ 服务端双向通道都通。
+
+### 已知的坑（诚实记录）
+
+- **Fabric API 的 `fabric-registry-sync-v0` 会踢客户端。** 它的握手检查在
+  **本服务端 + NeoForge 客户端**的组合下拿不到答案（客户端走 NeoForge 自己的
+  注册表同步），于是判定"客户端没装 Fabric API"并断开。本仓库把这个断开换成了
+  **保留连接 + 记录原因**（见 `FabricRegistrySyncHooks`），因为 NeoForge 客户端
+  本来就不需要走 Fabric 的同步路径。**这不是"修好了"，是"不让它误杀"。**
+- **`fabric-registry-sync` 的注册表同步在跨协议版本时不可能成功** —— 别指望用
+  1.21.4 客户端经 Via 连 26.2 服务端还能正常同步注册表。
+- **CraftBukkit 兼容层仍在补全中。** 有两三个文件在 `universal.jar` 的编译
+  classpath 上过不了（已知，见 `projects/neoforge/build.gradle` 的 exclude），
+  对应的 API 目前是缺失的。
 
 ---
 
@@ -191,7 +275,103 @@ cd NeoFobric
 
 ## English
 
-[中文](#neofobric) | **English**
+[中文](#neoforbrickit) | **English**
+
+## First, what this is and how it relates to upstream
+
+**This repository is `NeoForbricKit`, forked from [`NeoForbric`](https://github.com/Lonmo0208/NeoForbric).**
+`NeoForbric` is upstream. This repository adds one more layer on top of it:
+**CraftBukkit / Paper plugin support**. That layer is the point of this fork — see
+"Plugin support" below.
+
+**Why some names still say `NeoForbric` / `neoforge`:** this is a **direct fork**, so the
+upstream package names (`net.neoforged.*`), artifact names (`neoforge-*`) and module
+names were kept. Renaming them would pull on the whole toolchain (installer, patches,
+launchers, `mods.toml` resolution) for no proportional gain, so **only the product name
+changed**. When you see something like
+`neoforge-26.2.0.129-26.2-NeoFobric-universal.jar`, that is an artifact built from *this*
+repository, not something from NeoForge proper.
+
+**This repository targets the server.** Upstream `NeoForbric` ships both a client and a
+server; this fork is **server-oriented** (plugin support only means anything on a server),
+and **building a client from it is not recommended** — use upstream for that. **The client
+code and its documentation are still present here** (they came with the fork); they are
+upstream's, not this fork's direction.
+
+> **⚠️ About the authors: most of this project's code was written by AI.**
+> Specifically by **GitHub Copilot** (Claude / GPT / DeepSeek and others, depending on the
+> session), working under human direction. The humans set the goals, accepted or rejected
+> the results, ran the real tests, and cleaned up afterwards. **So expect the usual AI-code
+> problems:**
+> - logic that reads as coherent but never considered the edge cases;
+> - comments longer than the code, and **comments that disagree with the implementation**
+>   (AI loves writing the ideal version rather than the real one);
+> - **hallucinated changes** — inventing APIs that do not exist, guessing method names,
+>   treating "looks right" as "verified";
+> - fixing one hole while digging two more.
+>
+> **This is not a boilerplate disclaimer; it is an accurate risk profile of this project.**
+> We have hit several problems that compile, start, and log nothing unusual while still
+> behaving incorrectly — **only running the game catches those.** That is why the
+> "verified on a real machine" notes below are this project's strongest evidence. Anything
+> in this README that does not say it was tested should be treated as **unverified**.
+
+---
+
+## Plugin support (the point of this fork)
+
+**Besides the Fabric bridge, this repository ships a CraftBukkit / Paper compatibility
+layer — so Paper plugins run on NeoForge directly.**
+
+The base is NeoForge, so NeoForge mods work as usual; the Fabric bridge lets Fabric mods
+run too; **this layer lets the Paper plugins in `plugins/` load as well**. All three
+coexist in one process.
+
+What is actually implemented (**all verified on a real server**, not "should work by design"):
+
+- **A real `org.bukkit.*` API surface** — not empty shells. `Bukkit.getServer()`,
+  `ServerImpl`, `World`, `Player`, `Entity`, `ItemStack`, the command system and the event
+  system are wired into the live game state.
+- **The CraftBukkit-shaped classes** (`org.bukkit.craftbukkit.*`) — many plugins do
+  `Class.forName("org.bukkit.craftbukkit.entity.CraftPlayer")` or import them directly.
+  Those classes exist under the package names plugins expect and hand back real NMS handles.
+- **Plugin command trees** — a plugin's registered commands become Brigadier nodes;
+  commands like `/kit` or `/orbitalstrike` execute and complete, and the argument types
+  (including the `@e` / `@p` selectors) are registered.
+- **Plugin channels** — the messiest part; see below.
+- **`ServicesManager`**, the **scheduler** (sync and async tasks), **permissions**,
+  **chat / messaging** and the everyday API.
+
+### Plugin channels: why they need special handling
+
+A Paper plugin's plugin messages use the `minecraft:register` channel negotiation, and
+**NeoForge uses the same id for its own negotiation with a different wire format**. Mixing
+them kills the connection. This repository's answer: move Fabric's channel constants onto
+ids of their own so the two exchanges run side by side, and **announce the channels a
+Bukkit plugin declares during configuration**, or a Fabric client believes the server does
+not accept them and `ClientPacketDistributor.sendToServer` throws
+`UnsupportedOperationException` — which shows up as **Simple Voice Chat reporting "server
+does not accept voice chat packets"**.
+
+**Verified after that fix**: SVC completes its handshake (`Successfully authenticated` /
+`successfully connected to voice chat`), and a plugin's client ↔ server channels work in
+both directions.
+
+### Known gaps (recorded honestly)
+
+- **Fabric API's `fabric-registry-sync-v0` disconnects clients.** Its handshake check
+  cannot get an answer on **this server combined with a NeoForge client** (that client
+  syncs registries through NeoForge's own channel), so it decides the client lacks Fabric
+  API and disconnects. This repository replaces that disconnect with **keep the connection
+  + record the reason** (see `FabricRegistrySyncHooks`), because a NeoForge client has no
+  need for the Fabric route anyway. **This is not "fixed", it is "stopped from misfiring".**
+- **`fabric-registry-sync`'s sync can never succeed across a protocol version gap** — do
+  not expect a 1.21.4 client reaching a 26.2 server through Via to sync registries.
+- **The CraftBukkit layer is still being filled in.** A couple of files do not compile on
+  `universal.jar`'s classpath (known, see the `exclude`s in
+  `projects/neoforge/build.gradle`), so those API pieces are currently missing.
+
+---
 
 ## What this is
 
@@ -373,4 +553,4 @@ See [README-LICENSE.md](README-LICENSE.md): **our own code** follows NeoForge's 
 
 ---
 
-[↑ 回到顶部（中文版）/ Back to top](#neofobric)
+[↑ 回到顶部（中文版）/ Back to top](#neoforbrickit)

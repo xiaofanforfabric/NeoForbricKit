@@ -1309,19 +1309,25 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 		// that ends up here, so implementing this one is what makes them all work -- including the
 		// CompletableFuture forms a pre-generator drives its whole loop from.
 		//
-		// `arg2` is "generate if absent" and `arg3` is "run the callback on the main thread". The second is not
-		// decoration: a plugin that touches the world in the callback needs the server thread, and Paper's
-		// contract says this is what decides it. The bridge schedules through its own scheduler for both cases
-		// because the callback must not run on the game's chunk-loading thread either way.
+		// `arg2` is "generate if absent". `arg3` is `urgent` -- whether the chunk may be prioritised above
+		// others already in the load queue -- and is NOT "run the callback on the main thread": Paper's
+		// contract states the Consumer is always executed synchronously on the main Server Thread regardless
+		// of this flag. This bridge honours that by delivering every callback from a task it scheduled onto
+		// the game thread, so no flag has to ask for it.
+		//
+		// `arg3` is accepted and ignored. The synchronous load below goes through ServerChunkCache.getChunk,
+		// which has no priority parameter to forward it to, and inventing a ticket to fake the ordering would
+		// change persistence semantics rather than just this call's queue position. Ignoring it leaves the
+		// caller with a result it is entitled to; the only thing lost is a scheduling hint, and only for the
+		// async path.
 		boolean generate = arg2;
-		boolean mainThread = arg3;
 		java.util.function.Consumer<? super org.bukkit.Chunk> callback = arg4;
 
 		if (isGameThread()) {
 			// Already where the game can be touched, so no scheduling at all: register the interest, ask for the
 			// chunk, and answer. Going through a queue here would widen the window in which the chunk can be
 			// unloaded again before the callback runs.
-			beginAsyncChunkLoad(arg0, arg1, generate, mainThread, callback);
+			beginAsyncChunkLoad(arg0, arg1, generate, callback);
 			return;
 		}
 		// Off the server thread, so hop onto it. The bridge's own scheduler is used rather than Bukkit's
@@ -1333,7 +1339,7 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 		// plugin's, and attributing it to the caller would make a plugin's disable cancel a load it merely
 		// asked for.
 		schedulers().scheduleGameNow(null,
-				task -> beginAsyncChunkLoad(arg0, arg1, generate, mainThread, callback));
+				task -> beginAsyncChunkLoad(arg0, arg1, generate, callback));
 	}
 
 	/** The bridge's schedulers, for hopping onto the game thread from elsewhere. */
@@ -1352,35 +1358,32 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	 * so the load it is waiting for cannot be reached until the wait ends.
 	 *
 	 * <p>What a plugin sees is still asynchronous, which is the part that matters: this method returns as soon
-	 * as it has handed work off, and the callback arrives later — after the chunk is loaded, on the thread the
-	 * caller asked for. A pre-generator driving thousands of these gets them one per tick rather than one per
-	 * call, because each is a separate scheduled task.
+	 * as it has handed work off, and the callback arrives later — after the chunk is loaded, on the main
+	 * Server Thread. That thread is not a request this method has to grant: it is where the caller already
+	 * placed us, and Paper's contract guarantees the callback runs there either way.
 	 *
 	 * <p>A chunk that could not be produced completes the callback with a null rather than swallowing the
 	 * failure, because a plugin iterating a region has to be able to count what it got.
 	 */
-	private void beginAsyncChunkLoad(int chunkX, int chunkZ, boolean generate, boolean mainThread,
+	private void beginAsyncChunkLoad(int chunkX, int chunkZ, boolean generate,
 					java.util.function.Consumer<? super org.bukkit.Chunk> callback) {
 		net.minecraft.world.level.chunk.LevelChunk chunk = loadChunkNow(chunkX, chunkZ, generate);
-		// The callback is delivered through deliverChunk, which hops to the main thread only when asked and only
-		// when it is not already there -- so the common case, a plugin that asked for the main thread while this
-		// already runs on it, is a direct call with no queueing at all.
-		deliverChunk(callback, chunk == null ? null : ForbricChunk.loaded(this, chunk), mainThread);
+		deliverChunk(callback, chunk == null ? null : ForbricChunk.loaded(this, chunk));
 	}
 
 	/**
-	 * Runs the plugin's callback, on the main thread if that is what was asked for.
+	 * Runs the plugin's callback on the main Server Thread.
+	 *
+	 * <p>Callers reach here from a task already scheduled onto the game thread, so the callback runs there
+	 * unconditionally -- no thread hop and no queueing on the common path. This is the behaviour Paper's
+	 * getChunkAtAsync contract promises for every call, independent of any flag.
 	 *
 	 * <p>A null callback is tolerated rather than refused: Bukkit's contract marks the argument non-null, but
 	 * a plugin written against an older signature can pass one, and there is nothing to do but drop it.
 	 */
 	private void deliverChunk(java.util.function.Consumer<? super org.bukkit.Chunk> callback,
-					org.bukkit.Chunk chunk, boolean mainThread) {
+					org.bukkit.Chunk chunk) {
 		if (callback == null) {
-			return;
-		}
-		if (mainThread && !isGameThread()) {
-			schedulers().scheduleGameNow(null, task -> callback.accept(chunk));
 			return;
 		}
 		try {

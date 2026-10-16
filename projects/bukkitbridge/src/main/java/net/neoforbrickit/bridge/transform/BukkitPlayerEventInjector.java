@@ -48,7 +48,7 @@ import org.objectweb.asm.tree.VarInsnNode;
  *   <caption>Injections</caption>
  *   <tr><th>Class</th><th>Method</th><th>Raised</th><th>A miss means</th></tr>
  *   <tr><td>{@code ServerGamePacketListenerImpl}</td>
- *       <td>{@code handleAcceptPlayerLoad}</td>
+ *       <td>{@code handleAcceptPlayerLoad}, before its {@code markClientLoaded()} call</td>
  *       <td>{@code PlayerJoinEvent}</td>
  *       <td>no plugin ever hears that a player arrived</td></tr>
  *   <tr><td>{@code PlayerList}</td>
@@ -66,7 +66,23 @@ import org.objectweb.asm.tree.VarInsnNode;
  * plugin's chat message arrive before the client's chat window exists, which looks identical to
  * "the plugin did nothing".
  *
+ * <h2>Why inside that method, rather than at its entry</h2>
+ *
+ * <p>{@code handleAcceptPlayerLoad} is ENTERED TWICE per join. Its first instruction is
+ * {@code PacketUtils.ensureRunningOnSameThread}, which — when the caller is a Netty IO thread —
+ * re-queues the packet and throws to abandon that pass; the server thread then re-enters the
+ * method, and only that pass reaches {@code markClientLoaded()}. A hook at the entry therefore
+ * raised {@code PlayerJoinEvent} twice, and TAB turned that into a client-side disconnect: it
+ * creates a scoreboard objective named {@code TAB-PlayerList} per join, so the client received the
+ * {@code set_objective} packet twice and died with
+ * {@code An objective with the name 'TAB-PlayerList' already exists!}.
+ *
+ * <p>Anchoring to {@code markClientLoaded} makes the raise once-per-join without this bridge
+ * keeping any state, and a missing anchor is reported rather than silently falling back.
+ *
  * <p>{@code PlayerList.remove} takes the player as its only argument, so no field is needed there.
+ * It has no equivalent double-entry, because it is called by the game itself rather than from a
+ * packet handler that may need re-threading.
  *
  * <p>{@code -Dneofobric.bukkitPlayerEvents=off} leaves both classes alone.
  */
@@ -87,6 +103,30 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	static final String JOIN_METHOD = "handleAcceptPlayerLoad";
 	static final String JOIN_DESC =
 			"(Lnet/minecraft/network/protocol/game/ServerboundPlayerLoadedPacket;)V";
+
+	/**
+	 * The call the join hook is placed BEFORE, as a name and descriptor pair.
+	 *
+	 * <p>Not the method entry, and that is the whole point. {@code handleAcceptPlayerLoad} runs FIRST on the
+	 * Netty IO thread, where its own second instruction is
+	 * {@code PacketUtils.ensureRunningOnSameThread} — which, when the calling thread is not the server's,
+	 * re-queues the packet and throws {@code RunningOnDifferentThreadException} to abandon that pass. The
+	 * server thread then pulls the packet out of the queue and enters the method a SECOND time, and that pass
+	 * is the one that reaches {@code markClientLoaded()}.
+	 *
+	 * <p>Hooking the entry therefore ran the bridge twice and raised {@code PlayerJoinEvent} twice. That is not
+	 * a theoretical duplicate: TAB creates a scoreboard objective named {@code TAB-PlayerList} per join, so
+	 * the client received two {@code set_objective} packets, and the second killed the connection with
+	 * {@code IllegalArgumentException: An objective with the name 'TAB-PlayerList' already exists!}.
+	 *
+	 * <p>{@code markClientLoaded()} is reached only on the pass that owns the thread — verified by
+	 * disassembling the method: it is four instructions ({@code ensureRunningOnSameThread}, then
+	 * {@code markClientLoaded}) — so a hook immediately before that call runs exactly once per join, with no
+	 * state of this bridge's own to keep in sync.
+	 */
+	static final String MARK_LOADED_OWNER = "net/minecraft/server/network/ServerGamePacketListenerImpl";
+	static final String MARK_LOADED_NAME = "markClientLoaded";
+	static final String MARK_LOADED_DESC = "()V";
 
 	/** The leave point's class and method. */
 	static final String PLAYER_LIST_DOT = "net.minecraft.server.players.PlayerList";
@@ -136,11 +176,12 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	}
 
 	/**
-	 * {@code handleAcceptPlayerLoad}: prepend a call that names the player this listener speaks for.
+	 * {@code handleAcceptPlayerLoad}: insert a call that names the player, immediately before the method's own
+	 * {@code markClientLoaded()} call.
 	 *
-	 * <p>The player comes from the listener's own field rather than from an argument, so the field
-	 * has to exist. It is a plain field lookup rather than a reflective one — the descriptor is
-	 * compared as text, because the type cannot be loaded here.
+	 * <p>Not at the entry — see {@link #MARK_LOADED_NAME} for why the entry runs twice per join. The player comes
+	 * from the listener's own field rather than from an argument, so the field has to exist; it is matched by
+	 * descriptor text because the type cannot be loaded on this layer.
 	 */
 	private ComputeFlags injectJoin(TransformationContext context) {
 		ClassNode node = context.node();
@@ -161,26 +202,45 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		if (alreadyInjected(target, JOIN_HOOK)) {
 			return ComputeFlags.NO_REWRITE;
 		}
-		if (headIsBranchTarget(target)) {
+
+		// The instruction the hook goes before. A miss here is fatal to the seam and must be loud: silently
+		// falling back to the method entry would restore the double raise this is fixing, and nothing about
+		// the resulting logs would say so.
+		AbstractInsnNode anchor = callTo(target, MARK_LOADED_OWNER, MARK_LOADED_NAME, MARK_LOADED_DESC);
+		if (anchor == null) {
 			context.audit("neofobric:bukkit_player_events declined " + context.type().getClassName()
-					+ "." + JOIN_METHOD
-					+ ": the entry is a branch target, where a prepended hook cannot be first");
+					+ "." + JOIN_METHOD + ": no " + MARK_LOADED_NAME + MARK_LOADED_DESC
+					+ " call to anchor the join hook to, and hooking the entry instead would raise"
+					+ " PlayerJoinEvent twice per join");
 			return ComputeFlags.NO_REWRITE;
 		}
 
-		// BEFORE the game's own handling: the event is about the player having finished loading, and
-		// vanilla's work inside this method is what completes the join. Raising it first is what lets
-		// a plugin's message reach a client whose chat window is about to exist.
 		InsnList code = new InsnList();
 		code.add(new VarInsnNode(Opcodes.ALOAD, 0));
 		code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, player.name, player.desc));
 		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, JOIN_HOOK, hookDesc(), false));
-		target.instructions.insert(code);
+		target.instructions.insertBefore(anchor, code);
 
 		ForbricLog.info("[NeoFobric/Bukkit] %s raises PlayerJoinEvent from %s"
-						+ " — a plugin's listener hears that a player arrived",
+						+ " — a plugin's listener hears that a player arrived, once per join",
 						simpleName(node.name), JOIN_METHOD);
 		return ComputeFlags.COMPUTE_FRAMES;
+	}
+
+	/**
+	 * The instruction calling exactly this method, or null.
+	 *
+	 * <p>Matched by owner, name AND descriptor: an overload would share the name and quietly anchor the hook to
+	 * the wrong call, which is the kind of mistake that produces "sometimes the event fires twice".
+	 */
+	private static AbstractInsnNode callTo(MethodNode method, String owner, String name, String desc) {
+		for (AbstractInsnNode instruction : method.instructions) {
+			if (instruction instanceof MethodInsnNode call
+					&& call.owner.equals(owner) && call.name.equals(name) && call.desc.equals(desc)) {
+				return instruction;
+			}
+		}
+		return null;
 	}
 
 	/**

@@ -1,8 +1,12 @@
 /*
- * Forbric Bukkit bridge — the {@code Server} a plugin receives.  *** GENERATED FILE — DO NOT EDIT ***
+ * Forbric Bukkit bridge — the {@code Server} a plugin receives.
  *
- * Produced by tools/gen_stub.py from tools/stubs/ServerImpl.table. Editing this file by hand means the next
- * generation silently discards the edit; the change belongs in the table or the template.
+ * <p>The ~200 method signatures below were generated from Paper's API jar, which is why they carry the
+ * interface's own parameter names stripped to {@code arg0}/{@code arg1}. The generator is NOT in this
+ * repository (it lived with the project this bridge came from, as {@code tools/gen_stub.py} plus a
+ * {@code tools/stubs/ServerImpl.table}), so this file is edited by hand now. A previous version of this
+ * header said "DO NOT EDIT" and pointed at those missing files, which told the next reader to look for a
+ * script that does not exist; the note is kept only to explain the mechanical style of the signatures.
  */
 package net.neoforbrickit.bukkit;
 
@@ -17,8 +21,26 @@ package net.neoforbrickit.bukkit;
  *
  * <p>Every method carries the interface's own signature, generated from the API jar, so a plugin links against
  * this class exactly as it would against Paper's.
+ *
+ * <h2>Why this class is public, and has to be</h2>
+ *
+ * <p>{@code Bukkit.getServer()} returns this object, and a whole family of plugins reaches past the Bukkit API
+ * through it:
+ *
+ * <pre>{@code
+ * Object nms = Bukkit.getServer().getClass().getMethod("getServer").invoke(Bukkit.getServer());
+ * }</pre>
+ *
+ * <p>That idiom — reflect on {@code getServer()}'s runtime class — is how TAB, Simple Voice Chat and others
+ * detect the server implementation. {@code Method.invoke} checks whether the CALLER may access the method's
+ * declaring class, and a package-private class fails that check with {@code IllegalAccessException} even
+ * though every method on it is public. Measured, not assumed: TAB failed to load with exactly
+ * "cannot access a member of class net.neoforbrickit.bukkit.ServerImpl (in module neoforge) with modifiers
+ * public" while calling {@code getCommandMap} this way.
+ *
+ * <p>The same fix was applied to {@link ForbricSchedulers} and its nested types for the identical reason.
  */
-final class ServerImpl implements org.bukkit.Server {
+public final class ServerImpl implements org.bukkit.Server {
 
 	static final String BRAND = "Forbric";
 	static final String BUKKIT_VERSION = "26.2-R0.1-SNAPSHOT";
@@ -66,7 +88,16 @@ final class ServerImpl implements org.bukkit.Server {
 	 */
 	private final org.bukkit.scheduler.BukkitScheduler bukkitScheduler;
 
-	ServerImpl(java.util.logging.Logger logger, org.bukkit.plugin.PluginManager pluginManager,
+	/**
+	 * Built once by {@link BridgeBootstrap}, which is the only caller.
+	 *
+	 * <p>Public because the class is: a plugin that reflectively reaches {@code getServer()}'s runtime class
+	 * (see the class comment) gets this type, and {@code Constructor#newInstance} on a package-private
+	 * constructor would fail the same access check the methods did. Nothing outside the bridge constructs one
+	 * — the arguments include the running game server — but there is no reason to make the failure mode
+	 * reachable again.
+	 */
+	public ServerImpl(java.util.logging.Logger logger, org.bukkit.plugin.PluginManager pluginManager,
 			java.nio.file.Path pluginsFolder, String version, net.minecraft.server.MinecraftServer minecraft) {
 		this.logger = logger;
 		this.pluginManager = pluginManager;

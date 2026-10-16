@@ -156,15 +156,40 @@ final class ForbricSchedulers {
         void runOnGameThread(ServerImpl server) {
             if (stopped()) {
                 state = ExecutionState.CANCELLED;
+                forget();
                 return;
             }
             // The body is run here rather than re-dispatched: the timer thread is not the game thread, so
             // this hops onto it through the server's own queue when it has to.
             if (server.isPrimaryThread()) {
                 invoke();
+                forget();
             } else {
-                server.minecraft().execute(() -> invoke());
+                server.minecraft().execute(() -> {
+                    invoke();
+                    forget();
+                });
             }
+        }
+
+        /**
+         * Drops a finished one-shot from the registry.
+         *
+         * <p>Without this the registry grows by one entry per scheduling call for the life of the
+         * server, and because it is a {@link CopyOnWriteArrayList} every subsequent add copies the
+         * whole array. A plugin that schedules per packet — Simple Voice Chat does, once per
+         * outbound message — turns that into seconds of latency within minutes.
+         *
+         * <p>Repeating tasks stay listed: they can still be cancelled, and {@code cancelTasks}
+         * has to be able to find them.
+         */
+        void forget() {
+            if (repeating || cancelled.get()) {
+                // A cancelled one-shot was already removed by cancel(); a repeating task is needed
+                // until the plugin that owns it stops.
+                return;
+            }
+            tasks.remove(this);
         }
 
         /** True once {@link #cancel()} has been called, whatever the reason. */

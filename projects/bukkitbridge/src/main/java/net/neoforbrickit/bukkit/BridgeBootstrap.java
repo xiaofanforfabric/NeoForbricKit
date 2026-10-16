@@ -171,6 +171,7 @@ public final class BridgeBootstrap {
 
 		for (Path jar : jars) {
 			try {
+
 				PluginHandle handle = PluginHandle.load(jar, hostLoader, dataFolder, logger, server);
 				loaded.add(handle);
 				server.enablePlugin(handle);

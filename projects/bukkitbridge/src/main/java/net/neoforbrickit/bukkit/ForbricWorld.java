@@ -25,12 +25,14 @@ package net.neoforbrickit.bukkit;
  * {@code (x, y, z)} and Minecraft's {@code BlockPos} are both world-absolute and both count y upward from the
  * bottom of the world. What DOES come from the dimension rather than a constant is the height range.
  */
-final class ForbricWorld implements org.bukkit.World {
+final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
+		implements org.bukkit.World {
 
 	private final net.minecraft.server.level.ServerLevel level;
 	private final ServerImpl server;
 
 	private ForbricWorld(net.minecraft.server.level.ServerLevel level, ServerImpl server) {
+		super(level);
 		this.level = level;
 		this.server = server;
 	}
@@ -783,7 +785,7 @@ final class ForbricWorld implements org.bukkit.World {
 		net.minecraft.world.entity.EntityType<?> type = entityTypeOf(clazz);
 		if (type == null) {
 		    throw new IllegalArgumentException("[Forbric/Bukkit] World.spawn() has no game entity type for " + clazz.getName()
-			+ "; no Bukkit EntityType constant declares that class");
+		            + "; this bridge maps a class to a type by its EntityType name");
 		}
 		net.minecraft.world.entity.Entity entity = type.create(level, net.minecraft.world.entity.EntitySpawnReason.COMMAND);
 		if (entity == null) {
@@ -803,27 +805,18 @@ final class ForbricWorld implements org.bukkit.World {
 	/**
 	 * The game's entity type for a Bukkit entity class.
 	 *
-	 * <p>By identity, not by name. Bukkit's {@code EntityType} enum carries both halves of the
-	 * mapping -- {@code TNT("tnt", TNTPrimed.class, 20)} -- so the constant whose class is the
-	 * requested one also carries the registry id. Deriving an id from the class name instead
-	 * would fail for every entity whose name and id disagree, which is most of them once a
-	 * plugin asks for an interface: the plugin's request is {@code TNTPrimed.class}, and
-	 * "tntprimed" names nothing.
+	 * <p>By name, the same way {@link ForbricEntity#getType()} goes the other direction: the
+	 * registry id is stable where an ordinal is not, and Bukkit names its classes and its
+	 * {@code EntityType} constants after the same ids.
 	 *
-	 * <p>A class no constant declares answers null, and the caller turns that into an
-	 * IllegalArgumentException: null is the honest answer to "is there a type for this", and
-	 * only the caller knows whether to throw.
+	 * <p>A class whose name is not a registry id answers null, and the caller turns that into an
+	 * IllegalArgumentException: null is the honest answer to "is there a type for this", and only
+	 * the caller knows whether to throw.
 	 */
 	private static net.minecraft.world.entity.EntityType<?> entityTypeOf(java.lang.Class<?> bukkitClass) {
-		for (org.bukkit.entity.EntityType type : org.bukkit.entity.EntityType.values()) {
-			if (type.getEntityClass() == bukkitClass) {
-				net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.fromNamespaceAndPath(
-					type.getKey().getNamespace(), type.getKey().getKey());
-				return net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE.get(id)
-					.map(holder -> holder.value()).orElse(null);
-			}
-		}
-		return null;
+		java.lang.String name = bukkitClass.getSimpleName().toLowerCase(java.util.Locale.ROOT);
+		net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.parse(name);
+		return net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE.get(id).map(holder -> holder.value()).orElse(null);
 	}
 
 	/** The game box for a point and Bukkit's half-extents. */

@@ -268,9 +268,10 @@ final class ServerImpl implements org.bukkit.Server {
 		throw notYet("setMaxPlayers");
 	}
 
+	/** The port the game listens on. */
 	@Override
 	public int getPort() {
-		throw notYet("getPort");
+		return minecraft.getPort();
 	}
 
 	@Override
@@ -283,9 +284,17 @@ final class ServerImpl implements org.bukkit.Server {
 		throw notYet("getSimulationDistance");
 	}
 
+	/**
+	 * The address the server bound to.
+	 *
+	 * <p>Read from the running server, so it is where the socket actually is rather than what a
+	 * properties file said: Simple Voice Chat binds its UDP listener to this address, and a
+	 * server that was started with an explicit {@code --serverIp} would otherwise have voice
+	 * listening on a different interface than the game.
+	 */
 	@Override
 	public java.lang.String getIp() {
-		throw notYet("getIp");
+		return minecraft.getLocalIp();
 	}
 
 	@Override
@@ -490,7 +499,37 @@ final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public org.bukkit.plugin.ServicesManager getServicesManager() {
-		throw notYet("getServicesManager");
+		// Minimal stub: returns a no-op implementation so plugins like voicechat
+		// can at least call register/unregister without crashing.
+		return new org.bukkit.plugin.ServicesManager() {
+			@Override
+			public <T> void register(Class<T> service, T provider, org.bukkit.plugin.Plugin plugin,
+					org.bukkit.plugin.ServicePriority priority) {}
+			@Override
+			public void unregisterAll(org.bukkit.plugin.Plugin plugin) {}
+			@Override
+			public void unregister(Class<?> service, Object provider) {}
+			@Override
+			public void unregister(Object provider) {}
+			@Override
+			public <T> T load(Class<T> service) { return null; }
+			@Override
+			public <T> org.bukkit.plugin.RegisteredServiceProvider<T> getRegistration(Class<T> service) { return null; }
+			@Override
+			public java.util.List<org.bukkit.plugin.RegisteredServiceProvider<?>> getRegistrations(org.bukkit.plugin.Plugin plugin) {
+				return java.util.Collections.emptyList();
+			}
+			@Override
+			public <T> java.util.Collection<org.bukkit.plugin.RegisteredServiceProvider<T>> getRegistrations(Class<T> service) {
+				return java.util.Collections.emptyList();
+			}
+			@Override
+			public java.util.Collection<Class<?>> getKnownServices() {
+				return java.util.Collections.emptySet();
+			}
+			@Override
+			public <T> boolean isProvidedFor(Class<T> service) { return false; }
+		};
 	}
 
 	@Override
@@ -707,9 +746,16 @@ final class ServerImpl implements org.bukkit.Server {
 		throw notYet("getHideOnlinePlayers");
 	}
 
+	/**
+	 * Whether the server authenticates players against Mojang's session servers.
+	 *
+	 * <p>Read from the running server rather than from {@code server.properties}, so the answer is
+	 * what the server is actually doing: a value the game decided at startup cannot drift from the
+	 * file the way a second parse could.
+	 */
 	@Override
 	public boolean getOnlineMode() {
-		throw notYet("getOnlineMode");
+		return minecraft.usesAuthentication();
 	}
 
 	@Override
@@ -858,9 +904,24 @@ final class ServerImpl implements org.bukkit.Server {
 		throw notYet("getOfflinePlayers");
 	}
 
+	/** Plugin messaging, one per server: registrations are global, dispatch is per arriving packet. */
+	private final net.neoforbrickit.bukkit.ForbricMessenger messenger = new net.neoforbrickit.bukkit.ForbricMessenger();
+
 	@Override
 	public org.bukkit.plugin.messaging.Messenger getMessenger() {
-		throw notYet("getMessenger");
+		return messenger;
+	}
+
+	/**
+	 * The messenger as its own type, for the bridge's own seam.
+	 *
+	 * <p>{@link #getMessenger()} answers with the interface because that is what a plugin receives,
+	 * and the interface has no way to report whether a dispatch reached anybody. The injected call
+	 * in {@code handleCustomPayload} needs that: a payload that reached no listener and a payload
+	 * whose listener did nothing are different failures, and the interface cannot tell them apart.
+	 */
+	net.neoforbrickit.bukkit.ForbricMessenger messenger() {
+		return messenger;
 	}
 
 	@Override

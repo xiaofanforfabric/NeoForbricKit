@@ -1243,7 +1243,7 @@ public final class ServerImpl implements org.bukkit.Server {
 		double[] tps = new double[tickNanos.length];
 		for (int i = 0; i < tickNanos.length; i++) {
 			long nanos = tickNanos[i];
-			tps[i] = nanos <= 0L ? 20.0 : Math.min(20.0, 2.0e10 / nanos);
+			tps[i] = nanos <= 0L ? 20.0 : Math.min(20.0, 1.0e9 / nanos);
 		}
 		return tps;
 	}

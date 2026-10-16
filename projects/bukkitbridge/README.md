@@ -92,6 +92,25 @@ maven-resolver 全家桶和 MC 已自带的 gson/guava/brigadier/fastutil/log4j/
 桥**没有 CraftBukkit 的 `getHandle()` 路径**。强依赖 NMS 的插件（如 TAB）跑不了 ——
 与 Forbric 的规则一致。纯 `org.bukkit.*` API 的插件是目标。
 
+## 插件通道注册：重复注册必须是幂等
+
+**Bukkit 的 `Messenger` 语义是"注册进集合"，不是"注册一次"。** `registerOutgoingPluginChannel`
+和 `registerIncomingPluginChannel` 都往 set 里塞，同一个通道第一次和第二次的结果一样 ——
+真实插件也确实会调两次：onEnable 里注册一遍、reload 之后再注册一遍，或者同一个通道在
+onEnable 的两个地方各写了一次。
+
+**之前这里会直接抛异常。** 插件收到的是一句"不支持"，日志里既没有通道名、也没有"你已经注册过了"，
+于是最自然的怀疑是**加载器/桥根本不支持插件消息** —— 这正是本仓库 issue #16 报的现象。
+更麻烦的是：插件若在 onEnable 里 catch 了它，会带着"半注册"状态继续跑；没 catch 的话，
+异常会把 `PluginManager` 那条启用链一起带走。
+
+**现在的行为**：命中已注册的通道 → 打一行 INFO（带插件全名和通道名）→ 正常返回。
+incoming 那次还会返回同一个 `PluginMessageListenerRegistration` 句柄，所以插件用哪次调用拿到的
+句柄去 `unregister` 都有效。真正的错误（`minecraft:*` 保留通道、通道名非法）仍然照抛。
+
+改动只在 `projects/bukkitbridge/src/main/java/net/neoforbrickit/bukkit/ForbricMessenger.java`，
+无 API 变化，也不需要重新生成桩文件（该文件不是 `gen_stub.py` 的产物）。
+
 ## 构建
 
 ```bash

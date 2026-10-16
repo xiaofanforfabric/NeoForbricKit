@@ -102,6 +102,61 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
                 return player;
         }
 
+        /**
+         * The adventure boss bars this player is currently shown, as this bridge tracks them.
+         *
+         * <p><b>Kept per game player, not per wrapper.</b> {@link #of} builds a fresh wrapper on every call, so
+         * a view stored on the wrapper would be reachable by exactly one caller — and a plugin that shows a bar
+         * through one call and hides it through the next would be talking to two different maps. The game
+         * player is the thing both calls share, so it is the key.
+         *
+         * <p>A weak key, like {@link #CHANNELS}: a view holds a listener registration on each of the plugin's
+         * bars, so it must not be kept alive by this map after the player is gone. There is a second reason
+         * for that care — the {@code ServerPlayer} the game drops is the only thing that can tell the bridge
+         * the bars are over, and nothing else clears them.
+         */
+        private static final java.util.Map<net.minecraft.server.level.ServerPlayer, ForbricBossBarView>
+                        BOSS_BAR_VIEWS = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+        /** This player's boss bar view, created on first use. */
+        private ForbricBossBarView bossBarView() {
+                // get/put rather than computeIfAbsent, and the difference is not stylistic: the map is
+                // synchronized, and computeIfAbsent on one holds the lock across the mapping function, which
+                // here would construct a view -- fine on its own, but the calling thread may already be inside
+                // another synchronized block on this same map through forgetBossBarView. Two plain calls under
+                // the same short lock keep the invariant obvious.
+                synchronized (BOSS_BAR_VIEWS) {
+                        ForbricBossBarView existing = BOSS_BAR_VIEWS.get(player);
+                        if (existing != null) {
+                                return existing;
+                        }
+                        ForbricBossBarView created = new ForbricBossBarView(player);
+                        BOSS_BAR_VIEWS.put(player, created);
+                        return created;
+                }
+        }
+
+        /**
+         * Drops a departing player's boss bar view, taking their bars off that player's screen.
+         *
+         * <p>Called from the quit hook, and the reason it is a static here rather than a method on the view is
+         * the same reason the map is: the caller has the game player and needs nothing else. Removing the entry
+         * also releases the listener registrations the view holds on the plugin's bars — see
+         * {@link ForbricBossBarView#clear()}.
+         *
+         * <p>The entry may not exist, which is not an error: a player who never had a bar shown to them never
+         * caused a view to be created, and that is the common case.
+         */
+        static void forgetBossBarView(net.minecraft.server.level.ServerPlayer player) {
+                ForbricBossBarView view;
+                synchronized (BOSS_BAR_VIEWS) {
+                        view = BOSS_BAR_VIEWS.remove(player);
+                }
+                if (view != null) {
+                        view.clear();
+                }
+        }
+
         private static UnsupportedOperationException notYet(String what) {
                 return new UnsupportedOperationException(
                                 "[Forbric/Bukkit] Player." + what + "() is not implemented by this bridge yet");
@@ -513,7 +568,37 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public java.lang.Iterable<? extends net.kyori.adventure.bossbar.BossBar> activeBossBars() {
-		throw notYet("activeBossBars");
+		// A live view of this player's own bars, created on demand and keyed by the player: a wrapper is built
+		// per call (see {@link #of}), so a view held on the wrapper would be visible to exactly one caller.
+		return bossBarView().active();
+	}
+
+	/**
+	 * Puts a boss bar on this player's screen.
+	 *
+	 * <p><b>An override, not an implementation of an abstract method.</b> {@code Audience.showBossBar} has a
+	 * default body that is a bare {@code return} — a bridge that never overrides it compiles, starts and runs,
+	 * with every bar a plugin shows silently discarded and nothing in any log to say so. TAB's boss bar feature
+	 * reaches this path in preference to {@code Bukkit.createBossBar}, so leaving it out is why a bar the
+	 * plugin reported as displayed never appeared on any client.
+	 *
+	 * <p>The bar a plugin passes is kept, not copied: adventure's {@code BossBar} is mutable, and a later
+	 * {@code bar.progress(0.5f)} has to reach the client. The listener registered here is what carries it.
+	 */
+	@Override
+	public void showBossBar(net.kyori.adventure.bossbar.BossBar bar) {
+		bossBarView().show(bar);
+	}
+
+	/**
+	 * Takes a boss bar off this player's screen.
+	 *
+	 * <p>Only this player is affected, which is what adventure's contract says: a bar shown to several viewers
+	 * is hidden from one of them by calling this on that viewer alone.
+	 */
+	@Override
+	public void hideBossBar(net.kyori.adventure.bossbar.BossBar bar) {
+		bossBarView().hide(bar);
 	}
 
 	@Override

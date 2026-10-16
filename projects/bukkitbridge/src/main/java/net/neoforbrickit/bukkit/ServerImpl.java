@@ -57,6 +57,15 @@ final class ServerImpl implements org.bukkit.Server {
 	 */
 	private final ForbricSchedulers schedulers;
 
+	/**
+	 * The classic scheduler, answered from the same timers as the region family.
+	 *
+	 * <p>Built eagerly alongside {@link #schedulers}: {@code getScheduler()} is allowed to be called from a
+	 * plugin's constructor, and a lazily-built adapter would have to be thread-safe for no benefit — there is
+	 * nothing to defer.
+	 */
+	private final org.bukkit.scheduler.BukkitScheduler bukkitScheduler;
+
 	ServerImpl(java.util.logging.Logger logger, org.bukkit.plugin.PluginManager pluginManager,
 			java.nio.file.Path pluginsFolder, String version, net.minecraft.server.MinecraftServer minecraft) {
 		this.logger = logger;
@@ -65,6 +74,7 @@ final class ServerImpl implements org.bukkit.Server {
 		this.version = version;
 		this.minecraft = minecraft;
 		this.schedulers = new ForbricSchedulers(this);
+		this.bukkitScheduler = new ForbricBukkitScheduler(this.schedulers);
 	}
 
 	/**
@@ -494,7 +504,26 @@ final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public org.bukkit.scheduler.BukkitScheduler getScheduler() {
-		throw notYet("getScheduler");
+		// Answered, not refused. This is the method the vast majority of Bukkit plugins reach for, and the one
+		// whose absence killed them at load: a plugin whose onEnable schedules anything (the common case) died
+		// here, and so did a Folia-aware plugin that reflectively tried the region schedulers first and fell
+		// back to this one when the lookup failed.
+		//
+		// Both families share one timer (see ForbricBukkitScheduler), because a single-threaded server has
+		// exactly one notion of "next tick" and two queues would fire work out of the order it was written.
+		return bukkitScheduler;
+	}
+
+	/**
+	 * Stops the scheduler timers, for a clean shutdown.
+	 *
+	 * <p>Called from {@link BridgeBootstrap#stop()} after the plugins are disabled. The timers are daemon
+	 * threads, so a missed stop does not hold the JVM open — but a plugin that is being disabled may still
+	 * have a task queued, and letting those fire into a half-torn-down bridge turns a clean shutdown into a
+	 * stack trace that names the wrong cause.
+	 */
+	void shutdownSchedulers() {
+		schedulers.shutdown();
 	}
 
 	@Override

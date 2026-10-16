@@ -46,8 +46,29 @@ import org.bukkit.plugin.Plugin;
  * <p>Every scheduling call returns a {@link ScheduledTask}; the handle is live, so {@code cancel()} stops a
  * repeating task and {@code getExecutionState()} reports what happened. A cancelled task that was already
  * queued does not run.
+ *
+ * <h2>Why every type here is public</h2>
+ *
+ * <p>These classes implement Paper's scheduler interfaces, and the objects are handed to plugins through
+ * {@code Server.getRegionScheduler()} and friends. A plugin that supports Folia does NOT call those methods
+ * directly — the interface is absent on older servers, so it looks the method up reflectively:
+ *
+ * <pre>{@code
+ * Object scheduler = server.getClass().getMethod("getGlobalRegionScheduler").invoke(server);
+ * scheduler.getClass().getMethod("runDelayed", Plugin.class, Consumer.class, long.class)
+ *          .invoke(scheduler, plugin, task, delayTicks);
+ * }</pre>
+ *
+ * <p>{@code invoke} checks that the CALLER may access the method's declaring class. A package-private nested
+ * class fails that check with {@code IllegalAccessException} even though the method itself is public, and
+ * every one of these plugins wraps the lookup in {@code catch (Throwable ignored)} — so the failure is
+ * silent, the call falls through to {@code Bukkit.getScheduler()}, and the plugin dies somewhere else
+ * entirely. Measured, not assumed: this is exactly how SimpleCom failed (its own stack showed
+ * {@code Bukkit.getScheduler} as the last frame before the {@code UnsupportedOperationException}).
+ *
+ * <p>Making them public costs nothing and is the only way reflectively-dispatched calls can work.
  */
-final class ForbricSchedulers {
+public final class ForbricSchedulers {
 
     /** The unit a "tick" is here: 50 ms, the length of a healthy server tick. */
     private static final long MILLIS_PER_TICK = 50L;
@@ -70,26 +91,124 @@ final class ForbricSchedulers {
     /** Every task handed out, so {@code cancelTasks(plugin)} can find a plugin's own. */
     private final CopyOnWriteArrayList<Task> tasks = new CopyOnWriteArrayList<>();
 
-    ForbricSchedulers(ServerImpl server) {
+    public ForbricSchedulers(ServerImpl server) {
         this.server = server;
     }
 
-    RegionScheduler region() {
+    public RegionScheduler region() {
         return new Region();
     }
 
-    GlobalRegionScheduler global() {
+    public GlobalRegionScheduler global() {
         return new Global();
     }
 
-    AsyncScheduler async() {
+    public AsyncScheduler async() {
         return new Async();
     }
 
     /** Stops every timer, for a clean shutdown. */
-    void shutdown() {
+    public void shutdown() {
         gameTimer.shutdownNow();
         asyncPool.shutdownNow();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The seam the classic {@code BukkitScheduler} uses.  Those methods hand out int ids and work with
+    // a plain Runnable, while everything here is built around a Consumer<ScheduledTask>; the adapter in
+    // ForbricBukkitScheduler is thin because the actual queueing lives HERE.  Routing both APIs through
+    // one timer is the point: a server that ticks on one thread has exactly one notion of "next tick",
+    // and two independent schedulers would drift apart (BukkitScheduler's "later" and
+    // GlobalRegionScheduler's "later" would fire in a different order than the plugin wrote them).
+    // ---------------------------------------------------------------------------------------------
+
+    /** Queues {@code body} for the game thread after {@code delayTicks}, as an AsyncScheduler-style task. */
+    ScheduledTask scheduleGameTask(Plugin plugin, Consumer<ScheduledTask> body, long delayTicks) {
+        return scheduleGame(plugin, body, delayTicks, 0L, false);
+    }
+
+    /** Queues {@code body} for the game thread, repeating every {@code periodTicks}. */
+    ScheduledTask scheduleGameRepeating(Plugin plugin, Consumer<ScheduledTask> body, long delayTicks,
+                    long periodTicks) {
+        return scheduleGame(plugin, body, delayTicks, periodTicks, true);
+    }
+
+    /** Queues {@code body} the way {@link #region()} would, with no coordinates to choose between. */
+    ScheduledTask scheduleGameNow(Plugin plugin, Consumer<ScheduledTask> body) {
+        return scheduleGame(plugin, body, 0L, 0L, false);
+    }
+
+    /** The async pool, for the classic API's {@code runTaskAsynchronously} family. */
+    AsyncScheduler asyncScheduler() {
+        return async();
+    }
+
+    /**
+     * Runs a {@code Callable} on the game thread and hands back its value through a future.
+     *
+     * <p>When the caller is already on that thread the value is computed inline: submitting and waiting
+     * would deadlock, because the thread that has to run the work is the one waiting for it. That is the
+     * same distinction Bukkit's own {@code callSyncMethod} makes.
+     */
+    <T> java.util.concurrent.Future<T> callOnGameThread(Plugin plugin, java.util.concurrent.Callable<T> callable) {
+        java.util.concurrent.CompletableFuture<T> future = new java.util.concurrent.CompletableFuture<>();
+        Runnable body = () -> {
+            try {
+                future.complete(callable.call());
+            } catch (Throwable failure) {
+                future.completeExceptionally(failure);
+            }
+        };
+        if (isGameThread()) {
+            body.run();
+        } else {
+            scheduleGameNow(plugin, task -> body.run());
+        }
+        return future;
+    }
+
+    /** Whether the calling thread is the game's own tick thread, for the API's "am I on the main thread". */
+    boolean onGameThread() {
+        return isGameThread();
+    }
+
+    /** Stops one task by the id the classic API handed out. */
+    boolean cancelTaskById(int id) {
+        for (Task task : tasks) {
+            if (task.id == id) {
+                task.cancel();
+                tasks.remove(task);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a task with this id is still queued and not cancelled. */
+    boolean isQueuedById(int id) {
+        for (Task task : tasks) {
+            if (task.id == id) return !task.stopped();
+        }
+        return false;
+    }
+
+    /** The tasks the classic API reports as pending, in id order. */
+    java.util.List<Task> pendingTasks() {
+        return new java.util.ArrayList<>(tasks);
+    }
+
+    /** Every task a plugin still owns, which is what {@code BukkitTask.getOwner()} answers from. */
+    java.util.List<Task> tasksOf(Plugin plugin) {
+        java.util.List<Task> mine = new java.util.ArrayList<>();
+        for (Task task : tasks) {
+            if (task.plugin == plugin) mine.add(task);
+        }
+        return mine;
+    }
+
+    /** Cancels every task a plugin owns, as the interface's own {@code cancelTasks(Plugin)} does. */
+    void cancelTasksOf(Plugin plugin) {
+        cancelTasks(plugin);
     }
 
     /**
@@ -130,6 +249,11 @@ final class ForbricSchedulers {
     /** The process-wide timer, so {@link ForbricSchedulers#shutdown()} can reach it from the bridge. */
     private static final AtomicInteger TASK_IDS = new AtomicInteger();
 
+    /** The next id the classic API will hand out, shared with {@link Task} so both APIs number one sequence. */
+    static int nextTaskId() {
+        return TASK_IDS.incrementAndGet();
+    }
+
     /**
      * One scheduled task, and its state.
      *
@@ -137,16 +261,17 @@ final class ForbricSchedulers {
      * but before it ran must not run, and the executor has no way to say that. {@code repeating} is
      * reported to the plugin, which branches on it to decide whether the handle needs cancelling at all.
      */
-    final class Task implements ScheduledTask {
+    public final class Task implements ScheduledTask {
 
         private final Plugin plugin;
         private final Consumer<ScheduledTask> body;
         private final boolean repeating;
         private final AtomicBoolean cancelled = new AtomicBoolean();
-        private final int id = TASK_IDS.incrementAndGet();
+        /** The id BOTH APIs report: ScheduledTask has none, BukkitTask's is this. */
+        final int id = TASK_IDS.incrementAndGet();
         private volatile ExecutionState state = ExecutionState.IDLE;
 
-        Task(Plugin plugin, Consumer<ScheduledTask> body, boolean repeating) {
+        public Task(Plugin plugin, Consumer<ScheduledTask> body, boolean repeating) {
             this.plugin = plugin;
             this.body = body;
             this.repeating = repeating;
@@ -194,6 +319,38 @@ final class ForbricSchedulers {
 
         /** True once {@link #cancel()} has been called, whatever the reason. */
         boolean stopped() {
+            return cancelled.get();
+        }
+
+        /**
+         * Whether the body is executing on this very call.
+         *
+         * <p>Read by the classic API's {@code isCurrentlyRunning}, which asks a different question from
+         * {@code isQueued}: a task waiting for its delay is queued but not running, and the two answers have
+         * to differ or a plugin polling both cannot tell "not yet" from "in progress".
+         */
+        boolean isRunningNow() {
+            return state == ExecutionState.RUNNING;
+        }
+
+        /** Whether this task repeats, which the classic API reports through {@code isSync()} on its handle. */
+        boolean repeats() {
+            return repeating;
+        }
+
+        /** The plugin that scheduled it, for {@code BukkitTask.getOwner()}. */
+        Plugin owner() {
+            return plugin;
+        }
+
+        /**
+         * Whether the task is still queued or running.
+         *
+         * <p>Distinct from {@link #stopped()}: {@code BukkitTask.isCancelled()} must stay false for a task
+         * that already FINISHED, because "ran to completion" and "was called off" are different answers and
+         * a plugin branches on the difference.
+         */
+        boolean cancelledOrNot() {
             return cancelled.get();
         }
 
@@ -281,7 +438,7 @@ final class ForbricSchedulers {
     }
 
     /** The region scheduler: every region is the one game thread, so the coordinates are ignored. */
-    final class Region implements RegionScheduler {
+    public final class Region implements RegionScheduler {
 
         @Override
         public void execute(Plugin plugin, org.bukkit.World world, int chunkX, int chunkZ, Runnable runnable) {
@@ -313,7 +470,7 @@ final class ForbricSchedulers {
     }
 
     /** The global scheduler: the same thread as every region, minus the coordinates. */
-    final class Global implements GlobalRegionScheduler {
+    public final class Global implements GlobalRegionScheduler {
 
         @Override
         public void execute(Plugin plugin, Runnable runnable) {
@@ -352,7 +509,7 @@ final class ForbricSchedulers {
      * <p>Delays here are in {@link TimeUnit}s the caller passes, not ticks — that is the API's shape, and
      * it is the one scheduler whose timing this bridge does not have to approximate.
      */
-    final class Async implements AsyncScheduler {
+    public final class Async implements AsyncScheduler {
 
         @Override
         public ScheduledTask runNow(Plugin plugin, Consumer<ScheduledTask> task) {

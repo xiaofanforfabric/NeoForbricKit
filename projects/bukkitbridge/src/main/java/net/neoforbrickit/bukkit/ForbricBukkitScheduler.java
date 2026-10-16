@@ -69,8 +69,29 @@ import net.neoforbrickit.bridge.util.ForbricLog;
  */
 final class ForbricBukkitScheduler implements BukkitScheduler {
 
-    /** The length of a tick, 50 ms — the same unit {@link ForbricSchedulers} counts in. */
+    /**
+     * The length of a tick, 50 ms — the same unit {@link ForbricSchedulers} counts in.
+     */
     private static final long MILLIS_PER_TICK = 50L;
+
+    /**
+     * A period of at least one tick, in milliseconds.
+     *
+     * <p>The classic API accepts {@code period = 0} and means "every tick", which is why the count is
+     * clamped upward rather than rejected. It has to be clamped on BOTH sides of the conversion:
+     * {@code gameTimer.scheduleAtFixedRate} rejects a non-positive period outright, and the async
+     * scheduler below forwards to the game timer's sibling — passing 0 through multiplied by 50 still
+     * gives 0, which throws {@code IllegalArgumentException} from inside the executor and surfaces as
+     * the plugin's scheduling call failing for a reason no plugin author can read.
+     */
+    private static long periodMillis(long periodTicks) {
+        return Math.max(1L, periodTicks) * MILLIS_PER_TICK;
+    }
+
+    /** The async pool's delay: 0 ticks means "now", so the clamp is at zero rather than one. */
+    private static long delayMillis(long delayTicks) {
+        return Math.max(0L, delayTicks) * MILLIS_PER_TICK;
+    }
 
     private final ForbricSchedulers schedulers;
 
@@ -348,9 +369,15 @@ final class ForbricBukkitScheduler implements BukkitScheduler {
     /** The {@code Consumer<? super BukkitTask>} flavour: the plugin's consumer receives the live handle. */
     private void gameConsumer(Plugin plugin, Consumer<? super BukkitTask> body, long delay, long period,
                     boolean repeating) {
-        // The handle does not exist when the task is created, and the task cannot exist without a body --
-        // so the body reads the handle out of this one-element array, which is filled before the body can
-        // ever run (the next tick at the earliest).
+        // The handle does not exist when the task is created, and the task cannot exist without a body.
+        // So the body reads the handle from this one-element array WHEN IT RUNS rather than being handed
+        // one at construction time.
+        //
+        // An earlier version filled the array before the body could run, on the reasoning that the next
+        // tick was the earliest the body could fire. That is false for `runTask` (and any 0-tick delay):
+        // scheduleGame runs the body INLINE when the caller is already on the game thread, which is the
+        // common case inside a command -- so the consumer received a null handle and a plugin calling
+        // task.cancel() from it threw a NullPointerException out of its own first run.
         Handle[] handle = new Handle[1];
         Consumer<io.papermc.paper.threadedregions.scheduler.ScheduledTask> wrapped =
                         ignore -> body.accept(handle[0]);
@@ -385,23 +412,31 @@ final class ForbricBukkitScheduler implements BukkitScheduler {
     private BukkitTask async(Plugin plugin, Consumer<io.papermc.paper.threadedregions.scheduler.ScheduledTask> body,
                     long delay, long period, boolean repeating) {
         ForbricSchedulers.Task task = (ForbricSchedulers.Task) (repeating
-                        ? schedulers.asyncScheduler().runAtFixedRate(plugin, body, delay * MILLIS_PER_TICK,
-                                        period * MILLIS_PER_TICK, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        : schedulers.asyncScheduler().runDelayed(plugin, body, delay * MILLIS_PER_TICK,
+                        ? schedulers.asyncScheduler().runAtFixedRate(plugin, body, delayMillis(delay),
+                                        periodMillis(period), java.util.concurrent.TimeUnit.MILLISECONDS)
+                        : schedulers.asyncScheduler().runDelayed(plugin, body, delayMillis(delay),
                                         java.util.concurrent.TimeUnit.MILLISECONDS));
         return new Handle(task, false);
     }
 
-    /** The async {@code Consumer<? super BukkitTask>} flavour. */
+    /**
+     * The async {@code Consumer<? super BukkitTask>} flavour.
+     *
+     * <p>The handle is handed to the consumer on EVERY run rather than being filled in once before the
+     * task starts. The array is empty until the scheduling call returns, and with {@code delay = 0} the
+     * body can run before that happens — the consumer would then receive null, and a plugin that calls
+     * {@code task.cancel()} on it throws a NullPointerException from inside its own first run. Reading
+     * the array at run time is what makes the ordering irrelevant.
+     */
     private void asyncConsumer(Plugin plugin, Consumer<? super BukkitTask> body, long delay, long period,
                     boolean repeating) {
         Handle[] handle = new Handle[1];
         Consumer<io.papermc.paper.threadedregions.scheduler.ScheduledTask> wrapped =
                         ignore -> body.accept(handle[0]);
         ForbricSchedulers.Task task = (ForbricSchedulers.Task) (repeating
-                        ? schedulers.asyncScheduler().runAtFixedRate(plugin, wrapped, delay * MILLIS_PER_TICK,
-                                        period * MILLIS_PER_TICK, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        : schedulers.asyncScheduler().runDelayed(plugin, wrapped, delay * MILLIS_PER_TICK,
+                        ? schedulers.asyncScheduler().runAtFixedRate(plugin, wrapped, delayMillis(delay),
+                                        periodMillis(period), java.util.concurrent.TimeUnit.MILLISECONDS)
+                        : schedulers.asyncScheduler().runDelayed(plugin, wrapped, delayMillis(delay),
                                         java.util.concurrent.TimeUnit.MILLISECONDS));
         handle[0] = new Handle(task, false);
     }
@@ -414,9 +449,9 @@ final class ForbricBukkitScheduler implements BukkitScheduler {
             task.run();
         };
         ForbricSchedulers.Task scheduled = (ForbricSchedulers.Task) (repeating
-                        ? schedulers.asyncScheduler().runAtFixedRate(plugin, wrapped, delay * MILLIS_PER_TICK,
-                                        period * MILLIS_PER_TICK, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        : schedulers.asyncScheduler().runDelayed(plugin, wrapped, delay * MILLIS_PER_TICK,
+                        ? schedulers.asyncScheduler().runAtFixedRate(plugin, wrapped, delayMillis(delay),
+                                        periodMillis(period), java.util.concurrent.TimeUnit.MILLISECONDS)
+                        : schedulers.asyncScheduler().runDelayed(plugin, wrapped, delayMillis(delay),
                                         java.util.concurrent.TimeUnit.MILLISECONDS));
         handle[0] = new Handle(scheduled, false);
         return handle[0];

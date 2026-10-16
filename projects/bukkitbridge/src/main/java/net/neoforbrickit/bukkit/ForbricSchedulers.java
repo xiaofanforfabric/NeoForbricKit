@@ -228,6 +228,13 @@ public final class ForbricSchedulers {
         if (delayMillis == 0L && !repeating && isGameThread()) {
             // Already where it needs to be and wanted now: run it here rather than round-tripping through
             // the timer, which would add a tick of latency to every synchronous scheduling call.
+            //
+            // Through runOnGameThread rather than invoke(), even though the thread is already right, and
+            // that is what makes a throwing plugin task survivable: runOnGameThread routes into invoke(),
+            // which contains the failure through Task#fail and reports it against the plugin. Calling the
+            // body directly here would let the exception escape into the scheduling call -- so a plugin
+            // that schedules from a command handler would see the game's command dispatch report the
+            // throw, and the task bookkeeping (state, forget()) would be left half done.
             task.runOnGameThread(server);
             return task;
         }

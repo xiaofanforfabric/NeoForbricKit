@@ -46,6 +46,12 @@ class ForbricEntity implements org.bukkit.entity.Entity {
                 if (entity instanceof net.minecraft.world.entity.LightningBolt bolt) {
                         return new ForbricLightningStrike(bolt, server);
                 }
+                // Primed TNT is the same story: a plugin that spawns a charge then sets its fuse casts
+                // the result to TNTPrimed, and the plain wrapper would fail that cast. The richer
+                // wrapper is the only answer that lets the plugin finish the job it started.
+                if (entity instanceof net.minecraft.world.entity.item.PrimedTnt tnt) {
+                        return new ForbricTNTPrimed(tnt, server);
+                }
                 // A living entity gets the richer interface for the same reason: a plugin asks every
                 // candidate from a nearby-entity search `instanceof LivingEntity` before damaging it, and
                 // the plain wrapper fails that test — so a blast that should hurt the mob next to it
@@ -194,19 +200,47 @@ class ForbricEntity implements org.bukkit.entity.Entity {
                 return "ForbricEntity[" + entity.getUUID() + "]";
         }
 
+	/**
+	 * The entity's position, written into the caller's own Location when one is given.
+	 *
+	 * <p>That argument is an output parameter, not an input: the legacy signature exists so a
+	 * caller that moves an entity every tick can reuse one Location instead of allocating. The
+	 * game's entity always knows where it is, so the argument is filled and returned -- a bridge
+	 * that allocated a fresh Location here would honour the result and ignore the reuse.
+	 */
 	@Override
 	public org.bukkit.Location getLocation(org.bukkit.Location arg0) {
-		throw notYet("getLocation");
+		org.bukkit.Location answer = arg0 == null ? getLocation() : arg0;
+		net.minecraft.world.phys.Vec3 position = entity.position();
+		answer.setWorld(world());
+		answer.setX(position.x());
+		answer.setY(position.y());
+		answer.setZ(position.z());
+		answer.setYaw(entity.getYRot());
+		answer.setPitch(entity.getXRot());
+		return answer;
 	}
 
+	/**
+	 * Sets the entity's velocity, in blocks per tick.
+	 *
+	 * <p>The game keeps this as delta movement and integrates it in the entity's own tick, so
+	 * writing it here is what makes a projectile launched this tick move on the next one. The
+	 * plugin that needs it spawns its charges at a single point and relies on this call alone to
+	 * spread them.
+	 */
 	@Override
 	public void setVelocity(org.bukkit.util.Vector arg0) {
-		throw notYet("setVelocity");
+		if (arg0 == null) {
+		    throw new IllegalArgumentException("[Forbric/Bukkit] Entity.setVelocity() needs a vector");
+		}
+		entity.setDeltaMovement(arg0.getX(), arg0.getY(), arg0.getZ());
 	}
 
 	@Override
 	public org.bukkit.util.Vector getVelocity() {
-		throw notYet("getVelocity");
+		net.minecraft.world.phys.Vec3 motion = entity.getDeltaMovement();
+		return new org.bukkit.util.Vector(motion.x(), motion.y(), motion.z());
 	}
 
 	@Override

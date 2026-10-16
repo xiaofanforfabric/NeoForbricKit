@@ -468,6 +468,16 @@ final class ServerImpl implements org.bukkit.Server {
 		return online == null ? null : online.getUniqueId();
 	}
 
+	/**
+	 * The game's own server, for reflection-based compatibility layers (like Simple Voice Chat).
+	 *
+	 * <p>Not part of the {@code Server} interface: this is a bridge-specific method for plugins that
+	 * need to inspect the Minecraft server directly.
+	 */
+	public net.minecraft.server.MinecraftServer getServer() {
+		return minecraft;
+	}
+
 	@Override
 	public org.bukkit.plugin.PluginManager getPluginManager() {
 		return pluginManager;

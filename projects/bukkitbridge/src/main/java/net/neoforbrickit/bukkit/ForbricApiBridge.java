@@ -218,7 +218,17 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 		// provider, so it is loaded by FML's "FML Plugins" layer, which cannot link net.minecraft.*.
 		// Naming ForbricItemCodec here would resolve THAT class in THIS layer, and its first
 		// RegistryAccess reference then fails with NoClassDefFoundError inside a plugin's command.
-		return (ItemStack) itemCodec("decode", new Class<?>[] {byte[].class}, data);
+		try {
+			return (ItemStack) itemCodec("decode", new Class<?>[] {byte[].class}, data);
+		} catch (ReflectiveOperationException unreachable) {
+			// The method and its shape are fixed by this bridge, so a lookup that fails means the
+			// two halves were built from different sources. Wrapped rather than swallowed: the
+			// caller is inside a plugin's command and needs the stack trace, not a silent null.
+			throw new IllegalStateException(
+				"[Forbric/Bukkit] the item codec's game-layer half (ForbricItemCodecLookup.decode)"
+					+ " is not present in the game layer",
+				unreachable);
+		}
 	}
 
 	@Override
@@ -248,7 +258,14 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 		// net.minecraft.world.item.ItemStack, and a descriptor is resolved when the call site is
 		// linked -- so naming the class here fails at load, one step along the same chain that
 		// ForbricItemCodec failed on.
-		return (ItemStack) itemCodec("emptyStack", new Class<?>[0]);
+		try {
+			return (ItemStack) itemCodec("emptyStack", new Class<?>[0]);
+		} catch (ReflectiveOperationException unreachable) {
+			throw new IllegalStateException(
+				"[Forbric/Bukkit] the item codec's game-layer half (ForbricItemCodecLookup.emptyStack)"
+					+ " is not present in the game layer",
+				unreachable);
+		}
 	}
 
 	@Override
@@ -279,25 +296,23 @@ public final class ForbricApiBridge implements InternalAPIBridge {
 	 * resolve that class in this layer, and its {@code RegistryAccess} reference cannot be linked
 	 * from here.
 	 */
-	private static Object itemCodec(String method, Class<?>[] parameterTypes, Object... arguments) {
+	private static Class<?> gameLayer() throws ReflectiveOperationException {
 		Object registries = ForbricRegistries.access();
 		if (registries == null) {
 			throw new IllegalStateException(
 					"[Forbric/Bukkit] the server has not published its registries yet, so an item cannot"
 							+ " be (de)serialised");
 		}
-		try {
-			Class<?> gameLayer = Class.forName("net.neoforbrickit.bukkit.ForbricItemCodecLookup", true,
-					registries.getClass().getClassLoader());
-			return gameLayer.getMethod(method, parameterTypes).invoke(null, arguments);
-		} catch (ReflectiveOperationException unreachable) {
-			// The class, the method and its shape are all fixed by this bridge, so a lookup that fails
-			// means the two halves were built from different sources. Wrapped rather than swallowed:
-			// the caller is inside a plugin's command and needs a stack trace, not a silent null.
-			throw new IllegalStateException(
-					"[Forbric/Bukkit] the item codec's game-layer half (ForbricItemCodecLookup." + method
-							+ ") is not present in the game layer",
-					unreachable);
-		}
+		return Class.forName("net.neoforbrickit.bukkit.ForbricItemCodecLookup", true,
+			registries.getClass().getClassLoader());
+	}
+
+	private static Object itemCodec(String method, Class<?>[] parameterTypes, Object... arguments)
+			throws ReflectiveOperationException {
+		// The class, the method and its shape are all fixed by this bridge, so a lookup that fails
+		// means the two halves were built from different sources. Letting it escape rather than
+		// swallowing it keeps the stack trace: the caller is inside a plugin's command and needs
+		// to see which layer was missing what.
+		return gameLayer().getMethod(method, parameterTypes).invoke(null, arguments);
 	}
 }

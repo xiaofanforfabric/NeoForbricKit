@@ -805,18 +805,62 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	/**
 	 * The game's entity type for a Bukkit entity class.
 	 *
-	 * <p>By name, the same way {@link ForbricEntity#getType()} goes the other direction: the
-	 * registry id is stable where an ordinal is not, and Bukkit names its classes and its
-	 * {@code EntityType} constants after the same ids.
+	 * <p>Through the API's own {@code EntityType}, NOT by the class name. The two differ far more
+	 * often than "they are named after the same ids" suggests: {@code TNTPrimed} is the interface
+	 * for {@code EntityType.TNT}, {@code PigZombie} for {@code ZOMBIFIED_PIGLIN},
+	 * {@code FallingBlock} for {@code FALLING_BLOCK}, and 50-odd more. Lower-casing the interface
+	 * name gives {@code tntprimed} / {@code pigzombie}, which is not a registry id of anything --
+	 * so {@code spawn()} threw for every one of them, first seen on a nuke plugin whose whole job
+	 * is to spawn {@code TNTPrimed}.
 	 *
-	 * <p>A class whose name is not a registry id answers null, and the caller turns that into an
+	 * <p>Walking {@code EntityType.values()} once and keying on the interface class it reports is
+	 * the mapping the API itself publishes, so it stays right when a name changes; the lookup then
+	 * follows {@code getKey()}, the same namespaced id {@link ForbricEntity#getType()} reads back.
+	 *
+	 * <p>A class no constant claims answers null, and the caller turns that into an
 	 * IllegalArgumentException: null is the honest answer to "is there a type for this", and only
 	 * the caller knows whether to throw.
 	 */
 	private static net.minecraft.world.entity.EntityType<?> entityTypeOf(java.lang.Class<?> bukkitClass) {
-		java.lang.String name = bukkitClass.getSimpleName().toLowerCase(java.util.Locale.ROOT);
-		net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.parse(name);
+		org.bukkit.entity.EntityType bukkit = ENTITY_TYPES_BY_CLASS.get(bukkitClass);
+		if (bukkit == null) {
+			return null;
+		}
+		org.bukkit.NamespacedKey key = bukkit.getKey();
+		net.minecraft.resources.Identifier id =
+				net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
 		return net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE.get(id).map(holder -> holder.value()).orElse(null);
+	}
+
+	/**
+	 * Every Bukkit {@code EntityType}, keyed by the entity interface it spawns.
+	 *
+	 * <p>Built once rather than scanned per call, and read-only thereafter. A {@code values()}
+	 * walk per spawn would be wasted work on the one path -- a nuke, a barrage, a wave -- that
+	 * spawns in a loop.
+	 *
+	 * <p>A constant whose {@code getEntityClass()} throws or answers null is skipped rather than
+	 * failing the whole table: some types ({@code UNKNOWN}, the legacy aliases) have no class, and
+	 * one of them must not cost the other 130 their lookup.
+	 */
+	private static final java.util.Map<java.lang.Class<?>, org.bukkit.entity.EntityType> ENTITY_TYPES_BY_CLASS =
+			buildEntityTypesByClass();
+
+	private static java.util.Map<java.lang.Class<?>, org.bukkit.entity.EntityType> buildEntityTypesByClass() {
+		java.util.Map<java.lang.Class<?>, org.bukkit.entity.EntityType> byClass = new java.util.HashMap<>();
+		for (org.bukkit.entity.EntityType type : org.bukkit.entity.EntityType.values()) {
+			try {
+				java.lang.Class<?> entityClass = type.getEntityClass();
+				if (entityClass != null) {
+					// First wins: a couple of constants share a class (the legacy aliases), and the
+					// first is the current one -- put-if-absent keeps it.
+					byClass.putIfAbsent(entityClass, type);
+				}
+			} catch (RuntimeException unsupported) {
+				// getEntityClass() on a type the API cannot map; nothing to key, so skip it.
+			}
+		}
+		return java.util.Map.copyOf(byClass);
 	}
 
 	/** The game box for a point and Bukkit's half-extents. */

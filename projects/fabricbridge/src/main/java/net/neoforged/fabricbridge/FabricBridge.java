@@ -91,6 +91,13 @@ public final class FabricBridge {
             var start = System.currentTimeMillis();
             ensureLauncherRegistered();
 
+            // Before the loader logs anything of its own: its builtin handler buffers instead of printing,
+            // so without this the "Loading N mod(s)" block stays invisible until the shutdown hook dumps it
+            // into fabricloader.log - the one line a Fabric user looks for, missing from console and
+            // latest.log. Log.init replays what the buffer already holds, so nothing logged before this
+            // point is lost.
+            BridgedLogHandler.install();
+
             try {
                 FabricLoaderImpl.INSTANCE.load();
                 FabricLoaderImpl.INSTANCE.freeze();

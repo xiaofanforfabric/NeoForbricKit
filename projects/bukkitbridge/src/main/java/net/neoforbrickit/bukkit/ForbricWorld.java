@@ -1004,16 +1004,15 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.Chunk getChunkAt(int arg0, int arg1, boolean arg2) {
-		// Blocking, and that is what the method is: Bukkit has one synchronous load and a family of async ones
-		// beside it. The wait is on the game's own future, so a plugin calling this from the server thread
-		// gets the chunk the moment the game has it, and one calling it from its own thread waits there.
-		//
-		// The status asked for is FULL, which is the level a plugin that wants to read blocks or entities
-		// needs. A lesser status would answer faster with a chunk whose lighting and entities are not done,
-		// and every caller of getChunkAt in practice is about to look at what is in it.
+		// The contract is @NotNull, and that is not a formality: `generate` means "fully generate or not",
+		// not "return null when there is nothing there". A plugin asking with generate=false wants a handle
+		// it can call isGenerated() on, and answering null makes that call throw on the plugin's own line --
+		// which is how a pre-generator's loop died on its first iteration with nothing in any log. The
+		// unloaded case is therefore answered with a Chunk whose isGenerated() is false, from the same
+		// wrapper the loaded case uses.
 		net.minecraft.world.level.chunk.LevelChunk chunk = loadChunkNow(arg0, arg1, arg2);
 		if (chunk == null) {
-			return null;
+			return ForbricChunk.unloaded(this, arg0, arg1);
 		}
 		return ForbricChunk.loaded(this, chunk);
 	}
@@ -1021,7 +1020,9 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	@Override
 	public org.bukkit.Chunk getChunkAt(org.bukkit.block.Block arg0) {
 		if (arg0 == null) {
-			return null;
+			// Not reachable from a plugin that got the block from this world, but a null argument has no
+			// coordinates to answer with and an empty chunk at 0,0 would be a wrong answer rather than none.
+			throw new IllegalArgumentException("[Forbric/Bukkit] a chunk cannot be located from a null Block");
 		}
 		// Through the block's own coordinates rather than its chunk: a Block from another world would otherwise
 		// be answered from this world's chunk at the same coordinate, which is a wrong chunk rather than an

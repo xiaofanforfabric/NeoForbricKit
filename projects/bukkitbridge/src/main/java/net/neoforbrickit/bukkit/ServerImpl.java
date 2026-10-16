@@ -556,6 +556,19 @@ public final class ServerImpl implements org.bukkit.Server {
 	}
 
 	/**
+	 * The bridge's schedulers, for the bridge's own use.
+	 *
+	 * <p>Package-visible rather than public: a plugin reaches schedulers through {@code getScheduler()},
+	 * which hands out the Bukkit-shaped view, and the region family through the Folia trio. This accessor is
+	 * for other bridge classes that need to hop onto the game thread without pretending to be a plugin — the
+	 * chunk loader in {@link ForbricWorld} being the first, where Bukkit's own scheduler cannot be used
+	 * because it demands a non-null plugin and the work belongs to nobody in particular.
+	 */
+	ForbricSchedulers schedulers() {
+		return schedulers;
+	}
+
+	/**
 	 * Stops the scheduler timers, for a clean shutdown.
 	 *
 	 * <p>Called from {@link BridgeBootstrap#stop()} after the plugins are disabled. The timers are daemon

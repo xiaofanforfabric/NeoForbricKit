@@ -110,6 +110,14 @@ public final class ForbricPlayerEventHook {
 			server.getPluginManager().callEvent(
 							new org.bukkit.event.player.PlayerQuitEvent(bukkitPlayer,
 									net.kyori.adventure.text.Component.text(player.getScoreboardName())));
+			// Boss bars after the event, not before: a plugin handling the quit may still hide one, and that
+			// call would find nothing to hide if the view had already been emptied. This runs afterwards so
+			// that whatever the plugin left behind is what gets cleaned up.
+			//
+			// The reason it has to happen at all is that an adventure bar keeps a reference to every listener
+			// registered on it. Dropping only the bridge's map would leave one dangling listener per bar per
+			// departed player, held by the plugin's own bar object, for the life of the server.
+			ForbricPlayer.forgetBossBarView(player);
 		} catch (Throwable failure) {
 			// Same reasoning as the join hook: the player is already leaving, and an exception here
 			// would turn a normal disconnect into a failed one.

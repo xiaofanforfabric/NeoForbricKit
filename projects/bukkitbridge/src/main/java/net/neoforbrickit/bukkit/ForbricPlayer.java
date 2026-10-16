@@ -47,16 +47,38 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
         private static final java.util.Map<net.minecraft.server.level.ServerPlayer, java.util.Set<String>> CHANNELS =
                         java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
-        /**
-         * Whatever this player has been granted at run time, in the order it was added.
-         *
-         * <p>Per wrapper, because a wrapper is built per call — see {@link #of}. A plugin that adds an
-         * attachment holds the wrapper it added it to and reads it back through the same one, which is the only
-         * usage the API describes; one that stores the attachment and re-reads through a NEW wrapper gets the
-         * attachment's own {@code getPermissions()} back, which is the documented way to do that.
-         */
-        private final java.util.List<org.bukkit.permissions.PermissionAttachment> attachments =
-                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+	/**
+	 * The per-player metadata every plugin shares.
+	 *
+	 * <p><b>Static, and keyed by the game's player, for a reason that is easy to get wrong.</b> A wrapper is
+	 * built per call (see {@link #of}), so a store held on the wrapper would be visible to exactly one caller
+	 * and a plugin would read back what it had written only if it held the same wrapper. The API's whole point
+	 * is the opposite: one plugin writes a value and a different plugin, through a different wrapper it built
+	 * itself, reads it. {@code %vanished%} is precisely that shape — a vanish plugin sets the marker, TAB
+	 * looks it up — and it cannot work with per-wrapper state.
+	 *
+	 * <p>{@link org.bukkit.metadata.MetadataStoreBase} rather than a map of our own, because it is the
+	 * semantics the API documents and plugins are already written against: one value per plugin per key,
+	 * several plugins may set the same key without overwriting each other, and {@code getMetadata} returns
+	 * all of them in one list. Reimplementing that here would be a second, subtly different version of a
+	 * contract plugins already depend on.
+	 *
+	 * <p>Weak keys, like {@link #CHANNELS}: metadata is not persisted anywhere and a departed player's
+	 * entry is unreachable the moment the game drops its own player object.
+	 */
+	private static final org.bukkit.metadata.MetadataStore<net.minecraft.server.level.ServerPlayer> METADATA =
+			new ForbricMetadataStore();
+
+	/**
+	 * Whatever this player has been granted at run time, in the order it was added.
+	 *
+	 * <p>Per wrapper, because a wrapper is built per call — see {@link #of}. A plugin that adds an
+	 * attachment holds the wrapper it added it to and reads it back through the same one, which is the only
+	 * usage the API describes; one that stores the attachment and re-reads through a NEW wrapper gets the
+	 * attachment's own {@code getPermissions()} back, which is the documented way to do that.
+	 */
+	private final java.util.List<org.bukkit.permissions.PermissionAttachment> attachments =
+			java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
         private ForbricPlayer(net.minecraft.server.level.ServerPlayer player, ServerImpl server) {
                 super(player);
@@ -78,6 +100,61 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
         /** The wrapped player, for the bridge's own use by {@link ForbricWorld} and the event layer. */
         net.minecraft.server.level.ServerPlayer player() {
                 return player;
+        }
+
+        /**
+         * The adventure boss bars this player is currently shown, as this bridge tracks them.
+         *
+         * <p><b>Kept per game player, not per wrapper.</b> {@link #of} builds a fresh wrapper on every call, so
+         * a view stored on the wrapper would be reachable by exactly one caller — and a plugin that shows a bar
+         * through one call and hides it through the next would be talking to two different maps. The game
+         * player is the thing both calls share, so it is the key.
+         *
+         * <p>A weak key, like {@link #CHANNELS}: a view holds a listener registration on each of the plugin's
+         * bars, so it must not be kept alive by this map after the player is gone. There is a second reason
+         * for that care — the {@code ServerPlayer} the game drops is the only thing that can tell the bridge
+         * the bars are over, and nothing else clears them.
+         */
+        private static final java.util.Map<net.minecraft.server.level.ServerPlayer, ForbricBossBarView>
+                        BOSS_BAR_VIEWS = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+        /** This player's boss bar view, created on first use. */
+        private ForbricBossBarView bossBarView() {
+                // get/put rather than computeIfAbsent, and the difference is not stylistic: the map is
+                // synchronized, and computeIfAbsent on one holds the lock across the mapping function, which
+                // here would construct a view -- fine on its own, but the calling thread may already be inside
+                // another synchronized block on this same map through forgetBossBarView. Two plain calls under
+                // the same short lock keep the invariant obvious.
+                synchronized (BOSS_BAR_VIEWS) {
+                        ForbricBossBarView existing = BOSS_BAR_VIEWS.get(player);
+                        if (existing != null) {
+                                return existing;
+                        }
+                        ForbricBossBarView created = new ForbricBossBarView(player);
+                        BOSS_BAR_VIEWS.put(player, created);
+                        return created;
+                }
+        }
+
+        /**
+         * Drops a departing player's boss bar view, taking their bars off that player's screen.
+         *
+         * <p>Called from the quit hook, and the reason it is a static here rather than a method on the view is
+         * the same reason the map is: the caller has the game player and needs nothing else. Removing the entry
+         * also releases the listener registrations the view holds on the plugin's bars — see
+         * {@link ForbricBossBarView#clear()}.
+         *
+         * <p>The entry may not exist, which is not an error: a player who never had a bar shown to them never
+         * caused a view to be created, and that is the common case.
+         */
+        static void forgetBossBarView(net.minecraft.server.level.ServerPlayer player) {
+                ForbricBossBarView view;
+                synchronized (BOSS_BAR_VIEWS) {
+                        view = BOSS_BAR_VIEWS.remove(player);
+                }
+                if (view != null) {
+                        view.clear();
+                }
         }
 
         private static UnsupportedOperationException notYet(String what) {
@@ -491,7 +568,37 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public java.lang.Iterable<? extends net.kyori.adventure.bossbar.BossBar> activeBossBars() {
-		throw notYet("activeBossBars");
+		// A live view of this player's own bars, created on demand and keyed by the player: a wrapper is built
+		// per call (see {@link #of}), so a view held on the wrapper would be visible to exactly one caller.
+		return bossBarView().active();
+	}
+
+	/**
+	 * Puts a boss bar on this player's screen.
+	 *
+	 * <p><b>An override, not an implementation of an abstract method.</b> {@code Audience.showBossBar} has a
+	 * default body that is a bare {@code return} — a bridge that never overrides it compiles, starts and runs,
+	 * with every bar a plugin shows silently discarded and nothing in any log to say so. TAB's boss bar feature
+	 * reaches this path in preference to {@code Bukkit.createBossBar}, so leaving it out is why a bar the
+	 * plugin reported as displayed never appeared on any client.
+	 *
+	 * <p>The bar a plugin passes is kept, not copied: adventure's {@code BossBar} is mutable, and a later
+	 * {@code bar.progress(0.5f)} has to reach the client. The listener registered here is what carries it.
+	 */
+	@Override
+	public void showBossBar(net.kyori.adventure.bossbar.BossBar bar) {
+		bossBarView().show(bar);
+	}
+
+	/**
+	 * Takes a boss bar off this player's screen.
+	 *
+	 * <p>Only this player is affected, which is what adventure's contract says: a bar shown to several viewers
+	 * is hidden from one of them by calling this on that viewer alone.
+	 */
+	@Override
+	public void hideBossBar(net.kyori.adventure.bossbar.BossBar bar) {
+		bossBarView().hide(bar);
 	}
 
 	@Override
@@ -1326,7 +1433,23 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public int getPing() {
-		throw notYet("getPing");
+		// The server's own measurement of this player's round trip, in milliseconds. It is what the tab list
+		// shows and what every "is this player lagging" plugin reads, so it has to be the real number rather
+		// than a constant: the connection keeps it up to date from the keep-alive exchange, and the same
+		// value is what vanilla puts in the player list packet.
+		//
+		// Reached through the listener rather than through the player, because that is where the field lives;
+		// `connection` is public on ServerPlayer (and the field on the listener has been widened), and
+		// `latency()` is a public getter, so this is two plain calls with nothing reflective in between.
+		//
+		// Answered before the listener exists, and that is a real case: the wrapper can be built for a player
+		// whose connection has not been attached yet, and asking then would throw out of a method plugins
+		// call in a loop. 0 is the honest answer for "no measurement yet", and it is also what vanilla
+		// reports for a player who has just joined.
+		if (player.connection == null) {
+			return 0;
+		}
+		return player.connection.latency();
 	}
 
 	@Override
@@ -3194,22 +3317,22 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public void setMetadata(java.lang.String arg0, org.bukkit.metadata.MetadataValue arg1) {
-		throw notYet("setMetadata");
+		METADATA.setMetadata(player, arg0, arg1);
 	}
 
 	@Override
 	public java.util.List<org.bukkit.metadata.MetadataValue> getMetadata(java.lang.String arg0) {
-		throw notYet("getMetadata");
+		return METADATA.getMetadata(player, arg0);
 	}
 
 	@Override
 	public boolean hasMetadata(java.lang.String arg0) {
-		throw notYet("hasMetadata");
+		return METADATA.hasMetadata(player, arg0);
 	}
 
 	@Override
 	public void removeMetadata(java.lang.String arg0, org.bukkit.plugin.Plugin arg1) {
-		throw notYet("removeMetadata");
+		METADATA.removeMetadata(player, arg0, arg1);
 	}
 
 	@Override

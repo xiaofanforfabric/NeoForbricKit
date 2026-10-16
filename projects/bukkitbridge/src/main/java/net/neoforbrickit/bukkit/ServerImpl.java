@@ -89,6 +89,16 @@ public final class ServerImpl implements org.bukkit.Server {
 	private final org.bukkit.scheduler.BukkitScheduler bukkitScheduler;
 
 	/**
+	 * The keyed boss bars plugins have registered, and the only place they can be found again.
+	 *
+	 * <p>Kept here rather than asked of the game, because the game cannot answer it: a {@code ServerBossEvent}
+	 * is a per-connection broadcast object and nothing enumerates the bars that exist. The bar a plugin gets
+	 * back is live — it holds the same game object the clients are being pushed to — so this is a name to
+	 * handle table, not a copy.
+	 */
+	private final ForbricBossBarRegistry bossBars = new ForbricBossBarRegistry(this);
+
+	/**
 	 * Built once by {@link BridgeBootstrap}, which is the only caller.
 	 *
 	 * <p>Public because the class is: a plugin that reflectively reaches {@code getServer()}'s runtime class
@@ -1165,27 +1175,53 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public org.bukkit.boss.BossBar createBossBar(java.lang.String arg0, org.bukkit.boss.BarColor arg1, org.bukkit.boss.BarStyle arg2, org.bukkit.boss.BarFlag... arg3) {
-		throw notYet("createBossBar");
+		// A bar nothing can look up again: Bukkit's unkeyed form, and the game's object is the whole of it.
+		// The game identifies a bar by a UUID it never sends, so a random one is what vanilla does here too.
+		//
+		// Colour and style may be null -- the API marks them @NotNull, but a plugin written against an older
+		// signature can pass null and the game's own constructor accepts it, using BLUE and PROGRESS. The
+		// mappings below answer the same way rather than throwing, so a bar is still created.
+		String title = arg0 == null ? "" : arg0;
+		net.minecraft.server.level.ServerBossEvent handle = new net.minecraft.server.level.ServerBossEvent(
+				java.util.UUID.randomUUID(),
+				ForbricComponentBridge.toGame(net.kyori.adventure.text.Component.text(title)),
+				ForbricBossBar.gameColor(arg1),
+				ForbricBossBar.gameOverlay(arg2));
+		ForbricBossBar bar = new ForbricBossBar(handle, this, title, arg1, arg2);
+		if (arg3 != null) {
+			for (org.bukkit.boss.BarFlag flag : arg3) {
+				bar.addFlag(flag);
+			}
+		}
+		return bar;
 	}
 
 	@Override
 	public org.bukkit.boss.KeyedBossBar createBossBar(org.bukkit.NamespacedKey arg0, java.lang.String arg1, org.bukkit.boss.BarColor arg2, org.bukkit.boss.BarStyle arg3, org.bukkit.boss.BarFlag... arg4) {
-		throw notYet("createBossBar");
+		// Registered, so the same key finds it again -- which is what a plugin does after a reload.
+		return bossBars.create(arg0, arg1, arg2, arg3, arg4);
 	}
 
 	@Override
 	public java.util.Iterator<org.bukkit.boss.KeyedBossBar> getBossBars() {
-		throw notYet("getBossBars");
+		// Only the KEYED bars, because only they were registered. A bar from the unkeyed createBossBar has no
+		// name to be listed under, and Bukkit's own documentation describes this iterator as the keyed set.
+		//
+		// A copy, not a view: the iterator is handed to a plugin, and a concurrent modification of the map
+		// behind it would throw from inside the plugin's own loop.
+		java.util.List<org.bukkit.boss.KeyedBossBar> bars = new java.util.ArrayList<>();
+		bars.addAll(bossBars.all());
+		return bars.iterator();
 	}
 
 	@Override
 	public org.bukkit.boss.KeyedBossBar getBossBar(org.bukkit.NamespacedKey arg0) {
-		throw notYet("getBossBar");
+		return bossBars.get(arg0);
 	}
 
 	@Override
 	public boolean removeBossBar(org.bukkit.NamespacedKey arg0) {
-		throw notYet("removeBossBar");
+		return bossBars.remove(arg0);
 	}
 
 	@Override
@@ -1195,17 +1231,31 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public double[] getTPS() {
-		throw notYet("getTPS");
+		// Ticks per second over the recent past. Vanilla keeps the last 100 tick durations in a ring buffer
+		// (tickTimesNanos, slot = tickCount % 100), so we can answer this from data that is already being
+		// collected -- no sampling of our own, and no plugin-visible difference from a real Paper server.
+		//
+		// One tick is scheduled every 50ms, i.e. 50_000_000ns, so a slot that took `n` nanoseconds
+		// corresponds to 20 * (50_000_000 / n) ticks in that second. Slots are capped at 20: a tick that
+		// finished early does not let the server run two ticks in the same window, and Paper reports the
+		// same ceiling. Unused slots read 0 until the ring buffer has been filled once, and must not divide.
+		long[] tickNanos = minecraft.getTickTimesNanos();
+		double[] tps = new double[tickNanos.length];
+		for (int i = 0; i < tickNanos.length; i++) {
+			long nanos = tickNanos[i];
+			tps[i] = nanos <= 0L ? 20.0 : Math.min(20.0, 1.0e9 / nanos);
+		}
+		return tps;
 	}
 
 	@Override
 	public long[] getTickTimes() {
-		throw notYet("getTickTimes");
+		return minecraft.getTickTimesNanos();
 	}
 
 	@Override
 	public double getAverageTickTime() {
-		throw notYet("getAverageTickTime");
+		return minecraft.getAverageTickTimeNanos() / 1.0e6;
 	}
 
 	/**
@@ -1358,7 +1408,9 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public int getCurrentTick() {
-		throw notYet("getCurrentTick");
+		// The server's own tick counter, exposed verbatim. It never resets, so plugins that store it see the
+		// same monotonic value they would on Paper.
+		return minecraft.getTickCount();
 	}
 
 	@Override

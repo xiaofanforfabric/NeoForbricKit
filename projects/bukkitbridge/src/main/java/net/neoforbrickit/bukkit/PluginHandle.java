@@ -55,12 +55,18 @@ final class PluginHandle {
 	 * @param dataRoot  where per-plugin data folders live; one directory per plugin is created beneath it
 	 * @param logger    the logger the plugin receives from {@code getLogger()}
 	 * @param server    the {@code Server} the plugin receives from {@code getServer()}
+	 * @param group     the cross-plugin class-loader group this plugin joins, so its classes are reachable
+	 *                  from other plugins and theirs from it
 	 */
-	static PluginHandle load(Path jarPath, ClassLoader parent, Path dataRoot, Logger logger, Object server)
+	static PluginHandle load(Path jarPath, ClassLoader parent, Path dataRoot, Logger logger, Object server,
+			ForbricClassLoaderGroup group)
 			throws IOException, InvalidDescriptionException, ReflectiveOperationException {
 		PluginDescriptionFile description = readDescription(jarPath);
 
 		PluginClassLoader loader = new PluginClassLoader(jarPath, parent, description);
+		// Before the main class is defined, so a plugin whose own constructor already reaches for a peer's
+		// type resolves it instead of caching a "not found" for the class it needs.
+		loader.joinGroup(group);
 		Class<?> mainClass = Class.forName(description.getMainClass(), true, loader);
 		if (!JavaPlugin.class.isAssignableFrom(mainClass)) {
 			throw new IllegalStateException(description.getMainClass() + " does not extend JavaPlugin");

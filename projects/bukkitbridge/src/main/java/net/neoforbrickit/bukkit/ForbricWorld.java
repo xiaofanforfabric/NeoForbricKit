@@ -31,6 +31,16 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	private final net.minecraft.server.level.ServerLevel level;
 	private final ServerImpl server;
 
+	/**
+	 * Which plugins hold a ticket on which chunk.
+	 *
+	 * <p>Kept here because the game cannot answer it: a FORCED ticket records that someone wants the chunk, not
+	 * who, and Bukkit's {@code getPluginChunkTickets} and its remove-one-plugin-only contract need the
+	 * distinction. Concurrent because a plugin may ticket a chunk from its own scheduler thread while the
+	 * server thread is asking which tickets exist.
+	 */
+	private final ChunkTicketTable chunkTickets = new ChunkTicketTable();
+
 	private ForbricWorld(net.minecraft.server.level.ServerLevel level, ServerImpl server) {
 		super(level);
 		this.level = level;
@@ -53,10 +63,66 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 		return level;
 	}
 
-	private static UnsupportedOperationException notYet(String what) {
-		return new UnsupportedOperationException(
-				"[Forbric/Bukkit] World." + what + "() is not implemented by this bridge yet");
+	/**
+	 * The plugins holding a ticket on each chunk, as a set of (chunk, plugin) pairs.
+	 *
+	 * <p>A named type rather than a bare {@code Set} so that the field's meaning is readable at its declaration
+	 * and so the three operations that need to agree about it -- add, remove, and "does anyone still hold
+	 * this" -- live together instead of being open-coded three times.
+	 */
+	private static final class ChunkTicketTable implements Iterable<ChunkTicketKey> {
+
+		private final java.util.Set<ChunkTicketKey> held =
+				java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+		/** Whether this plugin already held the ticket; the caller reports that as the method's answer. */
+		boolean add(ChunkTicketKey key) {
+			return held.add(key);
+		}
+
+		/** Whether this plugin did hold the ticket; the caller reports that as the method's answer. */
+		boolean remove(ChunkTicketKey key) {
+			return held.remove(key);
+		}
+
+		/** Whether any plugin at all still holds a ticket on this chunk. */
+		boolean holds(int chunkX, int chunkZ) {
+			for (ChunkTicketKey key : held) {
+				if (key.chunkX() == chunkX && key.chunkZ() == chunkZ) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		/** Every pair held, for the per-chunk lookup {@code getPluginChunkTickets} needs. */
+		@Override
+		public java.util.Iterator<ChunkTicketKey> iterator() {
+			return held.iterator();
+		}
 	}
+
+	private static UnsupportedOperationException notYet(String what) {
+		// A refusal is a deliberate answer, and the exception is the loud half of it: the plugin sees
+		// UnsupportedOperationException with the method named, at the line that called it.
+		//
+		// <b>This line is the other half, and it exists because that exception is not always seen.</b> A method
+		// called from a plugin's own executor, or from inside a CompletableFuture, or from a callback the game
+		// invokes on a worker, throws where nobody is watching: the exception is captured, the future fails with
+		// no handler attached, and the plugin goes on with whatever it did next -- which is how a pre-generator
+		// reported "Processed: 0 chunks" with nothing in any log to say why. One line per method name, not per
+		// call: the first refusal of each kind is the one that matters, and a per-call line would flood.
+		if (notYetReported.add(what)) {
+			net.neoforbrickit.bridge.util.ForbricLog.warn(
+					"[Forbric/Bukkit] World.%s() is not implemented; a plugin called it and got a refusal. "
+							+ "If the plugin then misbehaves quietly, this is why.", what);
+		}
+		return new UnsupportedOperationException(
+					"[Forbric/Bukkit] World." + what + "() is not implemented by this bridge yet");
+	}
+
+	/** The method names already reported by {@link #notYet}, so each is logged once. */
+	private static final java.util.Set<String> notYetReported = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
 	/**
 	 * The world's name, as Bukkit knows it: the folder it is stored under.
@@ -933,17 +999,77 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.Chunk getChunkAt(int arg0, int arg1) {
-		throw notYet("getChunkAt");
+		return getChunkAt(arg0, arg1, true);
 	}
 
 	@Override
 	public org.bukkit.Chunk getChunkAt(int arg0, int arg1, boolean arg2) {
-		throw notYet("getChunkAt");
+		// Blocking, and that is what the method is: Bukkit has one synchronous load and a family of async ones
+		// beside it. The wait is on the game's own future, so a plugin calling this from the server thread
+		// gets the chunk the moment the game has it, and one calling it from its own thread waits there.
+		//
+		// The status asked for is FULL, which is the level a plugin that wants to read blocks or entities
+		// needs. A lesser status would answer faster with a chunk whose lighting and entities are not done,
+		// and every caller of getChunkAt in practice is about to look at what is in it.
+		net.minecraft.world.level.chunk.LevelChunk chunk = loadChunkNow(arg0, arg1, arg2);
+		if (chunk == null) {
+			return null;
+		}
+		return ForbricChunk.loaded(this, chunk);
 	}
 
 	@Override
 	public org.bukkit.Chunk getChunkAt(org.bukkit.block.Block arg0) {
-		throw notYet("getChunkAt");
+		if (arg0 == null) {
+			return null;
+		}
+		// Through the block's own coordinates rather than its chunk: a Block from another world would otherwise
+		// be answered from this world's chunk at the same coordinate, which is a wrong chunk rather than an
+		// error a plugin could see.
+		return getChunkAt(arg0.getX() >> 4, arg0.getZ() >> 4);
+	}
+
+	/**
+	 * Loads a chunk and returns it, or null when the game could not produce one.
+	 *
+	 * <p><b>`getChunk`, not `getChunkFuture`.</b> The two look interchangeable and are not, and getting this
+	 * wrong is what made a pre-generator stall for 50 seconds at a time with the server reporting a thousand
+	 * ticks behind.
+	 *
+	 * <p>The future form is written for callers that can afford to wait asynchronously, and on the main thread
+	 * it pumps the game's own task queue through {@code managedBlock} until the load finishes. That works when
+	 * the caller is something outside the tick — but a plugin running <em>inside</em> the tick is itself part of
+	 * the queue being pumped, so waiting for the queue to finish its work means waiting for the very task that
+	 * is blocked. The timeout then expires, the caller retries, and the server spends its ticks not ticking.
+	 *
+	 * <p>{@code getChunk} has no such shape. On the main thread it loads synchronously and returns — it cannot
+	 * wait for anything, because everything it needs is already there. Off the main thread it hands the work to
+	 * the main thread and waits, which is exactly the behaviour a plugin's own thread wants. There is no state
+	 * in which it deadlocks, so there is nothing here to bound with a timeout.
+	 *
+	 * <p>The status asked for is FULL, which is what a plugin reading blocks or entities needs. A lesser status
+	 * answers sooner with a chunk whose lighting and entities are not finished.
+	 */
+	private net.minecraft.world.level.chunk.LevelChunk loadChunkNow(int chunkX, int chunkZ, boolean generate) {
+		net.minecraft.server.level.ServerChunkCache source = level.getChunkSource();
+		// The fast path first: a chunk already in memory needs no load at all.
+		net.minecraft.world.level.chunk.LevelChunk present = source.getChunkNow(chunkX, chunkZ);
+		if (present != null) {
+			return present;
+		}
+		if (!generate && !source.hasChunk(chunkX, chunkZ)) {
+			// Asked not to generate and there is nothing there. Answered without starting a load that could
+			// not produce anything.
+			return null;
+		}
+		net.minecraft.world.level.chunk.ChunkAccess access = source.getChunk(chunkX, chunkZ,
+						net.minecraft.world.level.chunk.status.ChunkStatus.FULL, generate);
+		// A FULL request can answer with a chunk that is not a LevelChunk when the load was cancelled; asking
+		// the source again is cheaper than reasoning about which states can appear.
+		if (access instanceof net.minecraft.world.level.chunk.LevelChunk full) {
+			return full;
+		}
+		return source.getChunkNow(chunkX, chunkZ);
 	}
 
 	@Override
@@ -968,7 +1094,10 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public boolean isChunkGenerated(int arg0, int arg1) {
-		throw notYet("isChunkGenerated");
+		// Asked of the chunk source, which knows about chunks on disk: true for a chunk that exists whether or
+		// not anyone is holding it. This is the question a pre-generator asks to decide whether a coordinate
+		// still needs work, and answering it from "is it loaded" would send it over the whole region again.
+		return level.getChunkSource().hasChunk(arg0, arg1);
 	}
 
 	@Override
@@ -1023,12 +1152,74 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public boolean addPluginChunkTicket(int arg0, int arg1, org.bukkit.plugin.Plugin arg2) {
-		throw notYet("addPluginChunkTicket");
+		if (arg2 == null) {
+			throw new IllegalArgumentException("[Forbric/Bukkit] a chunk ticket needs a plugin to belong to");
+		}
+		// One game ticket per plugin per chunk, keyed by the plugin so that removing one plugin's ticket
+		// leaves every other plugin's alone -- which is the point of the API, and the reason the reference
+		// count is kept here rather than asked of the game.
+		ChunkTicketKey key = new ChunkTicketKey(arg0, arg1, arg2.getName());
+		if (!chunkTickets.add(key)) {
+			// Already held. The API's contract is that a second add does nothing, not that it fails, so this is
+			// answered as "the ticket is there" rather than as an error.
+			return false;
+		}
+		// FORCED is the game's own force-load ticket: what /forceload uses, and what keeps a chunk loaded with
+		// no player near it. It is saved with the world, which differs from a plugin ticket on Paper, but it is
+		// the only ticket the game offers that outlives the caller -- and a plugin asking for this wants the
+		// chunk kept, not kept only for as long as it happens to hold the reference.
+		level.getChunkSource().addTicketWithRadius(net.minecraft.server.level.TicketType.FORCED,
+						new net.minecraft.world.level.ChunkPos(arg0, arg1), 0);
+		return true;
 	}
 
 	@Override
 	public boolean removePluginChunkTicket(int arg0, int arg1, org.bukkit.plugin.Plugin arg2) {
-		throw notYet("removePluginChunkTicket");
+		if (arg2 == null) {
+			return false;
+		}
+		ChunkTicketKey key = new ChunkTicketKey(arg0, arg1, arg2.getName());
+		if (!chunkTickets.remove(key)) {
+			// Nothing of this plugin's to remove. Answered false rather than as an error: a plugin tidying up
+			// after a reload calls this for tickets that may never have existed.
+			return false;
+		}
+		// Only when the last holder of this chunk has gone. The game's FORCED ticket has no notion of which
+		// plugin asked, so releasing it while another plugin still wants the chunk would unload it under them.
+		if (!chunkTickets.holds(arg0, arg1)) {
+			level.getChunkSource().removeTicketWithRadius(net.minecraft.server.level.TicketType.FORCED,
+							new net.minecraft.world.level.ChunkPos(arg0, arg1), 0);
+		}
+		return true;
+	}
+
+	/**
+	 * The plugins currently holding a ticket on one chunk.
+	 *
+	 * <p>derived from the same set the two methods above maintain, because the game cannot answer it: a FORCED
+	 * ticket carries no record of who asked for it, only that someone did.
+	 */
+	java.util.Collection<org.bukkit.plugin.Plugin> pluginChunkTickets(int chunkX, int chunkZ) {
+		java.util.List<org.bukkit.plugin.Plugin> holders = new java.util.ArrayList<>();
+		for (ChunkTicketKey key : chunkTickets) {
+			if (key.chunkX() == chunkX && key.chunkZ() == chunkZ) {
+				org.bukkit.plugin.Plugin plugin = org.bukkit.Bukkit.getPluginManager().getPlugin(key.plugin());
+				if (plugin != null) {
+					holders.add(plugin);
+				}
+			}
+		}
+		return holders;
+	}
+
+	/**
+	 * One plugin's ticket on one chunk, and the structure the ticket table is keyed by.
+	 *
+	 * <p>A record rather than a string key because the three parts are always used together and a joined string
+	 * would have to decide on a separator that cannot appear in a plugin name. Value equality is what the set
+	 * needs: asking twice for the same plugin's ticket on the same chunk must be the same entry.
+	 */
+	private record ChunkTicketKey(int chunkX, int chunkZ, String plugin) {
 	}
 
 	@Override
@@ -1113,7 +1304,99 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public void getChunkAtAsync(int arg0, int arg1, boolean arg2, boolean arg3, java.util.function.Consumer<? super org.bukkit.Chunk> arg4) {
-		throw notYet("getChunkAtAsync");
+		// The one abstract member of a family of nineteen. Every other getChunkAtAsync overload is a default
+		// that ends up here, so implementing this one is what makes them all work -- including the
+		// CompletableFuture forms a pre-generator drives its whole loop from.
+		//
+		// `arg2` is "generate if absent" and `arg3` is "run the callback on the main thread". The second is not
+		// decoration: a plugin that touches the world in the callback needs the server thread, and Paper's
+		// contract says this is what decides it. The bridge schedules through its own scheduler for both cases
+		// because the callback must not run on the game's chunk-loading thread either way.
+		boolean generate = arg2;
+		boolean mainThread = arg3;
+		java.util.function.Consumer<? super org.bukkit.Chunk> callback = arg4;
+
+		if (isGameThread()) {
+			// Already where the game can be touched, so no scheduling at all: register the interest, ask for the
+			// chunk, and answer. Going through a queue here would widen the window in which the chunk can be
+			// unloaded again before the callback runs.
+			beginAsyncChunkLoad(arg0, arg1, generate, mainThread, callback);
+			return;
+		}
+		// Off the server thread, so hop onto it. The bridge's own scheduler is used rather than Bukkit's
+		// BukkitScheduler: that one requires a non-null plugin -- passing none is an IllegalArgumentException,
+		// which is a shape the bridge cannot satisfy here, because this load belongs to whoever asked and
+		// telling the scheduler must not be the caller's problem.
+		//
+		// `plugin` is null in the task bookkeeping too, and deliberately: the work is the bridge's own, not a
+		// plugin's, and attributing it to the caller would make a plugin's disable cancel a load it merely
+		// asked for.
+		schedulers().scheduleGameNow(null,
+				task -> beginAsyncChunkLoad(arg0, arg1, generate, mainThread, callback));
+	}
+
+	/** The bridge's schedulers, for hopping onto the game thread from elsewhere. */
+	private ForbricSchedulers schedulers() {
+		return server.schedulers();
+	}
+
+	/**
+	 * Loads the chunk if it is not there and hands it to the plugin's callback, from the server thread.
+	 *
+	 * <p><b>Why the load is synchronous here.</b> This method runs on the game thread by construction — the
+	 * caller schedules it there — and a synchronous load on the game thread is the one kind that always
+	 * finishes: {@code getChunk} does the work and returns. The clever-looking alternative, registering a
+	 * completion handler on the game's chunk future, is what stalled the server for fifty seconds at a time:
+	 * waiting on that future from the game thread pumps the same task queue the caller is itself running in,
+	 * so the load it is waiting for cannot be reached until the wait ends.
+	 *
+	 * <p>What a plugin sees is still asynchronous, which is the part that matters: this method returns as soon
+	 * as it has handed work off, and the callback arrives later — after the chunk is loaded, on the thread the
+	 * caller asked for. A pre-generator driving thousands of these gets them one per tick rather than one per
+	 * call, because each is a separate scheduled task.
+	 *
+	 * <p>A chunk that could not be produced completes the callback with a null rather than swallowing the
+	 * failure, because a plugin iterating a region has to be able to count what it got.
+	 */
+	private void beginAsyncChunkLoad(int chunkX, int chunkZ, boolean generate, boolean mainThread,
+					java.util.function.Consumer<? super org.bukkit.Chunk> callback) {
+		net.minecraft.world.level.chunk.LevelChunk chunk = loadChunkNow(chunkX, chunkZ, generate);
+		// The callback is delivered through deliverChunk, which hops to the main thread only when asked and only
+		// when it is not already there -- so the common case, a plugin that asked for the main thread while this
+		// already runs on it, is a direct call with no queueing at all.
+		deliverChunk(callback, chunk == null ? null : ForbricChunk.loaded(this, chunk), mainThread);
+	}
+
+	/**
+	 * Runs the plugin's callback, on the main thread if that is what was asked for.
+	 *
+	 * <p>A null callback is tolerated rather than refused: Bukkit's contract marks the argument non-null, but
+	 * a plugin written against an older signature can pass one, and there is nothing to do but drop it.
+	 */
+	private void deliverChunk(java.util.function.Consumer<? super org.bukkit.Chunk> callback,
+					org.bukkit.Chunk chunk, boolean mainThread) {
+		if (callback == null) {
+			return;
+		}
+		if (mainThread && !isGameThread()) {
+			schedulers().scheduleGameNow(null, task -> callback.accept(chunk));
+			return;
+		}
+		try {
+			callback.accept(chunk);
+		} catch (Throwable failure) {
+			// A plugin's callback throwing must not take down the chunk-loading thread it arrived on, and the
+			// exception would otherwise be swallowed by the future's completion machinery with no trace at all.
+			net.neoforbrickit.bridge.util.ForbricLog.error(
+							"[Forbric/Bukkit] a plugin's getChunkAtAsync callback threw for chunk (%s, %s) in %s",
+							chunk == null ? "?" : chunk.getX(), chunk == null ? "?" : chunk.getZ(), getName(),
+							failure);
+		}
+	}
+
+	/** Whether the calling thread is the one the game can be touched from. */
+	private boolean isGameThread() {
+		return server.isPrimaryThread();
 	}
 
 	@Override
@@ -1304,7 +1587,10 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public int getLogicalHeight() {
-		throw notYet("getLogicalHeight");
+		// The height a client is shown the world as being, which for every dimension the game ships is the
+		// same as the build height. They differ only for a custom dimension type, and there is no such thing
+		// reachable from a plugin here -- so this is the game's own answer rather than a second definition.
+		return level.getHeight();
 	}
 
 	@Override
@@ -1454,7 +1740,11 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.WorldBorder getWorldBorder() {
-		throw notYet("getWorldBorder");
+		// A fresh wrapper per call, like every other handle this bridge hands out: the border it wraps is the
+		// level's own and lives as long as the world, so the wrapper carries no state that a second call would
+		// need to find again. Chunky asks for it while wrapping the world at enable time, which is one of the
+		// broadest-reaching uses of this method and the reason it is answered rather than refused.
+		return new ForbricWorldBorder(level, this);
 	}
 
 	@Override
@@ -1710,7 +2000,22 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.World.Environment getEnvironment() {
-		throw notYet("getEnvironment");
+		// The three dimensions the game ships, told apart by the dimension the level was built from. Read from
+		// that rather than from the level's name or its registry key, because a custom dimension is addressed
+		// by whatever key its datapack chose and a name-based answer would be wrong for it in a way that looks
+		// right -- a plugin asking for the environment decides whether to apply overworld rules.
+		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD) {
+			return org.bukkit.World.Environment.NORMAL;
+		}
+		if (level.dimension() == net.minecraft.world.level.Level.NETHER) {
+			return org.bukkit.World.Environment.NETHER;
+		}
+		if (level.dimension() == net.minecraft.world.level.Level.END) {
+			return org.bukkit.World.Environment.THE_END;
+		}
+		// A datapack dimension is NORMAL by Bukkit's definition: the enum has no fourth value, and NORMAL is
+		// what Paper reports for one.
+		return org.bukkit.World.Environment.NORMAL;
 	}
 
 	@Override

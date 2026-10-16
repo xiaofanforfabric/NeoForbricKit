@@ -43,6 +43,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.network.ServerConfigurationPacketListenerImpl;
 import net.neoforged.fml.ModLoader;
 import net.neoforged.neoforge.common.NeoForgeVersion;
+import net.neoforged.neoforge.common.config.NeoForgeCommonConfig;
 import net.neoforged.neoforge.common.extensions.ICommonPacketListener;
 import net.neoforged.neoforge.network.configuration.CommonRegisterTask;
 import net.neoforged.neoforge.network.configuration.CommonVersionTask;
@@ -244,6 +245,10 @@ public class NetworkRegistry {
     public static StreamCodec<? super FriendlyByteBuf, ? extends CustomPacketPayload> getCodec(Identifier id, ConnectionProtocol protocol, PacketFlow flow) {
         // Custom modded packets which can be sent before a payload setup is negotiated.
         if (BUILTIN_PAYLOADS.containsKey(id)) {
+            if (flow == PacketFlow.SERVERBOUND
+                    && (id.equals(ModdedNetworkPayload.ID) || id.equals(ModdedNetworkSetupFailedPayload.ID))) {
+                return null;
+            }
             return BUILTIN_PAYLOADS.get(id);
         }
 
@@ -377,6 +382,31 @@ public class NetworkRegistry {
      * @return True if the payload is modded, and modded payload handling should be invoked for it.
      */
     public static boolean isModdedPayload(CustomPacketPayload payload) {
+        if (payload instanceof DiscardedPayload) {
+            return false;
+        }
+
+        Identifier id = payload.type().id();
+
+        if ("minecraft".equals(id.getNamespace())) {
+            return false;
+        }
+
+        // NeoFobric: a payload that has a registration in this registry is NeoForge's to handle, no matter
+        // what its namespace looks like. The Fabric heuristics below exist for channels that only Fabric
+        // knows about, and one of those by definition carries no registration from here. Asking them first
+        // let them claim registered payloads and skip the very handler that was registered for them:
+        // modernfix registers its load-finished sentinel as an optional payload, the bridge's exposure
+        // shells put every NeoForge mod's namespace into the Fabric namespace set, so the sentinel was
+        // classified as a Fabric payload, its client handler never ran, the client never answered the
+        // server and modernfix's integrated-server suspension stayed up for the whole session - all entity
+        // ticking frozen, no item pickup, creative flight never falling.
+        for (var byId : PAYLOAD_REGISTRATIONS.values()) {
+            if (byId.containsKey(id)) {
+                return true;
+            }
+        }
+
         // NeoFobric: a payload type a Fabric mod registered with Fabric's networking API is delivered by
         // Fabric's own networking - its addons hook the vanilla custom payload handling - and never takes
         // part in this registry's negotiation. Routing such a payload into the modded handling below would
@@ -384,9 +414,7 @@ public class NetworkRegistry {
         // what a Fabric mod whose channel is registered per connection (no declaration, no NeoForge
         // registration) would hit. Both loaders keep their own bookkeeping, so Fabric's payloads are left
         // to Fabric.
-        return !(payload instanceof DiscardedPayload)
-                && !"minecraft".equals(payload.type().id().getNamespace())
-                && !net.neoforged.fabricbridge.FabricBridgeHooks.isFabricChannel(payload.type().id().toString());
+        return !net.neoforged.fabricbridge.FabricBridgeHooks.isFabricChannel(id.toString());
     }
 
     /**
@@ -721,7 +749,15 @@ public class NetworkRegistry {
      * @param resourceLocations The resource locations to add.
      */
     public static void onMinecraftRegister(Connection connection, Set<Identifier> resourceLocations) {
-        ChannelAttributes.getOrCreateAdHocChannels(connection).addAll(resourceLocations);
+        var channels = ChannelAttributes.getOrCreateAdHocChannels(connection);
+        if ((channels.size() + resourceLocations.size()) > NeoForgeCommonConfig.INSTANCE.maxAdhocChannelLimit.getAsInt()) {
+            if (connection.getPacketListener() instanceof ICommonPacketListener listener) {
+                listener.disconnect(Component.translatable("neoforge.network.adhoc_channels.too_many"));
+                return;
+            }
+            throw new RuntimeException("Too many ad-hoc channels.");
+        }
+        channels.addAll(resourceLocations);
     }
 
     /**

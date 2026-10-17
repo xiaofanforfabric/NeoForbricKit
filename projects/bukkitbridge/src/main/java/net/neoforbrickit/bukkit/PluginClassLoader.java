@@ -57,15 +57,25 @@ final class PluginClassLoader extends URLClassLoader implements ConfiguredPlugin
 	private JavaPlugin plugin;
 
 	/**
+	 * What {@link #init} writes into the instance before the plugin's own constructor body runs.
+	 *
+	 * <p>See {@link #init} for why these are stashed on the loader instead of being passed to
+	 * {@code JavaPlugin.init(...)} alone.
+	 */
+	private final PluginFields fields;
+
+	/**
 	 * @param jar    the plugin's own jar, used as this loader's code source
 	 * @param parent the loader that carries the Bukkit API and the game — every plugin shares it, which is what
 	 *               lets one plugin's types and another's be the same types
 	 * @param meta   the plugin's description, answered from {@link #getConfiguration()}
+	 * @param fields the values {@code getLogger()}, {@code getServer()} and friends must answer with
 	 */
-	PluginClassLoader(Path jar, ClassLoader parent, PluginMeta meta) throws IOException {
+	PluginClassLoader(Path jar, ClassLoader parent, PluginMeta meta, PluginFields fields) throws IOException {
 		super(new URL[] {jar.toUri().toURL()}, parent);
 		this.jar = jar;
 		this.meta = meta;
+		this.fields = fields;
 	}
 
 	@Override
@@ -105,11 +115,11 @@ final class PluginClassLoader extends URLClassLoader implements ConfiguredPlugin
 			return super.loadClass(name, resolve);
 		} catch (ClassNotFoundException notHere) {
 			ForbricClassLoaderGroup current = group;
-			// TEMPORARY DIAGNOSTIC: a cross-plugin lookup failed, and the two ways it can fail need different
-			// fixes -- a null group means the wiring never ran, a non-null one means the peers were searched and
-			// the class was in none of them. The call stack cannot tell them apart (a null return leaves no
-			// frame), so this line is the only thing that can. Remove once the seam is proven.
-			net.neoforbrickit.bridge.util.ForbricLog.info(
+			// Debug, not info: a miss is the ordinary answer for every optional integration a plugin probes
+			// for by name (Paper classes, other plugins' APIs, LuckPerms' own nested-jar types), so at INFO this
+			// line ran to hundreds of entries on a normal startup and buried the lines that matter. Guarded by
+			// -Dneofobric.debug, which is when the "who was searched" answer is actually wanted.
+			net.neoforbrickit.bridge.util.ForbricLog.debug(
 					"[Forbric/Bukkit] cross-plugin lookup: %s not in %s; group=%s peers=%s",
 					name, jar.getFileName(), current == null ? "NULL" : "present",
 					current == null ? "-" : current.describePeers());
@@ -183,14 +193,126 @@ final class PluginClassLoader extends URLClassLoader implements ConfiguredPlugin
 	}
 
 	/**
-	 * Links a plugin instance to this loader.
+	 * Links a plugin instance to this loader, and fills the fields its own constructor may already read.
 	 *
 	 * <p>Called by {@code JavaPlugin}'s constructor, so it runs while the plugin is only partly constructed —
-	 * nothing here may touch the instance beyond keeping the reference.
+	 * nothing here may touch the instance beyond writing the plain fields listed in {@link #PRE_INIT_FIELDS}.
+	 *
+	 * <h2>Why the fields are written here</h2>
+	 *
+	 * <p>{@code JavaPlugin}'s constructor ends with {@code loader.init(this)}, and only then does the subclass
+	 * constructor body run. {@code JavaPlugin.init(...)} — the call that normally assigns these fields — cannot
+	 * run until after construction, because it takes the instance itself. So a plugin whose constructor calls
+	 * {@code getLogger()} or {@code getServer()} sees {@code null}.
+	 *
+	 * <p>That is not hypothetical: LuckPerms' {@code BukkitLoaderPlugin} constructs {@code LPBukkitBootstrap} in
+	 * its constructor, and that constructor captures both {@code getLogger()} (wrapped in a
+	 * {@code JavaPluginLogger} whose field is {@code final}) and {@code getServer()} (wrapped in a
+	 * {@code NullSafeConsoleCommandSender}). Each null is permanent, and the plugin dies on its first log line in
+	 * {@code onLoad} and then on its first console message in {@code onEnable} — so a permission plugin other
+	 * plugins look for never arrives.
+	 *
+	 * <p>This method is the last point where the instance exists and the plugin's own code has not run yet, so
+	 * it is the only place the fields can be filled early. Writing them is safe: every name in
+	 * {@link #PRE_INIT_FIELDS} is a plain non-final instance field, and {@code init(...)} assigns the same values
+	 * again later.
 	 */
 	@Override
 	public void init(JavaPlugin plugin) {
 		this.plugin = plugin;
+		fillFields(plugin, fields);
+	}
+
+	/**
+	 * What {@link #init} writes into a half-constructed plugin.
+	 *
+	 * @param server     the {@code Server} {@code getServer()} must answer with
+	 * @param description the description {@code getDescription()} and {@code getPluginMeta()} must answer with
+	 * @param dataFolder the folder {@code getDataFolder()} must answer with
+	 * @param jar        the jar {@code getFile()} must answer with
+	 * @param logger     the logger {@code getLogger()} must answer with
+	 */
+	record PluginFields(Object server, PluginMeta description, java.io.File dataFolder, java.io.File jar,
+			java.util.logging.Logger logger) {
+	}
+
+	/**
+	 * The {@code JavaPlugin} fields that {@code JavaPlugin.init(...)} assigns from data the loader already has.
+	 *
+	 * <p>Deliberately a fixed list rather than something derived: each entry is a field this bridge can supply
+	 * the real value for. {@code loader} is NOT here — it is a {@code PluginLoader}, which this bridge has no
+	 * equivalent of, and {@code JavaPlugin.init(...)} leaves it null too.
+	 */
+	private static final String[] PRE_INIT_FIELDS = {"server", "description", "pluginMeta", "dataFolder", "file",
+			"logger"};
+
+	/** Makes a write failure be reported once per field, not once per plugin. */
+	private static final java.util.Set<String> FAILED_FIELDS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	/**
+	 * Writes {@link #PRE_INIT_FIELDS} on an instance whose constructor is still on the stack.
+	 *
+	 * <p>Reflection rather than a direct assignment because the fields are private to the API class. Each is
+	 * resolved once and cached. A failure never escapes: the plugin then behaves exactly as it did before this
+	 * hook existed, which is the old null-field behaviour rather than a crash at load time.
+	 */
+	private static void fillFields(JavaPlugin plugin, PluginFields values) {
+		if (values == null) {
+			return;
+		}
+		set(plugin, "server", values.server());
+		set(plugin, "description", values.description());
+		// The same object: PluginDescriptionFile implements PluginMeta.
+		set(plugin, "pluginMeta", values.description());
+		set(plugin, "dataFolder", values.dataFolder());
+		set(plugin, "file", values.jar());
+		set(plugin, "logger", values.logger());
+	}
+
+	private static void set(JavaPlugin plugin, String name, Object value) {
+		if (value == null) {
+			return;
+		}
+		java.lang.reflect.Field field = field(name);
+		if (field == null) {
+			return;
+		}
+		try {
+			field.set(plugin, value);
+		} catch (ReflectiveOperationException | RuntimeException failure) {
+			if (FAILED_FIELDS.add(name)) {
+				net.neoforbrickit.bridge.util.ForbricLog.warn(
+						"[Forbric/Bukkit] could not fill JavaPlugin." + name
+								+ " before the plugin's constructor; a plugin reading it that early will see null",
+						failure);
+			}
+		}
+	}
+
+	/** Field lookups by name; a missing field is a degraded answer, not a fatal one. */
+	private static final java.util.Map<String, java.lang.reflect.Field> FIELDS =
+			new java.util.concurrent.ConcurrentHashMap<>();
+
+	private static java.lang.reflect.Field field(String name) {
+		java.lang.reflect.Field cached = FIELDS.get(name);
+		if (cached != null) {
+			return cached;
+		}
+		try {
+			java.lang.reflect.Field field = JavaPlugin.class.getDeclaredField(name);
+			field.setAccessible(true);
+			FIELDS.put(name, field);
+			return field;
+		} catch (ReflectiveOperationException | RuntimeException missing) {
+			// Reported once by the caller's catch, exactly as a write failure is.
+			if (FAILED_FIELDS.add(name)) {
+				net.neoforbrickit.bridge.util.ForbricLog.warn(
+						"[Forbric/Bukkit] JavaPlugin." + name + " is not reachable in this API version; "
+								+ "plugins that read it from their constructor will see null",
+						missing);
+			}
+			return null;
+		}
 	}
 
 	@Override

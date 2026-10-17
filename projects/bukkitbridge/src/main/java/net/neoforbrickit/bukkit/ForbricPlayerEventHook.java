@@ -138,4 +138,130 @@ public final class ForbricPlayerEventHook {
 		org.bukkit.Server server = org.bukkit.Bukkit.getServer();
 		return server instanceof ServerImpl bridge ? bridge : null;
 	}
+
+	/**
+	 * The pool the pre-login event is raised on.
+	 *
+	 * <p>Daemon threads, because a server shutting down must not wait for a login that will never finish.
+	 * Bounded to one thread per core and named, so a thread dump during a slow login says who is stuck rather
+	 * than showing an anonymous pool.
+	 */
+	private static final java.util.concurrent.ExecutorService PRE_LOGIN_POOL =
+			java.util.concurrent.Executors.newCachedThreadPool(runnable -> {
+				Thread thread = new Thread(runnable, "forbric-pre-login");
+				thread.setDaemon(true);
+				return thread;
+			});
+
+	/**
+	 * Raises an asynchronous event from wherever the caller happens to be, and waits for it.
+	 *
+	 * <h2>Why not just {@code callEvent}</h2>
+	 *
+	 * <p>{@code AsyncPlayerPreLoginEvent} is declared asynchronous, and both Paper and this bridge refuse to
+	 * deliver an async event from the primary thread — {@code IllegalStateException: ... may not be triggered
+	 * from the primary thread}. That check is right: its whole purpose is that listeners may block on a
+	 * database read. The place the event has to be raised from, {@code PlayerList.placeNewPlayer}, IS the
+	 * primary thread, so the event has to move rather than the check being relaxed.
+	 *
+	 * <p>Waiting is deliberate. A permission plugin loads the player's data in that handler and every later
+	 * check reads what it stored; letting the login continue before the handler finished would leave the
+	 * session answering from defaults — the exact failure this event exists to prevent.
+	 *
+	 * <p>A handler that throws is reported and treated as "allowed": a broken listener must not become a login
+	 * that hangs forever or a player who cannot connect.
+	 */
+	private static void raiseOffThread(org.bukkit.event.Event event, String who) {
+		ServerImpl server = bridgeServer();
+		if (server == null) {
+			return;
+		}
+		if (!server.isPrimaryThread()) {
+			// Already off the game thread (a plugin calling this itself); the check above would pass anyway.
+			server.getPluginManager().callEvent(event);
+			return;
+		}
+		try {
+			PRE_LOGIN_POOL.submit(() -> server.getPluginManager().callEvent(event)).get();
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			ForbricLog.warn("[Forbric/Bukkit] interrupted while waiting for the pre-login handlers of %s", who);
+		} catch (java.util.concurrent.ExecutionException failed) {
+			// The plugin's own listener threw. Reported, not rethrown: this runs inside the login path.
+			ForbricLog.error("[Forbric/Bukkit] a pre-login handler for " + who + " threw", failed.getCause());
+		}
+	}
+
+	/**
+	 * A player is about to be placed into the world: raise {@code AsyncPlayerPreLoginEvent}.
+	 *
+	 * <h2>Why this event, and why it is not optional</h2>
+	 *
+	 * <p>It is where a permission plugin loads a player's data. LuckPerms registers
+	 * {@code onPlayerPreLogin} for it and does nothing at join time but read what that handler stored — so
+	 * without this event its user manager never learns the player exists, {@code /lp user <name>} answers
+	 * "user not found" for somebody standing in the world, and every permission check falls back to the
+	 * declared defaults. That is exactly the state this bridge was in: the plugin enabled, the commands ran,
+	 * and no player was ever known to it.
+	 *
+	 * <p>Raised here rather than at the network handshake because this is the earliest point the bridge has
+	 * a {@code ServerPlayer} to describe: an {@code AsyncPlayerPreLoginEvent} needs a name, an address and a
+	 * UUID, and all three are on the player the game has already authenticated. The event is documented as
+	 * asynchronous, and it is — a handler may block on a database read — but raising it from the game thread
+	 * is what a single-threaded bridge can honestly do; a handler that needs to block still can, and the cost
+	 * is one login's worth of latency rather than a wrong answer for the whole session.
+	 *
+	 * <p>Because it is the event plugins DISALLOW logins with, the result is honoured: a handler that calls
+	 * {@code disallow} disconnects the player, which is the behaviour a whitelist or ban plugin relies on.
+	 */
+	public static void playerPreLogin(ServerPlayer player) {
+		try {
+			if (player == null) {
+				return;
+			}
+			ServerImpl server = bridgeServer();
+			if (server == null) {
+				return;
+			}
+			// The address comes from the player's own connection WHEN THERE IS ONE, and is null otherwise.
+			//
+			// It must not be a guard. This hook runs at the head of `placeNewPlayer`, which is the method that
+			// ATTACHES the connection -- so `player.connection` is genuinely null here, and an early return on
+			// that was the reason this event never fired. A null address is a real value for the event (a
+			// local or already-closed connection), and a plugin that bans by IP simply has nothing to match
+			// against.
+			java.net.InetAddress address = null;
+			if (player.connection != null) {
+				java.net.SocketAddress remote = player.connection.getRemoteAddress();
+				address = remote instanceof java.net.InetSocketAddress inet ? inet.getAddress() : null;
+			}
+			org.bukkit.event.player.AsyncPlayerPreLoginEvent event =
+					new org.bukkit.event.player.AsyncPlayerPreLoginEvent(
+							player.getScoreboardName(), address, player.getUUID());
+			raiseOffThread(event, player.getScoreboardName());
+			if (event.getLoginResult() != org.bukkit.event.player.AsyncPlayerPreLoginEvent.Result.ALLOWED) {
+				// The plugin refused this login. Disconnect with ITS message, which is what a reference server
+				// shows -- a generic "disconnected" would leave the player with no idea why.
+				net.kyori.adventure.text.Component reason = event.kickMessage();
+				ForbricLog.info("[Forbric/Bukkit] %s was refused at pre-login: %s",
+						player.getScoreboardName(), reason);
+				net.kyori.adventure.text.Component shown = reason == null
+						? net.kyori.adventure.text.Component.text("Disconnected")
+						: reason;
+				// The connection is not attached yet, so there is nothing to disconnect through. Refusing at
+				// this point still has to take effect, or a whitelist plugin would be advisory: the player is
+				// marked by throwing out of placeNewPlayer, which the game reports as a failed login.
+				if (player.connection != null) {
+					player.connection.getConnection().disconnect(
+							net.minecraft.network.chat.Component.literal(
+									net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
+											.plainText().serialize(shown)));
+				}
+			}
+		} catch (Throwable failure) {
+			// Never rethrown: this runs inside the login path, and an escaping exception would be attributed to
+			// the connection and could disconnect a player who has done nothing wrong.
+			ForbricLog.error("[NeoFobric/Bukkit] could not raise AsyncPlayerPreLoginEvent", failure);
+		}
+	}
 }

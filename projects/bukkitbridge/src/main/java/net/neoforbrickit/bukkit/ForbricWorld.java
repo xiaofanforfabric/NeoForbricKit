@@ -1508,9 +1508,27 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 		throw notYet("getBiomeProvider");
 	}
 
+	/**
+	 * Writes this world's chunk data to disk.
+	 *
+	 * <p>Bukkit's contract is "flush what is dirty"; it deliberately says nothing about whether the caller
+	 * blocks. This bridge writes synchronously, which is the honest choice: the game's own save runs on the
+	 * server thread and completes before returning, and a plugin that calls this to make data durable before
+	 * doing something else (BlueMap snapshots a world to render it) would be wrong to assume otherwise.
+	 *
+	 * <p>Callers must be on the server thread. The game's save path asserts that itself, so this is not a
+	 * promise this class adds — but it is worth naming, because a plugin calling {@code save} from an async
+	 * task gets the game's assertion rather than a silent no-op.
+	 *
+	 * @param light whether to write lighting data as well, which the API offers as an optimisation for callers
+	 *              that are about to regenerate it anyway
+	 */
 	@Override
-	public void save(boolean arg0) {
-		throw notYet("save");
+	public void save(boolean light) {
+		// The game's own save, in its own terms: the progress listener is null (nothing to report to -- an
+		// abstract Bukkit plugin has no progress bar to drive), `flush` is true because a caller that asked to
+		// save wants the bytes on disk, and `skipSave` is the inverse of the light flag this method was given.
+		level.save(null, true, !light);
 	}
 
 	@Override

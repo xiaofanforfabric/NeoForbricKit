@@ -406,30 +406,45 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
         /**
          * Whether this player holds a permission.
          *
-         * <p>Three answers, in the order the API defines.
+         * <p>Four answers, in the order the API defines them.
          *
          * <ol>
+         *   <li>an attached permission plugin, asked through its own API — see {@link ForbricPermissions};
          *   <li>an attachment granted at run time;
          *   <li>the permission's own {@code default}, when it is registered;
          *   <li>{@code false}.
          * </ol>
          *
-         * <p>A default of {@code OP} or {@code TRUE} therefore grants it to everyone or to operators, which is what
-         * {@code permission: kits.kit} with {@code default: op} in a {@code plugin.yml} means. Reading only whether
-         * the permission exists — which is what the console sender beside this class does — would let every player
-         * through every gate.
+         * <p><b>Why the permission plugin comes first.</b> Without it, a permission node that the plugin
+         * grants but that no {@code plugin.yml} declares is invisible: {@code getPermission(name)} answers
+         * null and this method returns false. Every one of LuckPerms' own command permissions is exactly
+         * that shape — declared in its code, never in a {@code plugin.yml} — so the plugin's own command
+         * filter saw "no permission" for every node and offered no completions, while the console (which is
+         * allowed everything) completed normally.
+         *
+         * <p>A default of {@code OP} or {@code TRUE} grants to operators or everyone, which is what
+         * {@code permission: kits.kit} with {@code default: op} in a {@code plugin.yml} means. Reading only
+         * whether the permission exists would let every player through every gate, so the default itself
+         * decides and a permission nobody registered is denied.
          */
         @Override
         public boolean hasPermission(String name) {
                 if (name == null) {
                         return false;
                 }
+                // 1. A permission plugin, which owns this question whenever it is installed.
+                ForbricPermissions.Lookup installed = ForbricPermissions.lookup(getUniqueId(), name);
+                if (installed != ForbricPermissions.Lookup.UNKNOWN) {
+                        return installed == ForbricPermissions.Lookup.TRUE;
+                }
+                // 2. An attachment granted at run time.
                 for (org.bukkit.permissions.PermissionAttachment attachment : attachments) {
                         java.util.Map<String, Boolean> values = attachment.getPermissions();
                         if (values.containsKey(name)) {
                                 return Boolean.TRUE.equals(values.get(name));
                         }
                 }
+                // 3. The permission's declared default.
                 org.bukkit.permissions.Permission permission = server.getPluginManager() == null
                                 ? null : server.getPluginManager().getPermission(name);
                 if (permission == null) {
@@ -1428,7 +1443,18 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public java.util.Locale locale() {
-		throw notYet("locale");
+		// The client's own locale, as a java.util.Locale. `getLocale()` below is the same value as a string;
+		// Paper has both because the old Bukkit name returns "en_US" while this one is parsed.
+		//
+		// Read from the connection's ClientInformation rather than from a field this class keeps: a player can
+		// change their language in-game, and the next ClientInformation packet updates this. It is also what
+		// every plugin localising a message reads, so it has to be the client's setting and not the server's
+		// default -- LuckPerms branches on it when deciding which message file to load.
+		//
+		// A malformed or missing tag is not an error: the client may report a language this JVM does not have
+		// a Locale for, and Locale.forLanguageTag answers a usable Locale (or ROOT) for anything it is given
+		// rather than throwing, which is the behaviour a caller wants here.
+		return java.util.Locale.forLanguageTag(getLocale().replace('_', '-'));
 	}
 
 	@Override
@@ -1454,7 +1480,13 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public java.lang.String getLocale() {
-		throw notYet("getLocale");
+		// The client's language tag ("en_us", "zh_cn"), maintained by ClientInformation packets.
+		//
+		// Answered even for a player whose connection has gone: the field lives on ServerPlayer and keeps its
+		// last value, and a plugin localising a farewell message on quit asks exactly then. A null would send
+		// callers into their own fallback path for no reason; the game's own default is used instead.
+		String language = player.getLanguage();
+		return language == null || language.isEmpty() ? "en_us" : language;
 	}
 
 	@Override
@@ -1499,7 +1531,26 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public void updateCommands() {
-		throw notYet("updateCommands");
+		// Re-sends the command tree to this client, which is what makes a permission change visible to TAB at
+		// once instead of at the next join.
+		//
+		// The tree itself lives on the server and is filtered per sender by the game's own node predicates --
+		// so this is the whole implementation: ask the server to build it again for this player. A permission
+		// plugin calls this after granting or revoking, and LuckPerms calls it from its join handler, which is
+		// where an unimplemented version showed up as "scheduled task of LuckPerms threw" every time a player
+		// connected.
+		//
+		// Safe when the connection is gone: a player whose connection has already closed has nobody to send to,
+		// and the game's own send path is a no-op on a dead listener. Guarded anyway so a plugin holding a
+		// stale Player does not provoke an NPE out of a method whose contract is "refresh, best effort".
+		if (player.connection == null) {
+			return;
+		}
+		net.minecraft.server.MinecraftServer game = server.minecraft();
+		if (game == null) {
+			return;
+		}
+		game.getCommands().sendCommands(player);
 	}
 
 	@Override

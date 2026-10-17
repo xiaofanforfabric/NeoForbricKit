@@ -397,6 +397,19 @@ final class ForbricDeclaredCommands {
      * <p>{@code greedyString} keeps the quotes as typed, so the run is handed to a fresh reader and read
      * word by word — the same rules the game's parser applied to the line before this node saw it.
      * {@code /kit give "my kit"} is two words, and splitting the raw tail on spaces would make it three.
+     *
+     * <h2>The cursor guard is load-bearing</h2>
+     *
+     * <p>{@code readString} does NOT advance when the character at the cursor cannot start a word:
+     * {@code readUnquotedString} stops immediately, returns "", and leaves the cursor where it was. A loop
+     * that trusts {@code canRead()} alone therefore spins forever on that character, appending "" to the list
+     * each time — which is a heap exhaustion, not a hang, because the list is growing. This happened on a
+     * real command line and took the server down with {@code OutOfMemoryError: Java heap space} inside
+     * {@code ArrayList.grow}.
+     *
+     * <p>So every iteration must either consume input or leave. Anything the reader cannot parse is taken as
+     * one literal word and ends the scan, which is also the right user-visible behaviour: a command line the
+     * game accepted must still reach the plugin, even if this splitter cannot make sense of part of it.
      */
     private static String[] words(String rest) {
         if (rest == null || rest.isBlank()) return new String[0];
@@ -405,8 +418,16 @@ final class ForbricDeclaredCommands {
         while (reader.canRead()) {
             reader.skipWhitespace();
             if (!reader.canRead()) break;
+            int before = reader.getCursor();
             try {
-                words.add(reader.readString());
+                String word = reader.readString();
+                if (reader.getCursor() == before) {
+                    // The reader refused to consume the character. Keep the rest verbatim and stop; a loop
+                    // that kept asking would grow this list until the heap ran out.
+                    words.add(rest.substring(before).trim());
+                    break;
+                }
+                words.add(word);
             } catch (com.mojang.brigadier.exceptions.CommandSyntaxException unreadable) {
                 // The line could not be re-read even though the game already read it, so the tail is one word.
                 // Losing the quoting is better than losing the argument.
@@ -414,6 +435,7 @@ final class ForbricDeclaredCommands {
                 break;
             }
         }
+        words.removeIf(String::isEmpty);
         return words.toArray(new String[0]);
     }
 }

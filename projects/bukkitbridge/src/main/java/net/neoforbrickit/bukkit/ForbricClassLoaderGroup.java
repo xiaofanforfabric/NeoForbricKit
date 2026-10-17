@@ -63,6 +63,48 @@ final class ForbricClassLoaderGroup implements PluginClassLoaderGroup {
 
     ForbricClassLoaderGroup(Supplier<java.util.List<PluginHandle>> handles) {
         this.handles = handles;
+        // Published so bridge code that runs OUTSIDE any plugin loader can reach a plugin's classes.
+        //
+        // Not a static field: the bridge is defined TWICE (FML's plugins layer and the game layer), so a
+        // static here would be set in the copy that built the group and read as null by the copy that asks.
+        // A system property is the one channel both layers see -- the same handoff ForbricRegistries and
+        // ForbricApiBridge use, for the same reason.
+        System.getProperties().put(GROUP_KEY, this);
+    }
+
+    /** Where the live group is published; see the constructor. */
+    private static final String GROUP_KEY = "neofobric.bukkit.classLoaderGroup";
+
+    /**
+     * The live group, or null before {@link BridgeBootstrap} has built one.
+     *
+     * <p>Asked by code that needs a class from a plugin's own jar rather than from the game layer — a
+     * permission plugin's API is the case this exists for. {@code Class.forName} on a bridge class resolves
+     * against the game layer, which cannot see a plugin jar at all.
+     */
+    static ForbricClassLoaderGroup current() {
+        Object published = System.getProperties().get(GROUP_KEY);
+        return published instanceof ForbricClassLoaderGroup group ? group : null;
+    }
+
+    /**
+     * Loads {@code name} from any plugin's own jar, without asking the game layer first.
+     *
+     * <p>{@link #getClassByName} is the plugin-facing entry and deliberately skips the requester; this one has
+     * no requester and searches every jar, which is what a bridge caller wants.
+     */
+    Class<?> loadFromPlugins(String name) {
+        for (PluginHandle handle : handles.get()) {
+            try {
+                Class<?> found = handle.classLoader().findClassHere(name);
+                if (found != null) {
+                    return found;
+                }
+            } catch (Throwable notThisLoader) {
+                // Keep looking: an unrelated plugin's jar failing to supply it is the normal case.
+            }
+        }
+        return null;
     }
 
     /**

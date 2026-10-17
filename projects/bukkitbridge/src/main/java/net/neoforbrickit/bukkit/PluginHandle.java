@@ -23,6 +23,13 @@ import org.bukkit.plugin.java.JavaPlugin;
  * constructed. And {@code init(...)} must run before {@code onLoad}/{@code onEnable}, because every accessor a
  * plugin calls ({@code getDataFolder}, {@code getLogger}, {@code getName}) reads a field it fills.
  *
+ * <p><b>One deliberate deviation from that order.</b> A plugin that reads {@code getLogger()} from its own
+ * constructor would see {@code null}, because {@code init(...)} cannot run until construction finishes — it
+ * takes the instance. LuckPerms does exactly that and dies in {@code onLoad}, before {@code onEnable} ever
+ * announces it to the plugins waiting for it. The loader therefore writes the logger into the instance from
+ * inside {@code JavaPlugin}'s constructor; see {@link PluginClassLoader#init}}. {@code init(...)} below still
+ * runs and assigns the same value, so nothing downstream sees a different object either way.
+ *
  * <p>Mirrors the sequence Paper's own provider runs, without the parts this bridge does not have (a provider
  * registry, a module layer, a plugin meta file format of its own).
  */
@@ -63,7 +70,12 @@ final class PluginHandle {
 			throws IOException, InvalidDescriptionException, ReflectiveOperationException {
 		PluginDescriptionFile description = readDescription(jarPath);
 
-		PluginClassLoader loader = new PluginClassLoader(jarPath, parent, description);
+		Path dataFolder = dataRoot.resolve(description.getName());
+		// Everything JavaPlugin.init(...) would assign, handed to the loader so it can fill those fields from
+		// inside JavaPlugin's constructor. See PluginClassLoader#init for why that is necessary rather than an
+		// optimisation: a plugin that reads getLogger()/getServer() from its own constructor would see null.
+		PluginClassLoader loader = new PluginClassLoader(jarPath, parent, description,
+				new PluginClassLoader.PluginFields(server, description, dataFolder.toFile(), jarPath.toFile(), logger));
 		// Before the main class is defined, so a plugin whose own constructor already reaches for a peer's
 		// type resolves it instead of caching a "not found" for the class it needs.
 		loader.joinGroup(group);
@@ -76,9 +88,9 @@ final class PluginHandle {
 		// so the instance and the loader are linked before a single plugin field is assigned.
 		JavaPlugin plugin = (JavaPlugin) mainClass.getDeclaredConstructor().newInstance();
 
-		Path dataFolder = dataRoot.resolve(description.getName());
 		// The seven-argument init is the one that fills every accessor a plugin has; the older six-argument one
-		// derives the same fields but takes a PluginLoader this bridge has no equivalent of.
+		// derives the same fields but takes a PluginLoader this bridge has no equivalent of. It re-assigns what
+		// the loader already wrote, with the same values.
 		plugin.init((org.bukkit.Server) server, description, dataFolder.toFile(), jarPath.toFile(), loader,
 				description, logger);
 

@@ -65,6 +65,37 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
     /** A plain mod id, as both loaders spell them. */
     private static final java.util.regex.Pattern MOD_ID = java.util.regex.Pattern.compile("[a-z0-9_.-]+");
 
+    /**
+     * {@return the mod id when it is usable as a cache directory name, otherwise null}
+     *
+     * <p>Mod ids arrive from a jar's own {@code fabric.mod.json}, so they are attacker-controlled
+     * input: an id like {@code ../../Downloads} would walk out of the cache directory the moment it
+     * is resolved into a path.
+     */
+    private static String safeCacheId(String modId) {
+        return modId != null && MOD_ID.matcher(modId).matches() ? modId : null;
+    }
+
+    /**
+     * {@return the plain file name of a nested jar entry, or null when it is not one}
+     *
+     * <p>The same trust question as {@link #safeCacheId}: an entry name is split on both separators
+     * (a zip may use either), must come back a plain name, and must not carry {@code ..} or the
+     * drive/stream separator {@code :} into a write.
+     */
+    private static String safeNestedFileName(String nestedJar) {
+        var name = nestedJar == null ? "" : nestedJar;
+        var slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (slash >= 0) {
+            name = name.substring(slash + 1);
+        }
+        if (name.isEmpty() || name.equals(".") || name.equals("..") || name.indexOf(':') >= 0
+                || name.indexOf('\\') >= 0 || name.indexOf('/') >= 0) {
+            return null;
+        }
+        return name;
+    }
+
     /** The mod ids the NeoForge mods in the mods folder provide, for the current discovery pass. */
     private static volatile java.util.Set<String> fmlProvidedModIds = java.util.Set.of();
 
@@ -1234,13 +1265,14 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
             throw new IOException("Nested jar " + nestedJar + " does not exist in " + parentPath);
         }
 
-        var fileName = nestedJar;
-        int slash = fileName.lastIndexOf('/');
-        if (slash >= 0) {
-            fileName = fileName.substring(slash + 1);
+        var fileName = safeNestedFileName(nestedJar);
+        var cacheId = safeCacheId(parentInfo.modId());
+        if (fileName == null || cacheId == null) {
+            throw new IOException("Refusing to extract nested jar '" + nestedJar + "' of mod '"
+                    + parentInfo.modId() + "': the entry name or the mod id is not usable as a file name");
         }
 
-        var targetDir = getCacheDirectory().resolve(parentInfo.modId());
+        var targetDir = getCacheDirectory().resolve(cacheId);
         Files.createDirectories(targetDir);
         var target = targetDir.resolve(fileName);
 
@@ -1314,7 +1346,7 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
         // NeoForge install, unlike "net.minecraftforge.*" (the pre-1.20.5 Forge namespace), which only
         // ForgeConfigAPIPort provides and which must therefore stay with the Fabric jar that ships it.
         for (var packageName : fabricPackages) {
-            if (isPlatformNamespace(packageName)) {
+            if (isPlatformNamespace(packageName) || isAlwaysPlatformLibrary(packageName)) {
                 platform.add(packageName);
             }
         }
@@ -1441,6 +1473,24 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
                 // The platform's copy is complete and on the classpath already, so the composite must not
                 // claim any of it - same rule as the NeoForge namespace above.
                 || packageName.equals("com.llamalad7.mixinextras")
+                || packageName.startsWith("com.llamalad7.mixinextras.");
+    }
+
+    /**
+     * {@return whether the package belongs to a library the platform always provides}
+     *
+     * <p>MixinExtras travels inside the platform's own {@code mixinextras.neoforge} module, which FML
+     * adds to the transforming layer on every install and which exports its packages to the game's
+     * module. A Fabric jar bundling its own copy of the library (ViaFabricPlus and IAS do) then files
+     * the same package into the composite module, and the JDK refuses the whole layer:
+     *   Modules mixinextras.neoforge and neofobric.fabric.mods export package
+     *   com.llamalad7.mixinextras.sugar.ref to module minecraft
+     * This library is not on the launch classpath and not a mods-folder jar, so neither probe in
+     * {@link #platformProvidedPackages} could see it; the platform's copy stays and the bundled one is
+     * shadowed, exactly like the platform namespaces above.
+     */
+    private static boolean isAlwaysPlatformLibrary(String packageName) {
+        return packageName.equals("com.llamalad7.mixinextras")
                 || packageName.startsWith("com.llamalad7.mixinextras.");
     }
 
@@ -1910,9 +1960,17 @@ public final class BridgeFabricModLocator implements IModFileCandidateLocator {
     private static java.util.Map<String, Path> nestedReplacements(String parentModId,
             java.util.List<String> nestedJarPaths) {
         var replacements = new java.util.HashMap<String, Path>();
+        var cacheId = safeCacheId(parentModId);
+        if (cacheId == null) {
+            return replacements;
+        }
         for (var nested : nestedJarPaths) {
-            var patched = getCacheDirectory().resolve(parentModId)
-                    .resolve(nested.substring(nested.lastIndexOf('/') + 1) + ".neofobric-realigned.jar");
+            var fileName = safeNestedFileName(nested);
+            if (fileName == null) {
+                continue;
+            }
+            var patched = getCacheDirectory().resolve(cacheId)
+                    .resolve(fileName + ".neofobric-realigned.jar");
             if (Files.isRegularFile(patched)) {
                 replacements.put(nested, patched);
             }

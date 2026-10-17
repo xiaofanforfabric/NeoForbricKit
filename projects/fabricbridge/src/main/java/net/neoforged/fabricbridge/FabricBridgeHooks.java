@@ -54,20 +54,30 @@ public final class FabricBridgeHooks {
      * when the site is the caller, and keeps its ordinary behaviour for every other caller. The value is a
      * {@link java.util.function.BooleanSupplier} because the platform's removal needs the block state, the tool
      * and the drop decision, none of which fit the vanilla two-argument shape.
+     *
+     * <p>The pending entry remembers its position (packed as {@code BlockPos#asLong}), and only that position
+     * may claim it. A mod's mixin at the head of {@code Level#removeBlock} that removes *another* block (a
+     * door's other half, a support block) re-enters the method before the original call reaches it; without
+     * the position check that inner call would consume the carried removal for the wrong block - the original
+     * block would go through the plain path with its drops lost, while the inner caller would be told the
+     * platform removed a block it never touched.
      */
-    private static final ThreadLocal<java.util.function.BooleanSupplier> destroyAction = new ThreadLocal<>();
+    private record PendingDestroy(long pos, java.util.function.BooleanSupplier action) {}
 
-    public static void pushDestroyAction(java.util.function.BooleanSupplier action) {
-        destroyAction.set(action);
+    private static final ThreadLocal<PendingDestroy> destroyAction = new ThreadLocal<>();
+
+    public static void pushDestroyAction(long pos, java.util.function.BooleanSupplier action) {
+        destroyAction.set(new PendingDestroy(pos, action));
     }
 
     public static void popDestroyAction() {
         destroyAction.remove();
     }
 
-    /** {@return whether the platform's own block removal is waiting behind the vanilla-shaped call} */
-    public static boolean hasDestroyAction() {
-        return destroyAction.get() != null;
+    /** {@return whether the platform's own block removal is waiting for exactly this position (as {@code BlockPos#asLong})} */
+    public static boolean hasDestroyAction(long pos) {
+        var pending = destroyAction.get();
+        return pending != null && pending.pos() == pos;
     }
 
     /**
@@ -79,10 +89,13 @@ public final class FabricBridgeHooks {
      * ({@code fake_player_tests_test_fake_player_break_beehive}). Cleared, the inner call takes the plain path,
      * which is exactly what it would take without this bridge.
      */
-    public static boolean runDestroyAction() {
-        var action = destroyAction.get();
+    public static boolean runDestroyAction(long pos) {
+        var pending = destroyAction.get();
+        if (pending == null || pending.pos() != pos) {
+            return false;
+        }
         destroyAction.remove();
-        return action != null && action.getAsBoolean();
+        return pending.action().getAsBoolean();
     }
 
     /**
@@ -208,19 +221,8 @@ public final class FabricBridgeHooks {
     }
 
     /**
-     * Closes the window {@link #deferFabricWindow(Runnable, Runnable)} took over: drops the intrusive
-     * holders a Fabric mod built but never registered, then runs the freeze it held back. Called once
-     * both entrypoint sets are through.
-     */
-    private static void closeDeferredFabricWindow(DeferredFabricWindow fabricWindow) {
-        dropUnregisteredIntrusiveHolders();
-        fabricWindow.freeze().run();
-        LOGGER.info("[NeoFobric] Registries frozen after the Fabric entrypoints");
-    }
-
-    /**
      * Drops the intrusive holders a Fabric mod built but never registered, before the registry window
-     * closes.
+     * closes, then runs the freeze the window held back.
      *
      * <p>Minecraft's registries with intrusive-holder support ({@code BuiltInRegistries.BLOCK},
      * {@code ITEM}, {@code BLOCK_ENTITY_TYPE}, {@code ENTITY_TYPE}, {@code FLUID}) remember every value
@@ -529,14 +531,17 @@ public final class FabricBridgeHooks {
                 initialise = blockEntity.getClass().getMethod("initialize");
                 createInitialiseMethods.put(blockEntity.getClass(), initialise);
             }
-            field.setBoolean(blockEntity, true);
+            // Call first, mark after: with the flag set early, an initialize() that throws would leave the
+            // block entity permanently marked as initialised with no behaviours - every later lookup would
+            // early-return, nothing would ever retry, and the first real crash would carry no trace of this.
             initialise.invoke(blockEntity);
+            field.setBoolean(blockEntity, true);
             if (PROBED.add("early" + simpleName)) {
                 LOGGER.debug("[NeoFobric] Initialised a block entity from its behaviour lookup, before its first tick: {}", simpleName);
             }
         } catch (Throwable t) {
             if (PROBED.add("failed" + simpleName)) {
-                LOGGER.debug("[NeoFobric] Behaviour-lookup initialisation of {} failed", simpleName, t);
+                LOGGER.warn("[NeoFobric] Behaviour-lookup initialisation of {} failed - the block entity stays uninitialised and the next lookup will retry", simpleName, t);
             }
         }
     }
@@ -854,10 +859,49 @@ public final class FabricBridgeHooks {
         // entrypoint declarations directly and runs with the main set).
         net.neoforged.fabricbridge.compbridlnk.ModMenuUpdateLink.linkModMenuUpdateChecks();
 
-        // The client entrypoints are the last Fabric-side chance to register content, so this is where
-        // the registry window that runFabricEntrypoints left open closes again (see deferFabricWindow).
+        // The client entrypoints are the last Fabric-side chance to register content *from an
+        // entrypoint*, but not the last chance overall: Fabric API's registry sync re-runs
+        // bootStrap() from its Minecraft-constructor mixin (in front of which this hand-off sits),
+        // and mods hang their own late registrations inside that second bootstrap - ViaFabricPlus
+        // registers a particle type from an injection behind bootStrap's createContents() call.
+        // Freezing here would hand those mods "Registry is already frozen", so the freeze only gets
+        // *armed*; BuiltInRegistries.bootStrap() runs it once its own work is through (see
+        // freezeRegistriesAfterBootstrap, injected at the tail of that method).
         if (fabricWindow != null) {
-            closeDeferredFabricWindow(fabricWindow);
+            pendingFabricWindow = fabricWindow;
+        }
+    }
+
+    /** The window {@link #deferFabricWindow(Runnable, Runnable)} took over, waiting for the freeze point. */
+    private static volatile DeferredFabricWindow pendingFabricWindow;
+
+    /**
+     * Closes the registry window once the second bootstrap is through. Injected at the tail of
+     * {@code BuiltInRegistries.bootStrap()} (see the class tweaker), which Fabric API's registry sync
+     * re-runs from its Minecraft-constructor mixin - the last registry-writing step of client startup.
+     * Everything that registers inside that bootstrap (ViaFabricPlus's particle type and friends) has
+     * registered by then, and the freeze the entrypoints left armed finally closes the window.
+     *
+     * <p>The window carries two held-back steps and both run here, in the order the old close point
+     * used: first the shell-mod RegisterEvent pass (Architectury's listeners register their content on
+     * NeoForge buses - that pass needs the registries open, so it must precede the freeze), then the
+     * freeze itself. Runs at most once: bootStrap() can run more than once in principle, and only the
+     * first arrival behind an armed window has anything to close. On the datagen and dedicated-server
+     * paths the window was never taken over (deferFabricWindow returned false and NeoForge ran both
+     * steps inline), so there is nothing pending and this is a no-op.
+     */
+    public static void freezeRegistriesAfterBootstrap() {
+        var fabricWindow = pendingFabricWindow;
+        if (fabricWindow == null) {
+            return;
+        }
+        pendingFabricWindow = null;
+        try {
+            dropUnregisteredIntrusiveHolders();
+            fabricWindow.freeze().run();
+            LOGGER.info("[NeoFobric] Registries frozen after the second bootstrap");
+        } catch (Throwable t) {
+            LOGGER.error("[NeoFobric] Failed to freeze the registries after the second bootstrap", t);
         }
     }
 

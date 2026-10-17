@@ -836,7 +836,7 @@ public final class MixinJarPatcher {
         if (!injected) {
             return null;
         }
-        var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        var writer = new ClassWriter(0);
         node.accept(writer);
         LOGGER.debug("[NeoFobric] Injected the CTM probe into {}", entryName);
         return writer.toByteArray();
@@ -2212,6 +2212,9 @@ public final class MixinJarPatcher {
      */
     private static byte[] extendInjectorHandlerParams(byte[] classBytes, String entryName,
             java.util.function.Function<String, byte[]> targetBytecode) {
+        if (Boolean.getBoolean("neofobric.noHandlerExtension")) {
+            return null;
+        }
         ClassNode node;
         try {
             node = new ClassNode();
@@ -2398,7 +2401,25 @@ public final class MixinJarPatcher {
         if (!changed) {
             return null;
         }
-        var writer = new ClassWriter(0);
+        // COMPUTE_FRAMES is required: appending the missing parameters shifts the handler's locals
+        // (every VarInsn/Iinc/LVT entry at or after the callback moved by addedSlots) while the
+        // StackMapTable frames the handler carries still describe the OLD slot layout. Mixin inlines
+        // these handler bodies into the game class, and a stale frame riding along surfaces as
+        // "VerifyError: Expecting a stackmap frame" / "Bad local variable type" on the GAME class the
+        // first time it links (VFP's ClientPacketListener handlers, fabric-data-attachment's respawn
+        // bridge - all died that way). The common-superclass lookup needs a hierarchy the jar alone
+        // cannot answer, so it falls back to java/lang/Object: a verifier-acceptable answer wherever
+        // two unrelated reference types merge, which is all these synthetic handlers ever need.
+        var writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
+            @Override
+            protected String getCommonSuperClass(String type1, String type2) {
+                try {
+                    return super.getCommonSuperClass(type1, type2);
+                } catch (Throwable t) {
+                    return "java/lang/Object";
+                }
+            }
+        };
         node.accept(writer);
         return writer.toByteArray();
     }
@@ -2691,7 +2712,7 @@ public final class MixinJarPatcher {
             return null;
         }
         LOGGER.info("[NeoFobric] Made Create's behaviour lookup initialise the block entity first");
-        var writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        var writer = new ClassWriter(0);
         node.accept(writer);
         return writer.toByteArray();
     }
@@ -3716,6 +3737,13 @@ public final class MixinJarPatcher {
                 call.name = hook;
                 call.desc = desc;
                 call.itf = false;
+                // The rewrite pushes one more reference than the virtual call consumed: at the call the
+                // stack now holds (receiver, name, path) where it held (receiver, name) before, and the
+                // static call replaces all three. maxStack must grow by at least that one slot. Raised
+                // here directly: it is exact, offline, and keeps this pass from relying on the writer's
+                // frame machinery. Raising per rewrite can overshoot when one method rewrites twice; a
+                // larger maxStack than needed is always legal.
+                method.maxStack += 1;
                 changed = true;
             }
         }
@@ -5629,6 +5657,21 @@ public final class MixinJarPatcher {
                     versionMoved = movedAnchorsRetargeted;
                     patched.put(entry.getName(), versionMoved);
                 }
+                var wrapConditionOverloadRealigned = realignWrapConditionOverload(versionMoved, entry.getName());
+                if (wrapConditionOverloadRealigned != null) {
+                    versionMoved = wrapConditionOverloadRealigned;
+                    patched.put(entry.getName(), versionMoved);
+                }
+                var lambdaOverwritesPublicised = publiciseLambdaOverwrites(versionMoved, entry.getName());
+                if (lambdaOverwritesPublicised != null) {
+                    versionMoved = lambdaOverwritesPublicised;
+                    patched.put(entry.getName(), versionMoved);
+                }
+                var protocolVersionArgsStringified = stringifyViaFabricPlusVersionArgs(versionMoved, entry.getName());
+                if (protocolVersionArgsStringified != null) {
+                    versionMoved = protocolVersionArgsStringified;
+                    patched.put(entry.getName(), versionMoved);
+                }
                 var behaviourLookupGuarded = initialiseCreateBehavioursOnLookup(versionMoved, entry.getName());
                 if (behaviourLookupGuarded != null) {
                     versionMoved = behaviourLookupGuarded;
@@ -6073,6 +6116,201 @@ public final class MixinJarPatcher {
 
     private static boolean hasAnnotation(MethodNode method, String descriptor) {
         return findAnnotation(method, descriptor) != null;
+    }
+
+    /**
+     * Turns ViaFabricPlus's raw {@code ProtocolVersion} translation arguments into strings.
+     *
+     * <p>ViaFabricPlus's server-list tooltip feeds {@code Component.translatable} the
+     * {@code ProtocolVersion} object itself. This platform's development environment validates
+     * translatable arguments (Component, Number, Boolean or String - production skips the check), so
+     * the moment a target version is set, rendering any server-list entry crashed the render thread
+     * with {@code TranslatableContents' arguments must be either ...}. The call whose result the
+     * translation consumes is rewritten to its {@code toString()} - exactly what the translation line
+     * prints anyway ({@code 1.21-1.21.1 (767)}).
+     */
+    private static byte[] stringifyViaFabricPlusVersionArgs(byte[] classBytes, String entryName) {
+        if (!entryName.endsWith(".class")) {
+            return null;
+        }
+        ClassNode node;
+        try {
+            node = new ClassNode();
+            new ClassReader(classBytes).accept(node, 0);
+        } catch (Throwable t) {
+            return null;
+        }
+
+        var changed = false;
+        for (var method : node.methods) {
+            for (var insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+                if (!(insn instanceof org.objectweb.asm.tree.MethodInsnNode call)
+                        || !(call.owner.equals("com/viaversion/viafabricplus/injection/access/core/IServerData"))
+                        || !"viaFabricPlus$translatingVersion".equals(call.name)) {
+                    continue;
+                }
+                // The result sits on the stack where the translation wants a String. String.valueOf is
+                // null-safe: the polled "checking..." entries return a null version, and the first
+                // attempt (a plain toString call) died on exactly those with an NPE.
+                method.instructions.insert(call, new org.objectweb.asm.tree.MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "java/lang/String",
+                        "valueOf",
+                        "(Ljava/lang/Object;)Ljava/lang/String;",
+                        false));
+                changed = true;
+                LOGGER.info("[NeoFobric] Pointed {}#{}'s target-version argument at its toString so the translatable-argument validation accepts it",
+                        node.name.replace('/', '.'), method.name);
+            }
+        }
+
+        if (!changed) {
+            return null;
+        }
+        var writer = new ClassWriter(0);
+        node.accept(writer);
+        return writer.toByteArray();
+    }
+
+    /**
+     * Raises a private {@code @Overwrite} of a synthetic lambda to public.
+     *
+     * <p>A lambda handler compiled private fails Mixin's visibility conformance the moment the runtime
+     * target method is anything but private - ViaFabricPlus's 1.12.2 useItemOn packet-lambda overwrite
+     * died with "cannot reduce visibility of PUBLIC target method" even though the platform's own widen
+     * scan had deliberately left the lambda private for it (measured: the exclusion worked, the public
+     * target came from the merged context, and the mixin was refused wholesale). A {@code lambda$}
+     * member is a compilation detail with no external callers, so the merged method being public costs
+     * nothing and is immune to whoever widens the target.
+     */
+    private static byte[] publiciseLambdaOverwrites(byte[] classBytes, String entryName) {
+        if (!entryName.endsWith(".class") || !entryName.contains("mixin")) {
+            return null;
+        }
+        ClassNode node;
+        try {
+            node = new ClassNode();
+            new ClassReader(classBytes).accept(node, 0);
+        } catch (Throwable t) {
+            return null;
+        }
+
+        var changed = false;
+        for (var method : node.methods) {
+            if ((method.access & Opcodes.ACC_PRIVATE) == 0
+                    || !method.name.startsWith("lambda$")
+                    || findAnnotation(method, "Lorg/spongepowered/asm/mixin/Overwrite;") == null) {
+                continue;
+            }
+            method.access = (method.access & ~Opcodes.ACC_PRIVATE) | Opcodes.ACC_PUBLIC;
+            changed = true;
+            LOGGER.info("[NeoFobric] Raised the private lambda overwrite {}#{} to public so the visibility conformance cannot refuse it",
+                    node.name.replace('/', '.'), method.name);
+        }
+
+        if (!changed) {
+            return null;
+        }
+        var writer = new ClassWriter(0);
+        node.accept(writer);
+        return writer.toByteArray();
+    }
+
+    /**
+     * Repoints ViaFabricPlus's {@code startWaitingForNewLevel} wrap at the overload that actually runs, and
+     * widens its handler to the new call shape.
+     *
+     * <p>ViaFabricPlus wraps the {@code startWaitingForNewLevel(LocalPlayer, ClientLevel, Reason)} call
+     * inside {@code handleRespawn} with a {@code @WrapWithCondition} whose handler takes the wrapped call's
+     * arguments plus one {@code @Local(name = "dimensionKey")} sugar parameter. NeoForge split that method
+     * into a delegating three-argument overload with no call sites left and a five-argument overload that
+     * {@code handleRespawn} actually invokes, carrying the two dimension keys the sugar used to fish out of
+     * the frame. Against this platform the injection therefore dies in MixinExtras' parameter validation
+     * during the apply's post-phase - the target class is left half-transformed with frames that describe
+     * the pre-injection layout, and the first link of {@code ClientPacketListener} verifies a different
+     * method every launch ("Expecting a stackmap frame").
+     *
+     * <p>The fix points the {@code @At} target at the five-argument overload and lets the handler read the
+     * two keys as explicit call arguments: the sugar parameter's slot and type are the first new argument's,
+     * so the handler body reads it unchanged; only the second key is appended and the stale {@code @Local}
+     * annotation removed.
+     */
+    private static byte[] realignWrapConditionOverload(byte[] classBytes, String entryName) {
+        if (!"com/viaversion/viafabricplus/injection/mixin/features/v1_20_3/network/MixinClientPacketListener.class".equals(entryName)) {
+            return null;
+        }
+        ClassNode node;
+        try {
+            node = new ClassNode();
+            new ClassReader(classBytes).accept(node, 0);
+        } catch (Throwable t) {
+            return null;
+        }
+
+        var oldCallArgs = "(Lnet/minecraft/client/player/LocalPlayer;Lnet/minecraft/client/multiplayer/ClientLevel;Lnet/minecraft/client/gui/screens/LevelLoadingScreen$Reason;)V";
+        var newCallArgs = "(Lnet/minecraft/client/player/LocalPlayer;Lnet/minecraft/client/multiplayer/ClientLevel;Lnet/minecraft/client/gui/screens/LevelLoadingScreen$Reason;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/ResourceKey;)V";
+        var resourceKeyDesc = "Lnet/minecraft/resources/ResourceKey;";
+        var localSugar = "Lcom/llamalad7/mixinextras/sugar/Local;";
+
+        var changed = false;
+        for (var method : node.methods) {
+            // ViaFabricPlus uses MixinExtras' own WrapWithCondition, not sponge's - match both spellings.
+            var wrap = findAnnotation(method, "Lorg/spongepowered/asm/mixin/injection/WrapWithCondition;");
+            if (wrap == null) {
+                wrap = findAnnotation(method, "Lcom/llamalad7/mixinextras/injector/v2/WrapWithCondition;");
+            }
+            if (wrap == null || wrap.values == null) {
+                continue;
+            }
+            for (var i = 0; i + 1 < wrap.values.size(); i += 2) {
+                if (!"at".equals(wrap.values.get(i)) || !(wrap.values.get(i + 1) instanceof org.objectweb.asm.tree.AnnotationNode at)
+                        || at.values == null) {
+                    continue;
+                }
+                for (var j = 0; j + 1 < at.values.size(); j += 2) {
+                    if ("target".equals(at.values.get(j)) && at.values.get(j + 1) instanceof String target
+                            && target.startsWith("Lnet/minecraft/client/multiplayer/ClientPacketListener;startWaitingForNewLevel(")
+                            && target.contains(oldCallArgs)) {
+                        at.values.set(j + 1, target.replace(oldCallArgs, newCallArgs));
+                        changed = true;
+                    }
+                }
+            }
+
+            if (!method.name.equals("checkDimensionChange")) {
+                continue;
+            }
+            var args = org.objectweb.asm.Type.getArgumentTypes(method.desc);
+            if (args.length == 0 || !args[args.length - 1].getDescriptor().equals(resourceKeyDesc)) {
+                continue;
+            }
+            var newArgs = new org.objectweb.asm.Type[args.length + 1];
+            System.arraycopy(args, 0, newArgs, 0, args.length);
+            newArgs[args.length] = org.objectweb.asm.Type.getObjectType("net/minecraft/resources/ResourceKey");
+            method.desc = org.objectweb.asm.Type.getMethodDescriptor(org.objectweb.asm.Type.getReturnType(method.desc), newArgs);
+            // The last parameter was the @Local sugar; the first appended parameter takes over its slot
+            // (same type, the wrapper's own toDimension), so only the annotation goes.
+            if (method.visibleParameterAnnotations != null && method.visibleParameterAnnotations.length == args.length) {
+                method.visibleParameterAnnotations[args.length - 1] = null;
+            }
+            if (method.invisibleParameterAnnotations != null && method.invisibleParameterAnnotations.length == args.length) {
+                method.invisibleParameterAnnotations[args.length - 1] = null;
+            }
+            if (args[args.length - 1].getSize() == 1) {
+                method.maxLocals += 1;
+            } else {
+                method.maxLocals += 2;
+            }
+            method.signature = null;
+            changed = true;
+            LOGGER.info("[NeoFobric] Repointed {}#{} at the five-argument startWaitingForNewLevel overload and widened the handler by the explicit dimension keys", node.name.replace('/', '.'), method.name);
+        }
+
+        if (!changed) {
+            return null;
+        }
+        var writer = new ClassWriter(0);
+        node.accept(writer);
+        return writer.toByteArray();
     }
 
     /**

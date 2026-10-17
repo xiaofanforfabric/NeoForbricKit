@@ -148,7 +148,19 @@ public final class ServerImpl implements org.bukkit.Server {
 		// PluginManager method, and the few it delegates are the ones SimplePluginManager really
 		// implements itself, so the forward terminates.
 		simple.paperPluginManager = manager;
-		this.pluginManager = manager;
+		// Handed out is the SIMPLE manager, not the wrapper, and the difference is observable.
+		//
+		// A permission plugin recognises the stock manager by type: LuckPerms' injectors begin with
+		// `if (!(pluginManager instanceof SimplePluginManager)) { log an error; return; }` and only then
+		// replace the three permission tables. Given this wrapper's class, that test fails, the tables stay
+		// null, and the plugin's own permission calculation dies later with
+		// `NullPointerException: permissionMap is null` -- during a login, far from the line that caused it.
+		//
+		// The forward direction still works: SimplePluginManager sends every method this bridge cares about
+		// to `paperPluginManager`, which is the wrapper above. So a plugin sees the stock type, the plugin
+		// list is still answered from the bridge's handles, and the permission tables it injects into are the
+		// ones its own lookups read.
+		this.pluginManager = simple;
 	}
 
 	/**
@@ -1406,18 +1418,32 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public com.destroystokyo.paper.profile.PlayerProfile createProfile(java.lang.String arg0) {
-		throw notYet("createProfile");
-	}
+                // A profile carrying a name only. The id is deliberately null: resolving a name to an account
+                // is a network lookup, and answering with a made-up id would be worse than answering with
+                // none -- a caller that stores it would persist a wrong account.
+                if (arg0 == null) {
+                        throw new IllegalArgumentException("name must not be null");
+                }
+                return new ForbricPlayerProfile(null, arg0);
+        }
 
-	@Override
-	public com.destroystokyo.paper.profile.PlayerProfile createProfile(java.util.UUID arg0, java.lang.String arg1) {
-		throw notYet("createProfile");
-	}
+        @Override
+        public com.destroystokyo.paper.profile.PlayerProfile createProfile(java.util.UUID arg0,
+                        java.lang.String arg1) {
+                // Both halves given, which is the shape AsyncPlayerPreLoginEvent's constructor asks for.
+                // This used to throw, and that took the event down with it: every login attempt failed to
+                // raise it, so a permission plugin never learned that a player existed.
+                return new ForbricPlayerProfile(arg0, arg1);
+        }
 
-	@Override
-	public com.destroystokyo.paper.profile.PlayerProfile createProfileExact(java.util.UUID arg0, java.lang.String arg1) {
-		throw notYet("createProfileExact");
-	}
+        @Override
+        public com.destroystokyo.paper.profile.PlayerProfile createProfileExact(java.util.UUID arg0,
+                        java.lang.String arg1) {
+                // Upstream this asserts that the id and the name are known to belong together, which needs
+                // the account service. The two halves are returned as given rather than refused: a caller
+                // inside a login already has them from the game's own authentication.
+                return new ForbricPlayerProfile(arg0, arg1);
+        }
 
 	@Override
 	public int getCurrentTick() {

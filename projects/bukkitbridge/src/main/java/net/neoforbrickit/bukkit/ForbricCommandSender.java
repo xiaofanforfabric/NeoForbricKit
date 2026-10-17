@@ -121,15 +121,43 @@ class ForbricCommandSender implements org.bukkit.command.CommandSender {
     }
 
     /**
-     * Whether the sender may use a permission.
+     * Whether this sender may use a permission.
      *
-     * <p>Delegates to the plugin manager's permission tables, which is where a plugin's registered permissions
-     * live. A player-issued command is a player to the manager; anything else is asked directly.
+     * <p><b>Asked of the sender, not of the permission registry.</b> The distinction is the whole method: the
+     * previous body answered {@code getPermission(name) != null}, which says whether a plugin DECLARED that
+     * permission — a property of the server, identical for every sender. So the console got the same answer as
+     * an unprivileged player, and a plugin whose completions filter on {@code sender.hasPermission(...)} (the
+     * usual shape) offered nothing at all to anybody.
+     *
+     * <p>LuckPerms is exactly that shape, which is how this surfaced: {@code /lp} completed to nothing for
+     * every keystroke, on a server where {@code /lp info} ran fine. The command worked; only the suggestions
+     * were filtered away.
+     *
+     * <p>The console is allowed everything, which is what every server does and what {@link #isOp()} already
+     * says. A player is allowed what the game's permission level grants, plus what a permission plugin has
+     * attached to this player — the latter read from the entity's {@code perm}, which is the field a permission
+     * plugin installs its own implementation into.
      */
     @Override
     public boolean hasPermission(String name) {
-        return server.getPluginManager() != null
-                        && server.getPluginManager().getPermission(name) != null;
+        if (player == null) {
+            // Console, command block, function: the most privileged sender there is.
+            return true;
+        }
+        // The game decides what is privileged. A permission plugin's own answers come from the entity's
+        // permissible, which is asked after this and may grant more than the vanilla level.
+        if (server.isOperator(player.getUUID())) {
+            return true;
+        }
+        if (player instanceof org.bukkit.entity.Player bukkitPlayer) {
+            // Whatever was installed on the entity governs from here: the stock PermissibleBase consults the
+            // plugin manager's tables, and an installed permission plugin answers from its own cache.
+            return bukkitPlayer.hasPermission(name);
+        }
+        // A non-player human entity has no attached permissions of its own; the registry's default decides.
+        org.bukkit.permissions.Permission registered = server.getPluginManager() == null ? null
+                : server.getPluginManager().getPermission(name);
+        return registered != null && registered.getDefault() == org.bukkit.permissions.PermissionDefault.TRUE;
     }
 
     @Override

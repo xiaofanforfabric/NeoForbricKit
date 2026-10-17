@@ -19,8 +19,12 @@ import net.minecraft.server.level.ServerPlayer;
  * for the reason given in {@code CraftEntity}: the implementation that descends from it
  * already implements the interface, and repeating it would make every one of that
  * implementation's bodies abstract again.
+ *
+ * <p>A player is a human entity upstream, and the chain is kept because callers walk it:
+ * {@code CraftHumanEntity} carries the {@code perm} field a permission plugin replaces, and a
+ * lookup for it stops here rather than at {@code CraftEntity}.
  */
-public abstract class CraftPlayer extends CraftEntity {
+public abstract class CraftPlayer extends CraftHumanEntity {
 
 	protected CraftPlayer(ServerPlayer handle) {
 		super(handle);

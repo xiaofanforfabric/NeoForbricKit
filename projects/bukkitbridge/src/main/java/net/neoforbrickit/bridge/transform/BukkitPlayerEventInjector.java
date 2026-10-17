@@ -138,6 +138,22 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	static final String JOIN_HOOK = "playerJoined";
 	static final String QUIT_HOOK = "playerLeft";
 
+	/**
+	 * {@code PlayerList.placeNewPlayer(Connection, ServerPlayer, CommonListenerCookie)V} — the pre-login point.
+	 *
+	 * <p>This is where {@code AsyncPlayerPreLoginEvent} is raised, and it has to be BEFORE the player is put in
+	 * the world: a permission plugin loads its user data from that event and reads it back for every later
+	 * check, so raising it after the join would leave the whole session answering from defaults.
+	 *
+	 * <p>The player is argument 1 (slot 2) of an instance method — {@code this} is slot 0, the connection is
+	 * slot 1.
+	 */
+	static final String PRE_LOGIN_METHOD = "placeNewPlayer";
+	static final String PRE_LOGIN_DESC = "(Lnet/minecraft/network/Connection;"
+			+ "Lnet/minecraft/server/level/ServerPlayer;"
+			+ "Lnet/minecraft/server/network/CommonListenerCookie;)V";
+	static final String PRE_LOGIN_HOOK = "playerPreLogin";
+
 	private static final ProcessorName NAME = new ProcessorName("neofobric", "bukkit_player_events");
 
 	public static final String PROPERTY = "neofobric.bukkitPlayerEvents";
@@ -170,7 +186,14 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			return injectJoin(context);
 		}
 		if (PLAYER_LIST_DOT.equals(className)) {
-			return injectQuit(context);
+			// Two independent hooks in one class. Both run, and the class is rewritten if EITHER changed it --
+			// returning early from the first would drop the second, which is exactly the silent half-present
+			// failure this processor's own comments warn about.
+			ComputeFlags quit = injectQuit(context);
+			ComputeFlags preLogin = injectPreLogin(context);
+			return quit == ComputeFlags.NO_REWRITE && preLogin == ComputeFlags.NO_REWRITE
+					? ComputeFlags.NO_REWRITE
+					: ComputeFlags.COMPUTE_FRAMES;
 		}
 		return ComputeFlags.NO_REWRITE;
 	}
@@ -283,6 +306,47 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	/** {@code (Lnet/minecraft/server/level/ServerPlayer;)V} — both hooks take one player. */
 	private static String hookDesc() {
 		return "(" + PLAYER_DESC + ")V";
+	}
+
+	/**
+	 * {@code PlayerList.placeNewPlayer}: prepend a call naming the player, before it is put in the world.
+	 *
+	 * <p>This raises {@code AsyncPlayerPreLoginEvent}, which is where a permission plugin loads a player's
+	 * data. Without it the plugin's user manager never learns the player exists — {@code /lp user <name>}
+	 * answers "user not found" for somebody standing in the world, and every permission check falls back to the
+	 * declared defaults, while the plugin itself reports that it enabled successfully.
+	 *
+	 * <p>At the HEAD rather than anchored to a later call: the point of the event is to decide whether this
+	 * player may be placed at all, so it has to run before anything decides that for us.
+	 */
+	private ComputeFlags injectPreLogin(TransformationContext context) {
+		ClassNode node = context.node();
+		MethodNode target = method(node, PRE_LOGIN_METHOD, PRE_LOGIN_DESC);
+		if (target == null) {
+			context.audit("neofobric:bukkit_player_events found no " + PRE_LOGIN_METHOD + PRE_LOGIN_DESC
+					+ " in " + context.type().getClassName());
+			return ComputeFlags.NO_REWRITE;
+		}
+		if (alreadyInjected(target, PRE_LOGIN_HOOK)) {
+			return ComputeFlags.NO_REWRITE;
+		}
+		if (headIsBranchTarget(target)) {
+			context.audit("neofobric:bukkit_player_events declined " + context.type().getClassName()
+					+ "." + PRE_LOGIN_METHOD
+					+ ": the entry is a branch target, where a prepended hook cannot be first");
+			return ComputeFlags.NO_REWRITE;
+		}
+
+		// Argument 1 of an instance method: slot 0 is `this`, slot 1 the Connection, slot 2 the player.
+		InsnList code = new InsnList();
+		code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, PRE_LOGIN_HOOK, hookDesc(), false));
+		target.instructions.insert(code);
+
+		ForbricLog.info("[NeoFobric/Bukkit] %s raises AsyncPlayerPreLoginEvent from %s"
+						+ " — a permission plugin learns the player exists before the first permission check",
+						simpleName(node.name), PRE_LOGIN_METHOD);
+		return ComputeFlags.COMPUTE_FRAMES;
 	}
 
 	/** The method with exactly this name and descriptor, or null. */

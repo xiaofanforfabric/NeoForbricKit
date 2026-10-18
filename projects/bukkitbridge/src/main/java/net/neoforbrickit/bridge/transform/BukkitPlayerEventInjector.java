@@ -104,7 +104,7 @@ import org.objectweb.asm.tree.VarInsnNode;
  * that already had its join event — the client died on {@code 'TAB-Scoreboard'} again, on a server
  * whose startup log carried the line below. The flag therefore only stops one client load raising
  * twice; whether the load is a NEW session is decided in
- * {@code ForbricPlayerEventHook#raiseOncePerSession}, by the account's UUID.
+ * {@code ForbricPlayerEventHook#beginSession}, by the account's UUID.
  *
  * <p>{@code PlayerList.remove} takes the player as its only argument, so no field is needed there.
  * It has no equivalent double-entry, because it is called by the game itself rather than from a
@@ -300,7 +300,7 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		// The per-listener flag installed below catches two raises for ONE listener (the re-threaded packet).
 		// It cannot catch two listeners in one session, because a fresh listener starts with a false flag --
 		// which is exactly how the first fix shipped and failed. Session identity is the hook's business: see
-		// ForbricPlayerEventHook#raiseOncePerSession, and keep both halves.
+		// ForbricPlayerEventHook#beginSession, and keep both halves.
 		installJoinOnceGuard(node, target, hookCall);
 		return ComputeFlags.COMPUTE_FRAMES;
 	}
@@ -390,7 +390,7 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	 * <p>It is NOT the whole answer, and shipping it as though it were is why the client still died on
 	 * {@code 'TAB-Scoreboard'}: {@code respawn} gives the teleported player a new listener, so this flag starts
 	 * false for a session that already had its event. The session half lives in
-	 * {@code ForbricPlayerEventHook#raiseOncePerSession}, keyed by UUID. Two guards, two questions: "did this
+	 * {@code ForbricPlayerEventHook#beginSession}, keyed by UUID. Two guards, two questions: "did this
 	 * listener already raise?" and "did this session already have a join?".
 	 *
 	 * <p>The field is added by this processor, and every instruction referring to it is emitted from text

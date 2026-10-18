@@ -50,10 +50,11 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Raised once per SESSION. The two halves are a flag on the listener, so one client load raises one
-	 * event even though its packet is entered twice ({@code BukkitPlayerEventInjector#installJoinOnceGuard}),
-	 * and {@link #connectionIsLive}, so the load that arrives while a move between worlds is completing does
-	 * not raise a second one.
+	 * <p>Raised once per SESSION, and a session is the account, not the objects. The per-listener flag
+	 * ({@code BukkitPlayerEventInjector#installJoinOnceGuard}) stops one client load raising twice, because
+	 * its packet is entered on the network thread and again on the server thread. {@link #beginSession}
+	 * stops a MOVE between worlds raising at all, because a move builds a new player and a new listener and
+	 * reaches the same anchor a second time.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {
@@ -67,7 +68,14 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
-			if (!connectionIsLive(player)) {
+			if (!beginSession(player)) {
+				// A move between worlds rebuilds the player AND the listener, so the packet that finishes the
+				// move reaches this hook on a listener that has never raised anything. The answer is the
+				// ACCOUNT, not the object: this session already had its join, and TAB would build a second
+				// scoreboard for it.
+				ForbricLog.info("[Forbric/Bukkit] %s is finishing a move between worlds"
+								+ " — the session already had its PlayerJoinEvent, so none is raised",
+								player.getScoreboardName());
 				return;
 			}
 			// Unconditional while the seam is being proven: the only other evidence an event fired is
@@ -123,6 +131,7 @@ public final class ForbricPlayerEventHook {
 			// registered on it. Dropping only the bridge's map would leave one dangling listener per bar per
 			// departed player, held by the plugin's own bar object, for the life of the server.
 			ForbricPlayer.forgetBossBarView(player);
+			endSession(player);
 		} catch (Throwable failure) {
 			// Same reasoning as the join hook: the player is already leaving, and an exception here
 			// would turn a normal disconnect into a failed one.
@@ -198,49 +207,56 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
-	 * Whether the connection this load arrived on is still up, i.e. whether a session is STARTING on it.
+	 * The accounts whose session has raised {@code PlayerJoinEvent} and has not been removed yet.
 	 *
-	 * <h2>The shape in the log</h2>
+	 * <p>Keyed by {@code UUID} because that is what the game identifies a connection with; a name is what a
+	 * plugin shows, and an offline-mode server can serve the same one to a stranger.
 	 *
-	 * <p>09:59:33 a load raises the join event. 09:59:41 — eight seconds later, no login line anywhere in
-	 * between, the same virtual connection, the same voice-chat handshake — a second load raises it again and
-	 * the client dies on TAB's scoreboard. Eight seconds is not a portal walk. The second load exists because
-	 * the game rebuilt the player ({@code PlayerList.respawn}) while the client was being handed the new
-	 * dimension, which is exactly what a finished move looks like from here.
-	 *
-	 * <h2>Why the obvious tests are wrong</h2>
-	 *
-	 * <p>"Waited a while" cannot be it: a player standing still for ten seconds in the nether would then get a
-	 * second join event, and one who jumps through a portal in three would still get one per move.
-	 *
-	 * <p>"The player object changed" cannot be it either: {@link ForbricPlayer#of} wraps on every call, so
-	 * every raise "changes" the player, the first join included.
-	 *
-	 * <h2>What a move actually does to the connection</h2>
-	 *
-	 * <p>Nothing — and that is the answer. The virtual connection outlives the move, so a load that arrives on
-	 * a live connection is a session starting on it; the first load of a session is one, and a load that only
-	 * finishes a move is riding on the same live connection. A connection that is no longer live cannot be
-	 * starting a session either: its load belongs to a torn-down listener, and nobody is left to receive it.
-	 *
-	 * <p>Asked of the listener rather than of the player's own flag, because the two disagree for exactly the
-	 * case that matters: a rebuilt player carries a connection the game has already shut down.
-	 *
-	 * <p>Fails towards one missing event, never towards a disconnect, and it keeps no state of its own — so
-	 * there is nothing to prune, and nothing that can go stale between two sessions.
+	 * <p>Concurrent because the join path is not always the server thread — a proxy may deliver the load
+	 * packet on a network thread, and this must not be the thing that throws inside it.
 	 */
-	static boolean connectionIsLive(net.minecraft.server.level.ServerPlayer player) {
-		net.minecraft.server.network.ServerGamePacketListenerImpl listener = player.connection;
-		// Asked of the underlying netty channel. `ServerGamePacketListenerImpl` has no liveness test of its
-		// own, and the player's flag answers a different question: a rebuilt player carries a listener the
-		// game has already shut down. A channel that is no longer active cannot be starting a session.
-		if (listener == null || listener.connection == null || !listener.connection.channel.isActive()) {
-			ForbricLog.info("[Forbric/Bukkit] %s is loading on a connection that is already closed"
-							+ " — a finished move between worlds does not raise PlayerJoinEvent again",
-							player.getScoreboardName());
-			return false;
-		}
-		return true;
+	private static final java.util.Set<java.util.UUID> SESSIONS =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	/**
+	 * Whether this load STARTS a session, recording it if so.
+	 *
+	 * <h2>Why the account, and not the objects</h2>
+	 *
+	 * <p>Everything else in this method's path is rebuilt by a move between worlds and survives nothing.
+	 * {@code ServerPlayer.teleport} to another dimension runs {@code PlayerList.respawn}, which builds a new
+	 * {@code ServerPlayer} <i>and</i> a new {@code ServerGamePacketListenerImpl}; the client, having just loaded
+	 * the new level, answers with another {@code ServerboundPlayerLoadedPacket}, so the join anchor is reached
+	 * a second time with a fresh per-listener flag. Neither the player object nor the listener identity can
+	 * answer "is this a new session", because both change on a move. The {@code UUID} does not.
+	 *
+	 * <h2>Why not the connection's liveness</h2>
+	 *
+	 * <p>That was the previous attempt, and it never refused anything: the connection outlives a move, so it
+	 * is still active when the second load arrives, and the guard let every move through. It also could not be
+	 * fixed in the other direction — a load that arrives on a dead connection is a torn-down listener nobody
+	 * can serve, which the per-listener flag already covers.
+	 *
+	 * <h2>Lifetime</h2>
+	 *
+	 * <p>One entry per account, added here and removed in {@link #playerLeft}. That method runs from the head
+	 * of {@code PlayerList.remove}, which the game calls on a real disconnect only — a move goes through
+	 * {@code respawn} and keeps the entry. A removal that this hook never saw (a crashed login, a plugin
+	 * refusing pre-login) leaves nothing behind either, because nothing was added.
+	 */
+	private static boolean beginSession(ServerPlayer player) {
+		return SESSIONS.add(player.getUUID());
+	}
+
+	/**
+	 * Ends the session this account held, so the next connection raises {@code PlayerJoinEvent} again.
+	 *
+	 * <p>Called from {@link #playerLeft}, i.e. from {@code PlayerList.remove}, which is the leave path and not
+	 * the move path. Left behind, the entry would suppress the join event of the player's NEXT connection for
+	 * the life of the server.
+	 */
+	private static void endSession(ServerPlayer player) {
+		SESSIONS.remove(player.getUUID());
 	}
 
 	/**

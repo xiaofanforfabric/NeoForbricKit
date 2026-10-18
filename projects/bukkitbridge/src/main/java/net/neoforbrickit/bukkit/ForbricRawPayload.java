@@ -63,6 +63,24 @@ public final class ForbricRawPayload implements CustomPacketPayload {
 	}
 
 	/**
+	 * A payload's body, copied out now so it can be read after the packet it came from is gone.
+	 *
+	 * <p>Used by the one path that holds a client message back instead of delivering it immediately (see
+	 * {@code ForbricMessageHook}): the payload object belongs to the packet being handled, and reading it on a
+	 * later pass would be reading something the game may already have released. The copy is of the body only —
+	 * the channel is an immutable {@link Identifier}, so it can be shared.
+	 *
+	 * @return a payload carrying the same channel and body, or null when the body cannot be read
+	 */
+	public static CustomPacketPayload copyOf(CustomPacketPayload payload) {
+		byte[] body = dataOf(payload);
+		if (body == null) {
+			return null;
+		}
+		return new ForbricRawPayload(payload.type().id(), body);
+	}
+
+	/**
 	 * The codec for one channel's payloads.
 	 *
 	 * <p>One codec per channel because the channel <em>is</em> the type: the protocol writes the

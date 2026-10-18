@@ -268,9 +268,18 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			// Already hooked. The guard may still be missing — an older build of this bridge, or a class
 			// assembled from a cached copy — and leaving it off is exactly the duplicate this class is about,
 			// so it is installed either way, and the flag field is only added when it is genuinely absent.
-			if (!guardPresent(target, existingHook)) {
+			boolean guarded = guardPresent(target, existingHook);
+			if (!guarded) {
 				installJoinOnceGuard(node, target, existingHook);
 			}
+			// Said out loud, and this is the branch that matters most for reading a log. A seam found
+			// already in place means ANOTHER copy of the processor rewrote this class first; the raise
+			// then happens through that copy's code, not this one's. An earlier issue thread read the
+			// silence here as "the seam was never installed" and went looking in the wrong place. The
+			// guard state is reported with it, because "hooked but unguarded" is a different bug.
+			ForbricLog.info("[NeoFobric/Bukkit] %s.%s already raises PlayerJoinEvent (guard %s)"
+							+ " — a second processor pass found it hooked and left it alone",
+							simpleName(node.name), JOIN_METHOD, guarded ? "present" : "installed now");
 			return ComputeFlags.NO_REWRITE;
 		}
 
@@ -433,9 +442,14 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		mark.add(new InsnNode(Opcodes.ICONST_1));
 		mark.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name, flag.name, flag.desc));
 		target.instructions.insert(hookCall, mark);
-		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent at most once per client load"
-						+ " — a re-threaded load packet does not raise it again",
-						simpleName(node.name), JOIN_METHOD);
+		// Said out loud, because the absence of a line in a previous run's log was read as "the seam is
+		// not installed" when the seam was in fact installed and had simply been rewritten by an earlier
+		// copy of this bridge in the same JVM. Two different reasons looked identical; only one of them
+		// leaves this line. The seam names the anchor it used, so a later change to the anchor shows up
+		// here rather than in a client crash report.
+		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent once per client load"
+						+ " — hooked before %s(), behind a per-listener flag",
+						simpleName(node.name), JOIN_METHOD, MARK_LOADED_NAME);
 	}
 
 	/**
@@ -470,6 +484,10 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			return ComputeFlags.NO_REWRITE;
 		}
 		if (alreadyInjected(target, QUIT_HOOK)) {
+			// Same reason as the join side: silence here once sent a reader after the wrong bug.
+			ForbricLog.info("[NeoFobric/Bukkit] %s.%s already raises PlayerQuitEvent"
+							+ " — a second processor pass found it hooked and left it alone",
+							simpleName(node.name), QUIT_METHOD);
 			return ComputeFlags.NO_REWRITE;
 		}
 		if (headIsBranchTarget(target)) {
@@ -550,6 +568,9 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 				}
 			}
 			if (!stale) {
+				ForbricLog.info("[NeoFobric/Bukkit] %s.%s already raises AsyncPlayerPreLoginEvent"
+								+ " — a second processor pass found it hooked and left it alone",
+								simpleName(node.name), PRE_LOGIN_METHOD);
 				return ComputeFlags.NO_REWRITE;
 			}
 			context.audit("neofobric:bukkit_player_events re-emitted " + PRE_LOGIN_HOOK

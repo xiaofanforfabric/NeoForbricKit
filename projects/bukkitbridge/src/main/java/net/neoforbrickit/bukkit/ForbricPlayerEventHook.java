@@ -74,12 +74,24 @@ public final class ForbricPlayerEventHook {
 				// FIRST event was delivered and the plugin acted on it; a second one makes the client throw the
 				// connection away over a duplicate objective name. The thread is logged because the raise is not
 				// always on the server thread, and which one it was is the first question a repeat asks.
+				traceRepeatRaise(player);
 				ForbricLog.info("[Forbric/Bukkit] %s already has a PlayerJoinEvent this session — no second one is"
 								+ " raised (thread=%s)", player.getScoreboardName(),
 								Thread.currentThread().getName());
 				return;
 			}
-			// Unconditional while the seam is being proven: the only other evidence an event fired is
+			// Counted before the raise, and traced when it is not the session's first: this branch is exactly
+			// the case the guard was supposed to prevent, so if it is ever taken the stack is the evidence.
+			if (countRaise(player) > 1) {
+				traceRepeatRaise(player);
+			}
+			// The claim was granted, so this raise goes out. Whether it is the FIRST of the session or a
+			// repeat the guard failed to catch is not answerable here — that is what the switch below is for:
+			// {@code traceRepeatRaise} prints a stack on a raise that follows one from the same session
+			// without an intervening leave, which is the only way to tell "a fresh join" from "the same join,
+			// raised twice" once the frequency has already been measured.
+			//
+			// Unconditional otherwise, while the seam is being proven: the only other evidence an event fired is
 			// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
 			// not evidence at all. One line per join is nothing next to what the game already logs.
 			ForbricLog.info("[Forbric/Bukkit] raising PlayerJoinEvent for %s",
@@ -88,9 +100,19 @@ public final class ForbricPlayerEventHook {
 			// what the reference server shows and what a plugin reading joinMessage() expects to see.
 			// Passed as a Component rather than a legacy string because the legacy constructor formats
 			// through ChatColor, and this bridge hands plugins Adventure text everywhere else.
-			server.getPluginManager().callEvent(
-							new org.bukkit.event.player.PlayerJoinEvent(bukkitPlayer,
-									net.kyori.adventure.text.Component.text(player.getScoreboardName())));
+			//
+			// The window published around the call is what lets a reply the client sends DURING this handler
+			// wait for it to finish, instead of completing the plugin's handshake half way through a join
+			// the game has not acknowledged yet. Removed in a finally: a listener that throws must not leave
+			// the account looking permanently half-joined.
+			JOIN_IN_FLIGHT.add(player.getUUID());
+			try {
+				server.getPluginManager().callEvent(
+								new org.bukkit.event.player.PlayerJoinEvent(bukkitPlayer,
+										net.kyori.adventure.text.Component.text(player.getScoreboardName())));
+			} finally {
+				JOIN_IN_FLIGHT.remove(player.getUUID());
+			}
 		} catch (Throwable failure) {
 			// Reported and swallowed, never rethrown: this runs inside the client's own load packet,
 			// where an escaping exception would be attributed to the connection and could disconnect
@@ -208,6 +230,39 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
+	 * The players whose join event is being delivered right now, so the packet in flight is not counted.
+	 *
+	 * <p>See {@link #isJoining} and the channel seam (`ForbricMessageHook`): the client cannot have
+	 * answered a question that was asked after this raise began, so a reply that arrives while the raise is
+	 * still running is not a reply to it.
+	 */
+	private static final java.util.Set<java.util.UUID> JOIN_IN_FLIGHT =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	/**
+	 * Whether {@code player}'s {@code PlayerJoinEvent} is on the stack of some thread at this moment.
+	 *
+	 * <h2>Why the bridge has to know this at all</h2>
+	 *
+	 * <p>A plugin that talks to its own client mod asks a question on join and waits for the answer: Simple
+	 * Voice Chat creates a verification code in its join handler, tells the client to prove itself, and only
+	 * moves the player out of {@code disconnected} when the reply arrives. The reply is a plugin message.
+	 *
+	 * <p>So "the client answered" and "the join handler has finished" are two different moments, and the
+	 * answer can be in the game's hands <i>while the handler is still running</i> — ProtocolLib's reply to
+	 * the very handshake packet is the case in this issue's log: it is a {@code PLAY} packet, the loader's
+	 * join event fires before the client's screen is ready, and the mod answers immediately. Delivering that
+	 * answer inside the raise lets the plugin complete its handshake <i>while the server still thinks the
+	 * client is loading</i>, which is a state the game never produces by itself.
+	 *
+	 * <p>The channel seam asks this question, and holds the packet until it can answer no. Nothing else
+	 * changes: the packet is delivered, only not in the middle of the event that caused it.
+	 */
+	public static boolean isJoining(ServerPlayer player) {
+		return player != null && JOIN_IN_FLIGHT.contains(player.getUUID());
+	}
+
+	/**
 	 * The accounts that have an open session, i.e. have had a {@code PlayerJoinEvent} since their last leave.
 	 *
 	 * <p>Concurrent because the raise does not always happen on the server thread — a proxy or a re-threaded
@@ -262,6 +317,72 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
+	 * The sessions a raise has already gone out for, kept separately so a REPEAT can still be recognised.
+	 *
+	 * <p>{@link #SESSIONS} cannot answer it: a raise that happened at all leaves the entry behind, so "is it
+	 * there" means "ever raised", not "raised twice". This book counts raises per open session and is cleared
+	 * on the same leave path, which makes the second count the thing worth tracing.
+	 */
+	private static final java.util.Map<java.util.UUID, Integer> RAISES_PER_SESSION =
+			new java.util.concurrent.ConcurrentHashMap<>();
+
+	/** Counts one raise for this account's open session; returns how many that session has now had. */
+	private static int countRaise(ServerPlayer player) {
+		return RAISES_PER_SESSION.merge(player.getUUID(), 1, Integer::sum);
+	}
+
+	/**
+	 * Whether the join path should print WHO raised it, for the next reproduction of a duplicate.
+	 *
+	 * <h2>Why a switch, and why default off</h2>
+	 *
+	 * <p>Every guard written for this issue so far decided a question about the raise and got it wrong,
+	 * because the trigger was never identified — only its frequency measured. What the reports could not
+	 * answer is which code path raises the second one: a teleport, a client load packet, a plugin asking for
+	 * a re-join, or the bridge's own dispatch running twice. A stack trace answers that in one run, and it
+	 * is the same trace in every run, so it does not need to be on by default.
+	 *
+	 * <p>Off unless asked: {@code -Dneofobric.joinTrace=on} (or {@code 1}/{@code true}). A stack trace per
+	 * join on a busy server is a lot of log for something a single reproduction settles.
+	 *
+	 * <h2>Once per account, on the SECOND raise only</h2>
+	 *
+	 * <p>The first raise of a session is expected and printing it would bury the interesting one. The
+	 * second is the bug. One per account keeps the switch usable on a server that keeps being tested.
+	 */
+	private static final boolean JOIN_TRACE = traceEnabled();
+
+	private static boolean traceEnabled() {
+		String value = System.getProperty("neofobric.joinTrace", "off");
+		return "on".equalsIgnoreCase(value) || "1".equals(value) || "true".equalsIgnoreCase(value);
+	}
+
+	/** Accounts whose second raise has already been traced, so the switch stays readable. */
+	private static final java.util.Set<java.util.UUID> TRACED =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	/**
+	 * Prints the stack of a raise that was NOT the first of its session.
+	 *
+	 * <p>The frame people need is a few levels up: this method, {@link #playerJoined}, the injected call
+	 * site, and then whichever of the game's own paths reached it. Nothing here interprets the trace — the
+	 * point of the switch is that the reading is done against a real one instead of a hypothesis.
+	 *
+	 * <p>Called from both sides of the guard on purpose. The suppressed raise is the one the guard caught; the
+	 * admitted repeat is the one it missed, which is the only one that can actually reach a client and is
+	 * therefore the only one worth chasing. A report of "still kicked" is a claim that the second happened.
+	 */
+	private static void traceRepeatRaise(ServerPlayer player) {
+		if (!JOIN_TRACE || !TRACED.add(player.getUUID())) {
+			return;
+		}
+		ForbricLog.info("[Forbric/Bukkit] a second PlayerJoinEvent was reached for %s;"
+						+ " the stack below says from where (thread=%s)",
+						player.getScoreboardName(), Thread.currentThread().getName());
+		new Throwable("second PlayerJoinEvent for " + player.getScoreboardName()).printStackTrace();
+	}
+
+	/**
 	 * Ends the session this account held, so the next connection raises {@code PlayerJoinEvent} at once.
 	 *
 	 * <p>Called from {@link #playerLeft}, i.e. from {@code PlayerList.remove}, which is the leave path and not
@@ -269,6 +390,12 @@ public final class ForbricPlayerEventHook {
 	 */
 	private static void endSession(ServerPlayer player) {
 		SESSIONS.remove(player.getUUID());
+		RAISES_PER_SESSION.remove(player.getUUID());
+		TRACED.remove(player.getUUID());
+		// A quit arriving while the join event is still on the stack (a listener that disconnects the player)
+		// would otherwise leave the in-flight mark behind, and every later payload from that account would be
+		// held for a join that has already ended.
+		JOIN_IN_FLIGHT.remove(player.getUUID());
 	}
 
 	/**
@@ -280,6 +407,9 @@ public final class ForbricPlayerEventHook {
 	 */
 	public static void forgetAccounts() {
 		SESSIONS.clear();
+		RAISES_PER_SESSION.clear();
+		JOIN_IN_FLIGHT.clear();
+		TRACED.clear();
 	}
 
 	/**

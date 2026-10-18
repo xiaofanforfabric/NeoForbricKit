@@ -50,11 +50,11 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Raised once per SESSION, and a session is the account, not the objects. The per-listener flag
-	 * ({@code BukkitPlayerEventInjector#installJoinOnceGuard}) stops one client load raising twice, because
-	 * its packet is entered on the network thread and again on the server thread. {@link #beginSession}
-	 * stops a MOVE between worlds raising at all, because a move builds a new player and a new listener and
-	 * reaches the same anchor a second time.
+	 * <p>Raised once per JOIN, and a join is the account plus a window of time, not a set of objects. The
+	 * per-listener flag ({@code BukkitPlayerEventInjector#installJoinOnceGuard}) stops one client load raising
+	 * twice, because its packet is entered on the network thread and again on the server thread.
+	 * {@link #joinClaim} stops a MOVE between worlds raising again, because a move builds a new player and a new
+	 * listener and reaches the same anchor a second time — see {@link #SAME_JOIN_WINDOW_NANOS}.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {
@@ -68,11 +68,11 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
-			if (!beginSession(player)) {
-				// A move between worlds rebuilds the player AND the listener, so the packet that finishes the
-				// move reaches this hook on a listener that has never raised anything. The answer is the
-				// ACCOUNT, not the object: this session already had its join, and TAB would build a second
-				// scoreboard for it.
+			if (!joinClaim(player)) {
+				// The same join, asked for twice. Which is not hypothetical: the anchor is reached again from
+				// PlayerList.respawn moments after the first raise, and TAB rebuilds its scoreboard each time.
+				// The FIRST event was delivered and the plugin did act on it; this one is the copy that would
+				// make the client throw away a connection over a duplicate objective name.
 				ForbricLog.info("[Forbric/Bukkit] %s is finishing a move between worlds"
 								+ " — the session already had its PlayerJoinEvent, so none is raised",
 								player.getScoreboardName());
@@ -207,53 +207,88 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
-	 * The accounts whose session has raised {@code PlayerJoinEvent} and has not been removed yet.
+	 * How long after a raise an identical load for the same account is the same join.
 	 *
-	 * <p>Keyed by {@code UUID} because that is what the game identifies a connection with; a name is what a
-	 * plugin shows, and an offline-mode server can serve the same one to a stranger.
+	 * <p>This is the whole reason the guard is not "once per session, full stop". One join reaches the anchor
+	 * more than once in the log behind this issue: 06:05:15.8, 06:05:20.7, 06:06:00.2 — three raises, all
+	 * inside 45 seconds, and the account stayed connected until the client died on the third. The client had
+	 * already accepted the FIRST scoreboard, so any later {@code set_objective} for the same objective name is
+	 * fatal to it — "later" is the only thing that matters here, not "second".
 	 *
-	 * <p>Concurrent because the join path is not always the server thread — a proxy may deliver the load
-	 * packet on a network thread, and this must not be the thing that throws inside it.
+	 * <p>So the repeats are dropped and the first is kept, which is also what the reference server does for one
+	 * join. A boolean on the account instead would refuse a reconnect that happened inside the window — the
+	 * one case where a plugin genuinely needs the event — so the window is short on purpose: nothing in a
+	 * genuine rejoin (disconnect, login, configuration, terrain load) completes in it, and the reconnects in
+	 * the log took 14 s.
 	 */
-	private static final java.util.Set<java.util.UUID> SESSIONS =
-			java.util.concurrent.ConcurrentHashMap.newKeySet();
+	private static final long SAME_JOIN_WINDOW_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
 
 	/**
-	 * Whether this load STARTS a session, recording it if so.
+	 * Each account's {@code PlayerJoinEvent}: when it was raised, and how many raises were seen then.
 	 *
-	 * <h2>Why the account, and not the objects</h2>
+	 * <p>Both halves in one value so the decision has one atomic step — two lookups would let two threads see
+	 * the same {@code Claim} and both call themselves the first.
 	 *
-	 * <p>Everything else in this method's path is rebuilt by a move between worlds and survives nothing.
-	 * {@code ServerPlayer.teleport} to another dimension runs {@code PlayerList.respawn}, which builds a new
-	 * {@code ServerPlayer} <i>and</i> a new {@code ServerGamePacketListenerImpl}; the client, having just loaded
-	 * the new level, answers with another {@code ServerboundPlayerLoadedPacket}, so the join anchor is reached
-	 * a second time with a fresh per-listener flag. Neither the player object nor the listener identity can
-	 * answer "is this a new session", because both change on a move. The {@code UUID} does not.
-	 *
-	 * <h2>Why not the connection's liveness</h2>
-	 *
-	 * <p>That was the previous attempt, and it never refused anything: the connection outlives a move, so it
-	 * is still active when the second load arrives, and the guard let every move through. It also could not be
-	 * fixed in the other direction — a load that arrives on a dead connection is a torn-down listener nobody
-	 * can serve, which the per-listener flag already covers.
-	 *
-	 * <h2>Lifetime</h2>
-	 *
-	 * <p>One entry per account, added here and removed in {@link #playerLeft}. That method runs from the head
-	 * of {@code PlayerList.remove}, which the game calls on a real disconnect only — a move goes through
-	 * {@code respawn} and keeps the entry. A removal that this hook never saw (a crashed login, a plugin
-	 * refusing pre-login) leaves nothing behind either, because nothing was added.
+	 * <p>Concurrent because the join path is not always the server thread — a proxy may deliver the load
+	 * packet on a network thread — and this must not be the thing that throws inside it.
 	 */
-	private static boolean beginSession(ServerPlayer player) {
-		return SESSIONS.add(player.getUUID());
+	private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, Claim> SESSIONS =
+			new java.util.concurrent.ConcurrentHashMap<>();
+
+	/** See {@link #SESSIONS}: when the window opened, and the raise count it opened at. */
+	private record Claim(long raisedAtNanos, int seenAtRaise) {
 	}
 
 	/**
-	 * Ends the session this account held, so the next connection raises {@code PlayerJoinEvent} again.
+	 * Whether this load should RAISE {@code PlayerJoinEvent}.
+	 *
+	 * <h2>Why the account, and not the objects</h2>
+	 *
+	 * <p>Everything else on this path is rebuilt by a move between worlds and survives nothing.
+	 * {@code ServerPlayer.teleport} to another dimension runs {@code PlayerList.respawn}, which builds a new
+	 * {@code ServerPlayer} <i>and</i> a new {@code ServerGamePacketListenerImpl}, so neither the player object nor
+	 * the listener can answer "is this the same join". The {@code UUID} can.
+	 *
+	 * <h2>Why not "once per session"</h2>
+	 *
+	 * <p>That was the previous attempt, and this log refuses it: the raise the client dies on comes 39.5 s
+	 * after the join that opened the session, with no {@code PlayerList.remove} in between (the player was
+	 * still in the world, voice chat connected, and left minutes later). An account-wide {@code Set.add} would
+	 * answer "already had one" to a load that may well be a new client session, and it is exactly that guess
+	 * about the customer's action that was wrong. See {@link #SAME_JOIN_WINDOW_NANOS}.
+	 *
+	 * <h2>Why not the connection's liveness</h2>
+	 *
+	 * <p>The attempt before that, and it never refused anything: the connection outlives a move, so it is still
+	 * active when the second load arrives.
+	 *
+	 * <h2>Lifetime</h2>
+	 *
+	 * <p>One entry per account, added here and removed in {@link #playerLeft}. That method runs from the head of
+	 * {@code PlayerList.remove}, which the game calls on a real disconnect only — a move goes through
+	 * {@code respawn} and keeps the entry. The timestamp is the backstop for a leave this hook never sees.
+	 */
+	private static boolean joinClaim(ServerPlayer player) {
+		java.util.UUID account = player.getUUID();
+		long now = System.nanoTime();
+		// Atomic per account, because the decision is "is this a repeat" and the answer must not depend on two
+		// threads reading the same Claim and both deciding differently. compute() also prunes on the way in: a
+		// claim older than the window is not a claim at all.
+		Claim claim = SESSIONS.compute(account, (uuid, current) -> current == null
+					|| now - current.raisedAtNanos() > SAME_JOIN_WINDOW_NANOS
+					? new Claim(now, 1)
+					: new Claim(current.raisedAtNanos(), current.seenAtRaise() + 1));
+		// Raised exactly when this call is the one that opened the window.
+		return claim.seenAtRaise() == 1;
+	}
+
+	/**
+	 * Ends the session this account held, so the next connection raises {@code PlayerJoinEvent} at once.
 	 *
 	 * <p>Called from {@link #playerLeft}, i.e. from {@code PlayerList.remove}, which is the leave path and not
-	 * the move path. Left behind, the entry would suppress the join event of the player's NEXT connection for
-	 * the life of the server.
+	 * the move path. Left behind, the entry would suppress the first raise of the player's NEXT connection for
+	 * {@link #SAME_JOIN_WINDOW_NANOS} — which is why it is removed eagerly rather than waiting for the
+	 * timestamp to age out.
 	 */
 	private static void endSession(ServerPlayer player) {
 		SESSIONS.remove(player.getUUID());

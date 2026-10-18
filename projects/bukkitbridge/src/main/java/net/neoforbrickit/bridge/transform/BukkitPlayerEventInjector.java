@@ -103,8 +103,9 @@ import org.objectweb.asm.tree.VarInsnNode;
  * flag starts false on a listener nobody has seen before, and the anchor is reached on a session
  * that already had its join event — the client died on {@code 'TAB-Scoreboard'} again, on a server
  * whose startup log carried the line below. The flag therefore only stops one client load raising
- * twice; whether the load is a NEW session is decided in
- * {@code ForbricPlayerEventHook#joinClaim}, by the account's UUID and a short window.
+ * twice; whether the account already had its event this session is decided in
+ * {@code ForbricPlayerEventHook#joinClaim}, by the account's UUID, and cleared only by
+ * {@code PlayerList.remove} — the quit hook below.
  *
  * <p>{@code PlayerList.remove} takes the player as its only argument, so no field is needed there.
  * It has no equivalent double-entry, because it is called by the game itself rather than from a

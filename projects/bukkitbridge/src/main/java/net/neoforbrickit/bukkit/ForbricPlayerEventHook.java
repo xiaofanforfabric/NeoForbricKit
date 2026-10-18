@@ -49,9 +49,11 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Idempotence is not enforced here: the injected call sits at the head of a method the client
-	 * sends once. A repeated join packet would raise a second event, which is what a reference
-	 * server does too.
+	 * <p>Raised once per client load, which is what makes it once per session: the injected call site is
+	 * guarded by a flag the processor puts on the listener itself, so the extra
+	 * {@code ServerboundPlayerLoadedPacket} a dimension change produces — a fresh listener, and a client that
+	 * legitimately finished loading terrain again — does not raise a second {@code PlayerJoinEvent}. See
+	 * {@code BukkitPlayerEventInjector#installJoinOnceGuard} for why the flag belongs to the listener.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {

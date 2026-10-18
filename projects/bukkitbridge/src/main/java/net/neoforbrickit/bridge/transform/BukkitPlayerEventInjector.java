@@ -21,6 +21,7 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LookupSwitchInsnNode;
@@ -48,13 +49,18 @@ import org.objectweb.asm.tree.VarInsnNode;
  *   <caption>Injections</caption>
  *   <tr><th>Class</th><th>Method</th><th>Raised</th><th>A miss means</th></tr>
  *   <tr><td>{@code ServerGamePacketListenerImpl}</td>
- *       <td>{@code handleAcceptPlayerLoad}, before its {@code markClientLoaded()} call</td>
- *       <td>{@code PlayerJoinEvent}</td>
+ *       <td>{@code handleAcceptPlayerLoad}, before its {@code markClientLoaded()} call, behind a
+ *           {@code boolean} field this processor adds to the class</td>
+ *       <td>{@code PlayerJoinEvent}, once per listener</td>
  *       <td>no plugin ever hears that a player arrived</td></tr>
  *   <tr><td>{@code PlayerList}</td>
  *       <td>{@code remove}</td>
  *       <td>{@code PlayerQuitEvent}</td>
  *       <td>no plugin ever hears that a player left, so per-player state leaks</td></tr>
+ *   <tr><td>{@code PlayerList}</td>
+ *       <td>{@code placeNewPlayer}</td>
+ *       <td>{@code AsyncPlayerPreLoginEvent}</td>
+ *       <td>a permission plugin never learns the player exists, so every check answers from defaults</td></tr>
  * </table>
  *
  * <h2>Why the join hook is here and not in {@code placeNewPlayer}</h2>
@@ -77,8 +83,20 @@ import org.objectweb.asm.tree.VarInsnNode;
  * {@code set_objective} packet twice and died with
  * {@code An objective with the name 'TAB-PlayerList' already exists!}.
  *
- * <p>Anchoring to {@code markClientLoaded} makes the raise once-per-join without this bridge
- * keeping any state, and a missing anchor is reported rather than silently falling back.
+ * <p>A missing anchor is reported rather than silently falling back to the entry.
+ *
+ * <h2>Why the raise is guarded, and by what</h2>
+ *
+ * <p>Anchoring was not the whole answer. Crossing the END portal teleports the player through
+ * {@code PlayerList.respawn} → {@code placeNewPlayer}, which builds a NEW listener; the client, having
+ * just loaded that new level, answers with another {@code ServerboundPlayerLoadedPacket}, so the
+ * anchor is reached again and {@code PlayerJoinEvent} fires twice in one session. Same client-side
+ * death, a different objective name: {@code An objective with the name 'TAB-Scoreboard' already
+ * exists!}.
+ *
+ * <p>So the hook is preceded by a {@code boolean} field added to the listener: {@code if (this.f)
+ * return; this.f = true;}. A listener lives exactly one client load, so the flag's lifetime is the
+ * lifetime of the thing being counted, and nothing has to be pruned on quit.
  *
  * <p>{@code PlayerList.remove} takes the player as its only argument, so no field is needed there.
  * It has no equivalent double-entry, because it is called by the game itself rather than from a
@@ -127,6 +145,20 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	static final String MARK_LOADED_OWNER = "net/minecraft/server/network/ServerGamePacketListenerImpl";
 	static final String MARK_LOADED_NAME = "markClientLoaded";
 	static final String MARK_LOADED_DESC = "()V";
+
+	/**
+	 * The {@code boolean} this processor adds to the listener, and where its name comes from.
+	 *
+	 * <p>Declared by field name only: adding it is a {@link FieldNode}, and both references to it are emitted
+	 * as text, so nothing here loads a {@code net.minecraft.*} type.
+	 *
+	 * <p>On the LISTENER, not on the bridge, and not on the player: a listener object is built per client load
+	 * — {@code PlayerList.respawn} hands the new player a fresh one — while the player a plugin sees survives a
+	 * dimension change. The listener's lifetime is exactly "one client load", which is what the guard counts, so
+	 * the state is collected with the object and nothing has to be pruned on quit.
+	 */
+	static final String JOINED_FIELD = "neofobric$joinEventRaised";
+	static final String FLAG_DESC = "Z";
 
 	/** The leave point's class and method. */
 	static final String PLAYER_LIST_DOT = "net.minecraft.server.players.PlayerList";
@@ -222,7 +254,14 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 					+ ": no ServerPlayer field to read the joining player from");
 			return ComputeFlags.NO_REWRITE;
 		}
-		if (alreadyInjected(target, JOIN_HOOK)) {
+		MethodInsnNode existingHook = hookCallIn(target);
+		if (existingHook != null) {
+			// Already hooked. The guard may still be missing — an older build of this bridge, or a class
+			// assembled from a cached copy — and leaving it off is exactly the duplicate this class is about,
+			// so it is installed either way, and the flag field is only added when it is genuinely absent.
+			if (!guardPresent(target, existingHook)) {
+				installJoinOnceGuard(node, target, existingHook);
+			}
 			return ComputeFlags.NO_REWRITE;
 		}
 
@@ -238,16 +277,131 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			return ComputeFlags.NO_REWRITE;
 		}
 
+		MethodInsnNode hookCall = new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, JOIN_HOOK, hookDesc(), false);
 		InsnList code = new InsnList();
 		code.add(new VarInsnNode(Opcodes.ALOAD, 0));
 		code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, player.name, player.desc));
-		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, JOIN_HOOK, hookDesc(), false));
+		code.add(hookCall);
 		target.instructions.insertBefore(anchor, code);
 
-		ForbricLog.info("[NeoFobric/Bukkit] %s raises PlayerJoinEvent from %s"
-						+ " — a plugin's listener hears that a player arrived, once per join",
-						simpleName(node.name), JOIN_METHOD);
+		// Anchoring to markClientLoaded was right and is still not enough. Crossing the END portal runs
+		// ServerPlayer.teleport -> PlayerList.respawn -> placeNewPlayer, which builds a NEW listener; the
+		// client, fresh out of loading the new level, answers with another ServerboundPlayerLoadedPacket, and
+		// that packet reaches the anchor again on a listener whose hook has never run. So the raise is guarded
+		// per listener object -- see installJoinOnceGuard, which also logs the seam as armed.
+		installJoinOnceGuard(node, target, hookCall);
 		return ComputeFlags.COMPUTE_FRAMES;
+	}
+
+	/**
+	 * The {@code playerJoined} call already in this method, or null.
+	 *
+	 * <p>Separate from {@link #alreadyInjected} because the caller needs the INSTRUCTION, not just a yes —
+	 * the guard goes in front of it. Matched by owner and name only: {@code hookDesc()} is the only signature
+	 * this class ever emits for it.
+	 */
+	private static MethodInsnNode hookCallIn(MethodNode target) {
+		for (AbstractInsnNode instruction : target.instructions) {
+			if (instruction instanceof MethodInsnNode call
+					&& call.owner.equals(HOOK_OWNER) && call.name.equals(JOIN_HOOK)) {
+				return call;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Whether the guard is already in front of this hook call.
+	 *
+	 * <p>Walked backwards over the guard's own instructions — {@code PUTFIELD, ICONST_1, ALOAD 0} precede the
+	 * call, and the {@code IFEQ} before those is the test — rather than looking for an {@code IFEQ} anywhere
+	 * nearby, which would find the hook inside some unrelated vanilla branch and conclude the guard was there.
+	 */
+	private static boolean guardPresent(MethodNode target, AbstractInsnNode hookCall) {
+		AbstractInsnNode at = hookCall.getPrevious();
+		int putfield = 0;
+		int iconst = 0;
+		int aload = 0;
+		while (at != null && (putfield < 1 || iconst < 1 || aload < 1)) {
+			int opcode = at.getOpcode();
+			if (opcode == Opcodes.PUTFIELD && at instanceof FieldInsnNode field
+					&& field.name.equals(JOINED_FIELD)) {
+				putfield++;
+			} else if (opcode == Opcodes.ICONST_1) {
+				iconst++;
+			} else if (opcode == Opcodes.ALOAD && at instanceof VarInsnNode variable
+					&& variable.var == 0) {
+				aload++;
+			} else {
+				return false;
+			}
+			at = at.getPrevious();
+		}
+		while (at != null && at.getOpcode() < 0) {
+			at = at.getPrevious(); // labels and line numbers
+		}
+		return at != null && at.getOpcode() == Opcodes.IFEQ;
+	}
+
+	/**
+	 * Makes the join hook fire once per LISTENER, so one client load raises one {@code PlayerJoinEvent}.
+	 *
+	 * <h2>What actually went wrong on the END portal</h2>
+	 *
+	 * <p>Crossing to the END is {@code ServerPlayer.teleport} → {@code PlayerList.respawn} →
+	 * {@code placeNewPlayer}: a new level AND a new listener, and the client — which has just loaded a new
+	 * world — answers with another {@code ServerboundPlayerLoadedPacket}. That packet runs
+	 * {@code handleAcceptPlayerLoad} on the fresh listener, reaching the anchor added by {@code fc3eb7697} a
+	 * second time, and {@code PlayerJoinEvent} fires again for what the player did once. TAB builds a
+	 * scoreboard objective per raise, so the client received {@code set_objective} twice and died with
+	 * {@code An objective with the name 'TAB-Scoreboard' already exists!} — the same shape as the
+	 * {@code TAB-PlayerList} duplicate that commit fixed, one layer down: that one stopped a packet being
+	 * ENTERED twice, this one stops a second packet being SENT.
+	 *
+	 * <h2>Why the flag lives on the listener</h2>
+	 *
+	 * <p>Because the lifetime that matters is the listener's: one is built per client load, so a fresh one
+	 * legitimately starts false, and the state disappears with the object. A set of UUIDs in the bridge would
+	 * have to be pruned on quit — and a bug in that pruning is a player who silently never receives another
+	 * {@code PlayerJoinEvent}.
+	 *
+	 * <p>The field is added by this processor, and every instruction referring to it is emitted from text
+	 * (the field's own name, and {@code Z}), so this layer still names no {@code net.minecraft.*} type as a
+	 * class literal. The guard sees to its own flag being on the class, so a class that already carries the
+	 * hook from an earlier build gets the guard too rather than being left as it was.
+	 */
+	private void installJoinOnceGuard(ClassNode node, MethodNode target, AbstractInsnNode hookCall) {
+		FieldNode flag = null;
+		for (FieldNode candidate : node.fields) {
+			if (candidate.name.equals(JOINED_FIELD)) {
+				flag = candidate;
+				break;
+			}
+		}
+		if (flag == null) {
+			flag = new FieldNode(Opcodes.ACC_PRIVATE, JOINED_FIELD, FLAG_DESC, null, null);
+			node.fields.add(flag);
+		}
+
+		// In front of the hook call: `if (this.<flag>) return;` then `this.<flag> = true;`.
+		//
+		// The early RETURN is safe even though this sits mid-method: between here and markClientLoaded() there
+		// is nothing but the hook, and markClientLoaded() is exactly what the pass that set the flag has
+		// already done.
+		LabelNode raise = new LabelNode();
+		InsnList guard = new InsnList();
+		guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+		guard.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, flag.name, flag.desc));
+		guard.add(new JumpInsnNode(Opcodes.IFEQ, raise));
+		guard.add(new InsnNode(Opcodes.RETURN));
+		guard.add(raise);
+		guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+		guard.add(new InsnNode(Opcodes.ICONST_1));
+		guard.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name, flag.name, flag.desc));
+		target.instructions.insertBefore(hookCall, guard);
+		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent once per client load"
+						+ " — a dimension change does not raise it again",
+						simpleName(node.name), JOIN_METHOD);
 	}
 
 	/**

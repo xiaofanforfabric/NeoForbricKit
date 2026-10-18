@@ -1682,7 +1682,11 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public java.nio.file.Path getWorldPath() {
-		throw notYet("getWorldPath");
+           // The dimension's own folder -- the same answer getWorldFolder gives, as a Path.
+           //
+           // Bukkit declares both, and a plugin may reach for either; answering one and refusing the other
+           // makes it look like the world has no save while the folder is right there.
+           return getWorldFolder().toPath();
 	}
 
 	@Override
@@ -2001,8 +2005,50 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	}
 
 	@Override
+	public java.io.File getWorldFolder() {
+		// The save folder a map or backup plugin walks to find `region/*.mca`.
+		//
+		// In Bukkit that is one folder per world -- `<container>/world/`, `<container>/world/DIM-1/` -- because
+		// a Bukkit world is a self-contained save. This game instead keeps one save root (`level-name`) and puts
+		// every dimension inside it, the overworld included:
+		//
+		//   <server>/world/level.dat                              <- the save root, shared by all dimensions
+		//   <server>/world/dimensions/minecraft/overworld/region/  <- the overworld's own chunks
+		//   <server>/world/dimensions/minecraft/the_nether/region/
+		//   <server>/world/dimensions/<namespace>/<path>/region/   <- a datapack dimension
+		//
+		// So the answer is NOT the save root: that folder holds `level.dat` and `dimensions`, no `region`, and a
+		// map plugin given it renders nothing. Every dimension, overworld included, lives one level deeper.
+		//
+		// A legacy pre-1.16 save has no `dimensions` folder, and there the overworld really is `<root>/` with a
+		// sibling `DIM-1`/`DIM1` -- keep answering that layout, so an old world still renders instead of
+		// silently producing an empty map.
+		java.nio.file.Path worldRoot = level.getServer().getWorldPath(
+				net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
+		net.minecraft.resources.Identifier id = level.dimension().identifier();
+		java.nio.file.Path modern = worldRoot.resolve("dimensions")
+				.resolve(id.getNamespace()).resolve(id.getPath());
+		if (java.nio.file.Files.isDirectory(modern)) {
+			return modern.toFile();
+		}
+		// Legacy layout: `<root>/region` for the overworld, `<root>/DIM-1` and `<root>/DIM1` for the rest.
+		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD) {
+			return worldRoot.toFile();
+		}
+		return modern.toFile();
+	}
+
+	@Override
 	public org.bukkit.NamespacedKey getKey() {
-		throw notYet("getKey");
+           // The world's own registry key — `minecraft:overworld`, `minecraft:the_nether`, or whatever a
+           // datapack named a custom dimension.
+           //
+           // Read from the level's dimension key rather than derived from its folder name: a Bukkit world name
+           // is a local label a server owner chooses (`world`, `world_nether`), while the key is what the game
+           // and every datapack use to address the dimension. A map plugin storing "which dimension is this"
+           // needs the second, and the two disagree as soon as anyone renames a folder.
+           net.minecraft.resources.Identifier id = level.dimension().identifier();
+           return new org.bukkit.NamespacedKey(id.getNamespace(), id.getPath());
 	}
 
 	@Override

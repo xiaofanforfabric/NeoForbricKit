@@ -230,8 +230,11 @@ public final class ForbricPlayerEventHook {
 	 * there is nothing to prune, and nothing that can go stale between two sessions.
 	 */
 	static boolean connectionIsLive(net.minecraft.server.level.ServerPlayer player) {
-		net.minecraft.server.network.ServerGamePacketListenerImpl connection = player.connection;
-		if (connection == null || connection.isDisconnected()) {
+		net.minecraft.server.network.ServerGamePacketListenerImpl listener = player.connection;
+		// Asked of the underlying netty channel. `ServerGamePacketListenerImpl` has no liveness test of its
+		// own, and the player's flag answers a different question: a rebuilt player carries a listener the
+		// game has already shut down. A channel that is no longer active cannot be starting a session.
+		if (listener == null || listener.connection == null || !listener.connection.channel.isActive()) {
 			ForbricLog.info("[Forbric/Bukkit] %s is loading on a connection that is already closed"
 							+ " — a finished move between worlds does not raise PlayerJoinEvent again",
 							player.getScoreboardName());

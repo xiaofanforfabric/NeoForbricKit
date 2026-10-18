@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
+import java.util.List;
 
 import io.papermc.paper.plugin.configuration.PluginMeta;
 import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
@@ -65,17 +66,33 @@ final class PluginClassLoader extends URLClassLoader implements ConfiguredPlugin
 	private final PluginFields fields;
 
 	/**
-	 * @param jar    the plugin's own jar, used as this loader's code source
-	 * @param parent the loader that carries the Bukkit API and the game — every plugin shares it, which is what
-	 *               lets one plugin's types and another's be the same types
-	 * @param meta   the plugin's description, answered from {@link #getConfiguration()}
-	 * @param fields the values {@code getLogger()}, {@code getServer()} and friends must answer with
+	 * @param jar        the plugin's own jar, used as this loader's code source
+	 * @param parent     the loader that carries the Bukkit API and the game — every plugin shares it, which is
+	 *                   what lets one plugin's types and another's be the same types
+	 * @param meta       the plugin's description, answered from {@link #getConfiguration()}
+	 * @param fields     the values {@code getLogger()}, {@code getServer()} and friends must answer with
+	 * @param libraries  jars the plugin declared under {@code libraries:} in its own {@code plugin.yml}, already
+	 *                   on disk. They are on THIS loader rather than a shared one because two plugins may ask
+	 *                   for different versions of the same artifact; see {@link ForbricPluginLibraries}.
 	 */
-	PluginClassLoader(Path jar, ClassLoader parent, PluginMeta meta, PluginFields fields) throws IOException {
-		super(new URL[] {jar.toUri().toURL()}, parent);
+	PluginClassLoader(Path jar, ClassLoader parent, PluginMeta meta, PluginFields fields, List<Path> libraries)
+			throws IOException {
+		super(urlsOf(jar, libraries), parent);
 		this.jar = jar;
 		this.meta = meta;
 		this.fields = fields;
+	}
+
+	/** The plugin's own jar first, then its declared libraries in order: its own classes always win. */
+	private static URL[] urlsOf(Path jar, List<Path> libraries) throws IOException {
+		java.util.List<URL> urls = new java.util.ArrayList<>(1 + (libraries == null ? 0 : libraries.size()));
+		urls.add(jar.toUri().toURL());
+		if (libraries != null) {
+			for (Path library : libraries) {
+				urls.add(library.toUri().toURL());
+			}
+		}
+		return urls.toArray(new URL[0]);
 	}
 
 	@Override

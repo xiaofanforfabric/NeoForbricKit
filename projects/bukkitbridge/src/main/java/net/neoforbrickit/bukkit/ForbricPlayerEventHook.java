@@ -3,6 +3,7 @@
  */
 package net.neoforbrickit.bukkit;
 
+import net.minecraft.network.Connection;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforbrickit.bridge.util.ForbricLog;
 
@@ -49,11 +50,10 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Raised once per client load, which is what makes it once per session: the injected call site is
-	 * guarded by a flag the processor puts on the listener itself, so the extra
-	 * {@code ServerboundPlayerLoadedPacket} a dimension change produces — a fresh listener, and a client that
-	 * legitimately finished loading terrain again — does not raise a second {@code PlayerJoinEvent}. See
-	 * {@code BukkitPlayerEventInjector#installJoinOnceGuard} for why the flag belongs to the listener.
+	 * <p>Raised once per SESSION. The two halves are a flag on the listener, so one client load raises one
+	 * event even though its packet is entered twice ({@code BukkitPlayerEventInjector#installJoinOnceGuard}),
+	 * and {@link #connectionIsLive}, so the load that arrives while a move between worlds is completing does
+	 * not raise a second one.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {
@@ -67,6 +67,9 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
+			if (!connectionIsLive(player)) {
+				return;
+			}
 			// Unconditional while the seam is being proven: the only other evidence an event fired is
 			// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
 			// not evidence at all. One line per join is nothing next to what the game already logs.
@@ -195,6 +198,49 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
+	 * Whether the connection this load arrived on is still up, i.e. whether a session is STARTING on it.
+	 *
+	 * <h2>The shape in the log</h2>
+	 *
+	 * <p>09:59:33 a load raises the join event. 09:59:41 — eight seconds later, no login line anywhere in
+	 * between, the same virtual connection, the same voice-chat handshake — a second load raises it again and
+	 * the client dies on TAB's scoreboard. Eight seconds is not a portal walk. The second load exists because
+	 * the game rebuilt the player ({@code PlayerList.respawn}) while the client was being handed the new
+	 * dimension, which is exactly what a finished move looks like from here.
+	 *
+	 * <h2>Why the obvious tests are wrong</h2>
+	 *
+	 * <p>"Waited a while" cannot be it: a player standing still for ten seconds in the nether would then get a
+	 * second join event, and one who jumps through a portal in three would still get one per move.
+	 *
+	 * <p>"The player object changed" cannot be it either: {@link ForbricPlayer#of} wraps on every call, so
+	 * every raise "changes" the player, the first join included.
+	 *
+	 * <h2>What a move actually does to the connection</h2>
+	 *
+	 * <p>Nothing — and that is the answer. The virtual connection outlives the move, so a load that arrives on
+	 * a live connection is a session starting on it; the first load of a session is one, and a load that only
+	 * finishes a move is riding on the same live connection. A connection that is no longer live cannot be
+	 * starting a session either: its load belongs to a torn-down listener, and nobody is left to receive it.
+	 *
+	 * <p>Asked of the listener rather than of the player's own flag, because the two disagree for exactly the
+	 * case that matters: a rebuilt player carries a connection the game has already shut down.
+	 *
+	 * <p>Fails towards one missing event, never towards a disconnect, and it keeps no state of its own — so
+	 * there is nothing to prune, and nothing that can go stale between two sessions.
+	 */
+	static boolean connectionIsLive(net.minecraft.server.level.ServerPlayer player) {
+		net.minecraft.server.network.ServerGamePacketListenerImpl connection = player.connection;
+		if (connection == null || connection.isDisconnected()) {
+			ForbricLog.info("[Forbric/Bukkit] %s is loading on a connection that is already closed"
+							+ " — a finished move between worlds does not raise PlayerJoinEvent again",
+							player.getScoreboardName());
+			return false;
+		}
+		return true;
+	}
+
+	/**
 	 * A player is about to be placed into the world: raise {@code AsyncPlayerPreLoginEvent}.
 	 *
 	 * <h2>Why this event, and why it is not optional</h2>
@@ -214,9 +260,11 @@ public final class ForbricPlayerEventHook {
 	 * is one login's worth of latency rather than a wrong answer for the whole session.
 	 *
 	 * <p>Because it is the event plugins DISALLOW logins with, the result is honoured: a handler that calls
-	 * {@code disallow} disconnects the player, which is the behaviour a whitelist or ban plugin relies on.
+	 * {@code disallow} disconnects the player with the handler's own message, which is the behaviour a whitelist
+	 * or ban plugin relies on. The connection to close is taken as an ARGUMENT — see the note in the body about
+	 * why asking the player for it cannot work at this point in the login.
 	 */
-	public static void playerPreLogin(ServerPlayer player) {
+	public static void playerPreLogin(ServerPlayer player, Connection connection) {
 		try {
 			if (player == null) {
 				return;
@@ -225,16 +273,20 @@ public final class ForbricPlayerEventHook {
 			if (server == null) {
 				return;
 			}
-			// The address comes from the player's own connection WHEN THERE IS ONE, and is null otherwise.
+			// The address comes from the CONNECTION ARGUMENT, not from the player.
 			//
-			// It must not be a guard. This hook runs at the head of `placeNewPlayer`, which is the method that
-			// ATTACHES the connection -- so `player.connection` is genuinely null here, and an early return on
-			// that was the reason this event never fired. A null address is a real value for the event (a
-			// local or already-closed connection), and a plugin that bans by IP simply has nothing to match
-			// against.
+			// It must not be a guard, and `player.connection` must not be read here at all. This hook runs at
+			// the head of `placeNewPlayer`, which is the method that ATTACHES the connection -- so
+			// `player.connection` is genuinely null at this point, and an early return on it was the reason
+			// this event never fired. Reading it once more below to disconnect a refused login was worse than
+			// useless: the branch could never be taken, so a whitelist plugin's `disallow` was advisory.
+			//
+			// The connection `placeNewPlayer` was handed is the one being attached, so it is both available
+			// and the right thing to close. A null address stays a real value for the event (a local or
+			// already-closed connection), and a plugin that bans by IP simply has nothing to match against.
 			java.net.InetAddress address = null;
-			if (player.connection != null) {
-				java.net.SocketAddress remote = player.connection.getRemoteAddress();
+			if (connection != null) {
+				java.net.SocketAddress remote = connection.getRemoteAddress();
 				address = remote instanceof java.net.InetSocketAddress inet ? inet.getAddress() : null;
 			}
 			org.bukkit.event.player.AsyncPlayerPreLoginEvent event =
@@ -245,25 +297,49 @@ public final class ForbricPlayerEventHook {
 				// The plugin refused this login. Disconnect with ITS message, which is what a reference server
 				// shows -- a generic "disconnected" would leave the player with no idea why.
 				net.kyori.adventure.text.Component reason = event.kickMessage();
-				ForbricLog.info("[Forbric/Bukkit] %s was refused at pre-login: %s",
-						player.getScoreboardName(), reason);
 				net.kyori.adventure.text.Component shown = reason == null
 						? net.kyori.adventure.text.Component.text("Disconnected")
 						: reason;
-				// The connection is not attached yet, so there is nothing to disconnect through. Refusing at
-				// this point still has to take effect, or a whitelist plugin would be advisory: the player is
-				// marked by throwing out of placeNewPlayer, which the game reports as a failed login.
-				if (player.connection != null) {
-					player.connection.getConnection().disconnect(
-							net.minecraft.network.chat.Component.literal(
-									net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
-											.plainText().serialize(shown)));
+				String plain = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
+						.plainText().serialize(shown);
+				ForbricLog.info("[Forbric/Bukkit] %s was refused at pre-login: %s",
+						player.getScoreboardName(), plain);
+				// Closed through the connection this hook was handed, which is NOT yet attached to the player.
+				// Asking the player for it was the bug: `player.connection` is null here, so the refusal
+				// silently did nothing and a whitelist plugin was advisory.
+				//
+				// Out of placeNewPlayer rather than just closing: the disconnect is queued on the channel, and
+				// the game would go on to put this player in the world in the meantime. The exception is the
+				// failed login the caller reports, which is what makes the refusal take effect now.
+				if (connection != null) {
+					connection.disconnect(net.minecraft.network.chat.Component.literal(plain));
 				}
+				throw new LoginRefused(player.getScoreboardName() + " was refused at pre-login: " + plain);
 			}
+		} catch (LoginRefused refused) {
+			// Deliberately not contained: a plugin said no, and letting the login continue would hand it a
+			// player it asked not to have.
+			throw refused;
 		} catch (Throwable failure) {
-			// Never rethrown: this runs inside the login path, and an escaping exception would be attributed to
-			// the connection and could disconnect a player who has done nothing wrong.
+			// Everything else is reported and swallowed: this runs inside the login path, and an escaping
+			// exception would be attributed to the connection and could disconnect a player who has done
+			// nothing wrong.
 			ForbricLog.error("[NeoFobric/Bukkit] could not raise AsyncPlayerPreLoginEvent", failure);
+		}
+	}
+
+	/**
+	 * A login a plugin refused, thrown out of {@link #playerPreLogin} to abort the placement.
+	 *
+	 * <p>Extends {@link Error} so nothing on the way out mistakes it for a bridge failure and contains it the
+	 * way plugin failures are contained; the stack trace is suppressed because where it was raised is known
+	 * and the message already says who and why.
+	 */
+	public static final class LoginRefused extends Error {
+		private static final long serialVersionUID = 1L;
+
+		LoginRefused(String message) {
+			super(message, null, false, false);
 		}
 	}
 }

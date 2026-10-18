@@ -95,8 +95,16 @@ import org.objectweb.asm.tree.VarInsnNode;
  * exists!}.
  *
  * <p>So the hook is preceded by a {@code boolean} field added to the listener: {@code if (this.f)
- * return; this.f = true;}. A listener lives exactly one client load, so the flag's lifetime is the
- * lifetime of the thing being counted, and nothing has to be pruned on quit.
+ * return;}, and the flag is set after the raise. A listener lives exactly one client load, so the
+ * flag's lifetime is the lifetime of the thing being counted, and nothing has to be pruned on quit.
+ *
+ * <p><b>That flag alone is not enough, and the first attempt to fix this believed it was.</b>
+ * {@code PlayerList.respawn} builds a new listener <i>and</i> a new {@code ServerPlayer}, so the
+ * flag starts false on a listener nobody has seen before, and the anchor is reached on a session
+ * that already had its join event — the client died on {@code 'TAB-Scoreboard'} again, on a server
+ * whose startup log carried the line below. The flag therefore only stops one client load raising
+ * twice; whether the load is a NEW session is decided in
+ * {@code ForbricPlayerEventHook#raiseOncePerSession}, by the account's UUID.
  *
  * <p>{@code PlayerList.remove} takes the player as its only argument, so no field is needed there.
  * It has no equivalent double-entry, because it is called by the game itself rather than from a
@@ -287,8 +295,12 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		// Anchoring to markClientLoaded was right and is still not enough. Crossing the END portal runs
 		// ServerPlayer.teleport -> PlayerList.respawn -> placeNewPlayer, which builds a NEW listener; the
 		// client, fresh out of loading the new level, answers with another ServerboundPlayerLoadedPacket, and
-		// that packet reaches the anchor again on a listener whose hook has never run. So the raise is guarded
-		// per listener object -- see installJoinOnceGuard, which also logs the seam as armed.
+		// that packet reaches the anchor again on a listener whose hook has never run.
+		//
+		// The per-listener flag installed below catches two raises for ONE listener (the re-threaded packet).
+		// It cannot catch two listeners in one session, because a fresh listener starts with a false flag --
+		// which is exactly how the first fix shipped and failed. Session identity is the hook's business: see
+		// ForbricPlayerEventHook#raiseOncePerSession, and keep both halves.
 		installJoinOnceGuard(node, target, hookCall);
 		return ComputeFlags.COMPUTE_FRAMES;
 	}
@@ -316,9 +328,19 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	 * <p>Walked backwards over the guard's own instructions — {@code PUTFIELD, ICONST_1, ALOAD 0} precede the
 	 * call, and the {@code IFEQ} before those is the test — rather than looking for an {@code IFEQ} anywhere
 	 * nearby, which would find the hook inside some unrelated vanilla branch and conclude the guard was there.
+	 *
+	 * <p>The hook's own {@code ALOAD 0} (its player argument) sits directly behind the test, so it is skipped
+	 * first: this file's earlier revision set the flag BEFORE the call, and a class carrying that shape still
+	 * has to be recognised as guarded — reinstalling it would leave two sets of the same guard on the class of
+	 * a running server.
 	 */
 	private static boolean guardPresent(MethodNode target, AbstractInsnNode hookCall) {
 		AbstractInsnNode at = hookCall.getPrevious();
+		// The hook sits between the test and the flag being set, so the first thing behind the test is the
+		// hook's own argument load, not the guard. Exactly one instruction, and it has to be that load.
+		if (at != null && at.getOpcode() == Opcodes.ALOAD) {
+			at = at.getPrevious();
+		}
 		int putfield = 0;
 		int iconst = 0;
 		int aload = 0;
@@ -358,12 +380,18 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	 * {@code TAB-PlayerList} duplicate that commit fixed, one layer down: that one stopped a packet being
 	 * ENTERED twice, this one stops a second packet being SENT.
 	 *
-	 * <h2>Why the flag lives on the listener</h2>
+	 * <h2>Why the flag lives on the listener, and what it does not cover</h2>
 	 *
-	 * <p>Because the lifetime that matters is the listener's: one is built per client load, so a fresh one
-	 * legitimately starts false, and the state disappears with the object. A set of UUIDs in the bridge would
-	 * have to be pruned on quit — and a bug in that pruning is a player who silently never receives another
-	 * {@code PlayerJoinEvent}.
+	 * <p>Because the lifetime that matters for THE RE-THREADED PACKET is the listener's: one is built per
+	 * client load, so a fresh one legitimately starts false, and the state disappears with the object. That is
+	 * the duplicate this guard is for — {@code handleAcceptPlayerLoad} entered on the Netty thread and again on
+	 * the server thread.
+	 *
+	 * <p>It is NOT the whole answer, and shipping it as though it were is why the client still died on
+	 * {@code 'TAB-Scoreboard'}: {@code respawn} gives the teleported player a new listener, so this flag starts
+	 * false for a session that already had its event. The session half lives in
+	 * {@code ForbricPlayerEventHook#raiseOncePerSession}, keyed by UUID. Two guards, two questions: "did this
+	 * listener already raise?" and "did this session already have a join?".
 	 *
 	 * <p>The field is added by this processor, and every instruction referring to it is emitted from text
 	 * (the field's own name, and {@code Z}), so this layer still names no {@code net.minecraft.*} type as a
@@ -383,11 +411,14 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			node.fields.add(flag);
 		}
 
-		// In front of the hook call: `if (this.<flag>) return;` then `this.<flag> = true;`.
+		// Around the hook call: `if (this.<flag>) return;` in front of it, `this.<flag> = true;` behind it.
 		//
 		// The early RETURN is safe even though this sits mid-method: between here and markClientLoaded() there
 		// is nothing but the hook, and markClientLoaded() is exactly what the pass that set the flag has
 		// already done.
+		//
+		// The set comes AFTER the hook rather than before it for one reason: a hook that fails must not
+		// leave the flag claiming an event nobody heard. Nothing between the two can throw.
 		LabelNode raise = new LabelNode();
 		InsnList guard = new InsnList();
 		guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -395,12 +426,14 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		guard.add(new JumpInsnNode(Opcodes.IFEQ, raise));
 		guard.add(new InsnNode(Opcodes.RETURN));
 		guard.add(raise);
-		guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
-		guard.add(new InsnNode(Opcodes.ICONST_1));
-		guard.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name, flag.name, flag.desc));
 		target.instructions.insertBefore(hookCall, guard);
-		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent once per client load"
-						+ " — a dimension change does not raise it again",
+		InsnList mark = new InsnList();
+		mark.add(new VarInsnNode(Opcodes.ALOAD, 0));
+		mark.add(new InsnNode(Opcodes.ICONST_1));
+		mark.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name, flag.name, flag.desc));
+		target.instructions.insert(hookCall, mark);
+		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent at most once per client load"
+						+ " — a re-threaded load packet does not raise it again",
 						simpleName(node.name), JOIN_METHOD);
 	}
 
@@ -457,10 +490,22 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		return ComputeFlags.COMPUTE_FRAMES;
 	}
 
-	/** {@code (Lnet/minecraft/server/level/ServerPlayer;)V} — both hooks take one player. */
+	/** {@code (Lnet/minecraft/server/level/ServerPlayer;)V} — the join and quit hooks take one player. */
 	private static String hookDesc() {
 		return "(" + PLAYER_DESC + ")V";
 	}
+
+	/**
+	 * {@code (Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/network/Connection;)V} — the pre-login
+	 * hook also takes the connection being attached, which the player does not have yet.
+	 *
+	 * <p>Emitted as text, like {@link #PLAYER_DESC}: this layer must not name a {@code net.minecraft.*} type as
+	 * a class literal.
+	 */
+	static final String PRE_LOGIN_HOOK_DESC = "(" + PLAYER_DESC + "Lnet/minecraft/network/Connection;)V";
+
+	/** The pre-login hook as it was emitted before it needed the connection; matched so an old build re-emits. */
+	static final String PRE_LOGIN_HOOK_DESC_V1 = "(" + PLAYER_DESC + ")V";
 
 	/**
 	 * {@code PlayerList.placeNewPlayer}: prepend a call naming the player, before it is put in the world.
@@ -482,19 +527,51 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			return ComputeFlags.NO_REWRITE;
 		}
 		if (alreadyInjected(target, PRE_LOGIN_HOOK)) {
-			return ComputeFlags.NO_REWRITE;
-		}
-		if (headIsBranchTarget(target)) {
-			context.audit("neofobric:bukkit_player_events declined " + context.type().getClassName()
-					+ "." + PRE_LOGIN_METHOD
-					+ ": the entry is a branch target, where a prepended hook cannot be first");
-			return ComputeFlags.NO_REWRITE;
+			// A hook emitted by an earlier build takes only the player and leaves the connection unreachable,
+			// which is how a refused login became advisory. The class is rewritten if it still carries that
+			// signature; the injected call is what a cached class carries, so it is replaced by the two-argument
+			// form below. Both in one pass: this runs on already-transformed classes as well.
+			boolean stale = false;
+			for (AbstractInsnNode instruction : target.instructions) {
+				if (instruction instanceof MethodInsnNode call
+						&& call.owner.equals(HOOK_OWNER) && call.name.equals(PRE_LOGIN_HOOK)
+						&& call.desc.equals(PRE_LOGIN_HOOK_DESC_V1)) {
+					target.instructions.remove(call);
+					// The player load that fed it: `ALOAD 2` immediately before, and nothing else does.
+					AbstractInsnNode previous = instruction.getPrevious();
+					while (previous != null && previous.getOpcode() < 0) {
+						previous = previous.getPrevious();
+					}
+					if (previous instanceof VarInsnNode load && load.var == 2) {
+						target.instructions.remove(load);
+					}
+					stale = true;
+				}
+			}
+			if (!stale) {
+				return ComputeFlags.NO_REWRITE;
+			}
+			context.audit("neofobric:bukkit_player_events re-emitted " + PRE_LOGIN_HOOK
+					+ " with the connection, so a refused login is honoured");
+		} else {
+			if (headIsBranchTarget(target)) {
+				context.audit("neofobric:bukkit_player_events declined " + context.type().getClassName()
+						+ "." + PRE_LOGIN_METHOD
+						+ ": the entry is a branch target, where a prepended hook cannot be first");
+				return ComputeFlags.NO_REWRITE;
+			}
 		}
 
-		// Argument 1 of an instance method: slot 0 is `this`, slot 1 the Connection, slot 2 the player.
+		// Arguments 1 and 2 of an instance method: slot 0 is `this`, slot 1 the Connection, slot 2 the player.
+		//
+		// The Connection is passed because the hook cannot get it from the player: this method ATTACHES it,
+		// so `player.connection` is still null here — and the hook's refusal path used to ask the player for
+		// its connection (via a method that does not exist), which both failed to compile and, once fixed that
+		// way, could never have disconnected anybody.
 		InsnList code = new InsnList();
 		code.add(new VarInsnNode(Opcodes.ALOAD, 2));
-		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, PRE_LOGIN_HOOK, hookDesc(), false));
+		code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, PRE_LOGIN_HOOK, PRE_LOGIN_HOOK_DESC, false));
 		target.instructions.insert(code);
 
 		ForbricLog.info("[NeoFobric/Bukkit] %s raises AsyncPlayerPreLoginEvent from %s"

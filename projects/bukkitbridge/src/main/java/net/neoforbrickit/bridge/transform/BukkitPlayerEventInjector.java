@@ -169,6 +169,18 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	static final String JOINED_FIELD = "neofobric$joinEventRaised";
 	static final String FLAG_DESC = "Z";
 
+	/**
+	 * Whether the hook prints a stack per raise, as read HERE for the startup line only.
+	 *
+	 * <p>Duplicated rather than shared: this class runs on the FML plugin layer, which never loads the
+	 * bridge's own classes, so asking {@code ForbricPlayerEventHook} would be the class-literal mistake this
+	 * file's header warns about. One property, one default, two readers.
+	 */
+	private static final boolean JOIN_TRACE = !("off".equalsIgnoreCase(
+			System.getProperty("neofobric.joinTrace", "on"))
+			|| "0".equals(System.getProperty("neofobric.joinTrace", "on"))
+			|| "false".equalsIgnoreCase(System.getProperty("neofobric.joinTrace", "on")));
+
 	/** The leave point's class and method. */
 	static final String PLAYER_LIST_DOT = "net.minecraft.server.players.PlayerList";
 	static final String QUIT_METHOD = "remove";
@@ -447,9 +459,12 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		// copy of this bridge in the same JVM. Two different reasons looked identical; only one of them
 		// leaves this line. The seam names the anchor it used, so a later change to the anchor shows up
 		// here rather than in a client crash report.
+		// The join trace is named here on purpose: it is the one line that says whether the jar carrying it is
+		// the one running. A report of "the probe was on and printed nothing" is otherwise unanswerable —
+		// the switch and the printer lived in code a different build did not have.
 		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent once per client load"
-						+ " — hooked before %s(), behind a per-listener flag",
-						simpleName(node.name), JOIN_METHOD, MARK_LOADED_NAME);
+						+ " — hooked before %s(), behind a per-listener flag, join trace %s",
+						simpleName(node.name), JOIN_METHOD, MARK_LOADED_NAME, JOIN_TRACE ? "on" : "off");
 	}
 
 	/**

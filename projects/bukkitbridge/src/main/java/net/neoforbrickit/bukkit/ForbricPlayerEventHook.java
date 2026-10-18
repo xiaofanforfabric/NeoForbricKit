@@ -50,11 +50,10 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Raised once per JOIN, and a join is an ACCOUNT, not a set of objects and not a span of time. The
-	 * per-listener flag ({@code BukkitPlayerEventInjector#installJoinOnceGuard}) stops one client load raising
-	 * twice, because its packet is entered on the network thread and again on the server thread.
-	 * {@link #joinClaim} stops everything else raising again for the same account — a move between worlds, and
-	 * the late re-dispatch the issue's log shows 24 s after the first raise.
+	 * <p>Raised once per SESSION, decided by {@link #joinClaim} on the account's UUID: the load packet is
+	 * entered twice on two threads, {@code PlayerList.respawn} rebuilds the player and the listener during a
+	 * move between worlds, and this issue's logs show a further raise arriving seconds later on a session
+	 * that never left — all three are the same join, and only the UUID survives all three.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {
@@ -80,17 +79,14 @@ public final class ForbricPlayerEventHook {
 								Thread.currentThread().getName());
 				return;
 			}
-			// Counted before the raise, and traced when it is not the session's first: this branch is exactly
-			// the case the guard was supposed to prevent, so if it is ever taken the stack is the evidence.
-			if (countRaise(player) > 1) {
-				traceRepeatRaise(player);
-			}
-			// The claim was granted, so this raise goes out. Whether it is the FIRST of the session or a
-			// repeat the guard failed to catch is not answerable here — that is what the switch below is for:
-			// {@code traceRepeatRaise} prints a stack on a raise that follows one from the same session
-			// without an intervening leave, which is the only way to tell "a fresh join" from "the same join,
-			// raised twice" once the frequency has already been measured.
-			//
+			// Traced on the raise that actually goes OUT, the first of its session included. The report behind
+			// this issue carried the switch on for two runs and produced no trace at all, because the one
+			// branch that could reach the trace was the branch the guard had already closed: the second raise
+			// was suppressed here, so nothing was ever printed, and the log read as "the probe is broken".
+			// Every raise that reaches a client is a candidate for the one that kills it, so the trace is
+			// taken here — before the call, from the thread that really is raising — and capped per account
+			// rather than per session.
+			traceRaise(player);
 			// Unconditional otherwise, while the seam is being proven: the only other evidence an event fired is
 			// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
 			// not evidence at all. One line per join is nothing next to what the game already logs.
@@ -317,69 +313,100 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
-	 * The sessions a raise has already gone out for, kept separately so a REPEAT can still be recognised.
+	 * Whether the join path prints WHO raised it, which is the only evidence that tells the candidates apart.
 	 *
-	 * <p>{@link #SESSIONS} cannot answer it: a raise that happened at all leaves the entry behind, so "is it
-	 * there" means "ever raised", not "raised twice". This book counts raises per open session and is cleared
-	 * on the same leave path, which makes the second count the thing worth tracing.
-	 */
-	private static final java.util.Map<java.util.UUID, Integer> RAISES_PER_SESSION =
-			new java.util.concurrent.ConcurrentHashMap<>();
-
-	/** Counts one raise for this account's open session; returns how many that session has now had. */
-	private static int countRaise(ServerPlayer player) {
-		return RAISES_PER_SESSION.merge(player.getUUID(), 1, Integer::sum);
-	}
-
-	/**
-	 * Whether the join path should print WHO raised it, for the next reproduction of a duplicate.
+	 * <h2>Why this exists at all</h2>
 	 *
-	 * <h2>Why a switch, and why default off</h2>
+	 * <p>Every guard written for this issue so far answered a question about the raise and got it wrong,
+	 * because the trigger was never identified — only its frequency measured. Which code path reaches the
+	 * anchor a second time is what a stack trace settles in one run: the load packet again, {@code respawn}
+	 * during a move between worlds, or a re-dispatch from somewhere that is not the join path at all.
 	 *
-	 * <p>Every guard written for this issue so far decided a question about the raise and got it wrong,
-	 * because the trigger was never identified — only its frequency measured. What the reports could not
-	 * answer is which code path raises the second one: a teleport, a client load packet, a plugin asking for
-	 * a re-join, or the bridge's own dispatch running twice. A stack trace answers that in one run, and it
-	 * is the same trace in every run, so it does not need to be on by default.
+	 * <h2>Why it is ON unless switched off</h2>
 	 *
-	 * <p>Off unless asked: {@code -Dneofobric.joinTrace=on} (or {@code 1}/{@code true}). A stack trace per
-	 * join on a busy server is a lot of log for something a single reproduction settles.
+	 * <p>It shipped default-off, and a report came back saying the switch had been on for two runs with no
+	 * trace in the log. Both statements were true: the switch was on, and no trace was possible, because the
+	 * only branch that could reach the printer belonged to the raise the guard had already suppressed. A
+	 * probe that is silent when the bug is present is worse than no probe — it reads as proof of absence.
 	 *
-	 * <h2>Once per account, on the SECOND raise only</h2>
+	 * <p>So it prints on every raise that is actually delivered, and it is on by default: the cost is one
+	 * trace per join, and the alternative is another round of guessing.
+	 * {@code -Dneofobric.joinTrace=off} turns it off.
 	 *
-	 * <p>The first raise of a session is expected and printing it would bury the interesting one. The
-	 * second is the bug. One per account keeps the switch usable on a server that keeps being tested.
+	 * <h2>Why a cap per account</h2>
+	 *
+	 * <p>The stack is the same on every join, so a few per account are enough to catch a pattern, and an
+	 * uncapped trace on a server that keeps being tested buries everything else. Counted per account and
+	 * kept after the player leaves, because a reconnect is the case worth seeing twice.
 	 */
 	private static final boolean JOIN_TRACE = traceEnabled();
 
 	private static boolean traceEnabled() {
-		String value = System.getProperty("neofobric.joinTrace", "off");
-		return "on".equalsIgnoreCase(value) || "1".equals(value) || "true".equalsIgnoreCase(value);
+		String value = System.getProperty("neofobric.joinTrace", "on");
+		return !("off".equalsIgnoreCase(value) || "0".equals(value) || "false".equalsIgnoreCase(value));
 	}
 
-	/** Accounts whose second raise has already been traced, so the switch stays readable. */
-	private static final java.util.Set<java.util.UUID> TRACED =
-			java.util.concurrent.ConcurrentHashMap.newKeySet();
+	/** Traces printed per account before it goes quiet; enough to see a repeat, not enough to bury a log. */
+	private static final int TRACE_LIMIT = 6;
+
+	/** How many traces each account has had, capped by {@link #TRACE_LIMIT}. */
+	private static final java.util.Map<java.util.UUID, Integer> TRACES =
+			new java.util.concurrent.ConcurrentHashMap<>();
 
 	/**
-	 * Prints the stack of a raise that was NOT the first of its session.
+	 * Prints the stack of a raise that is about to reach the plugins.
 	 *
-	 * <p>The frame people need is a few levels up: this method, {@link #playerJoined}, the injected call
-	 * site, and then whichever of the game's own paths reached it. Nothing here interprets the trace — the
-	 * point of the switch is that the reading is done against a real one instead of a hypothesis.
+	 * <p>A few frames up are the ones that matter: this method, {@link #playerJoined}, the injected call site
+	 * and then whichever of the game's own paths reached it. Nothing here interprets the trace — the point is
+	 * that the reading is done against a real one instead of a hypothesis.
 	 *
-	 * <p>Called from both sides of the guard on purpose. The suppressed raise is the one the guard caught; the
-	 * admitted repeat is the one it missed, which is the only one that can actually reach a client and is
-	 * therefore the only one worth chasing. A report of "still kicked" is a claim that the second happened.
+	 * <p>Never throws: it runs inside the client's load packet, where anything escaping would be attributed
+	 * to the connection. A failure to print is reported and the raise continues.
 	 */
-	private static void traceRepeatRaise(ServerPlayer player) {
-		if (!JOIN_TRACE || !TRACED.add(player.getUUID())) {
+	private static void traceRaise(ServerPlayer player) {
+		if (!JOIN_TRACE) {
 			return;
 		}
-		ForbricLog.info("[Forbric/Bukkit] a second PlayerJoinEvent was reached for %s;"
-						+ " the stack below says from where (thread=%s)",
-						player.getScoreboardName(), Thread.currentThread().getName());
-		new Throwable("second PlayerJoinEvent for " + player.getScoreboardName()).printStackTrace();
+		try {
+			int printed = TRACES.merge(player.getUUID(), 1, Integer::sum);
+			if (printed > TRACE_LIMIT) {
+				return;
+			}
+			ForbricLog.info("[Forbric/Bukkit] PlayerJoinEvent #%d for %s is being raised; the stack below says"
+							+ " from where (thread=%s)", printed, player.getScoreboardName(),
+							Thread.currentThread().getName());
+			new Throwable("PlayerJoinEvent #" + printed + " for " + player.getScoreboardName())
+					.printStackTrace();
+		} catch (Throwable failure) {
+			ForbricLog.warn("[Forbric/Bukkit] could not trace the PlayerJoinEvent of %s (%s)",
+							player.getScoreboardName(), failure);
+		}
+	}
+
+	/**
+	 * Prints the stack of a raise the guard has just suppressed.
+	 *
+	 * <p>A different question from {@link #traceRaise}: this one never reaches a client, so it cannot be the
+	 * packet that kills one — but it is the evidence that the anchor is being reached more than once, and
+	 * which path reached it. Shared cap, so the two together stay readable.
+	 */
+	private static void traceRepeatRaise(ServerPlayer player) {
+		if (!JOIN_TRACE) {
+			return;
+		}
+		try {
+			int printed = TRACES.merge(player.getUUID(), 1, Integer::sum);
+			if (printed > TRACE_LIMIT) {
+				return;
+			}
+			ForbricLog.info("[Forbric/Bukkit] a second PlayerJoinEvent was reached for %s and suppressed;"
+							+ " the stack below says from where (thread=%s)",
+							player.getScoreboardName(), Thread.currentThread().getName());
+			new Throwable("suppressed PlayerJoinEvent for " + player.getScoreboardName()).printStackTrace();
+		} catch (Throwable failure) {
+			ForbricLog.warn("[Forbric/Bukkit] could not trace the suppressed PlayerJoinEvent of %s (%s)",
+							player.getScoreboardName(), failure);
+		}
 	}
 
 	/**
@@ -390,8 +417,7 @@ public final class ForbricPlayerEventHook {
 	 */
 	private static void endSession(ServerPlayer player) {
 		SESSIONS.remove(player.getUUID());
-		RAISES_PER_SESSION.remove(player.getUUID());
-		TRACED.remove(player.getUUID());
+		// TRACES is deliberately NOT cleared here: a reconnect is the case the probe exists to compare.
 		// A quit arriving while the join event is still on the stack (a listener that disconnects the player)
 		// would otherwise leave the in-flight mark behind, and every later payload from that account would be
 		// held for a join that has already ended.
@@ -407,9 +433,8 @@ public final class ForbricPlayerEventHook {
 	 */
 	public static void forgetAccounts() {
 		SESSIONS.clear();
-		RAISES_PER_SESSION.clear();
 		JOIN_IN_FLIGHT.clear();
-		TRACED.clear();
+		TRACES.clear();
 	}
 
 	/**

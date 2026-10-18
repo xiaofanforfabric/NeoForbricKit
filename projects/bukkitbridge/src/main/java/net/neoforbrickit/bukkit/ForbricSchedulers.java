@@ -235,11 +235,13 @@ public final class ForbricSchedulers {
             // body directly here would let the exception escape into the scheduling call -- so a plugin
             // that schedules from a command handler would see the game's command dispatch report the
             // throw, and the task bookkeeping (state, forget()) would be left half done.
-            task.runOnGameThread(server);
+            task.runOnGameThread(server, false);
             return task;
         }
 
-        Runnable dispatch = () -> task.runOnGameThread(server);
+        // `fromTimer`, not the thread we happen to be on: a plugin body running on the timer can schedule
+        // the next run synchronously, and that call has to queue rather than run here.
+        Runnable dispatch = () -> task.runOnGameThread(server, true);
         if (repeating) {
             gameTimer.scheduleAtFixedRate(dispatch, delayMillis, periodMillis, TimeUnit.MILLISECONDS);
         } else {
@@ -284,8 +286,24 @@ public final class ForbricSchedulers {
             this.repeating = repeating;
         }
 
-        /** Runs the body on the game thread, skipping it when it was cancelled while queued. */
-        void runOnGameThread(ServerImpl server) {
+        /**
+         * Runs the body on the game thread, skipping it when it was cancelled while queued.
+         *
+         * <p><b>{@code fromTimer} is not the same question as {@code isPrimaryThread()}.</b> The timer
+         * threads this class owns are neither the game thread nor the caller's, and
+         * {@code ServerImpl.isPrimaryThread()} has to keep answering "not the game thread" about them:
+         * it is the API's answer to "may I touch the world directly", and returning {@code true} on a
+         * thread the game is not ticking would let a plugin write to the world from a foreign thread
+         * with no warning.
+         *
+         * <p>The consequence is that this hop cannot be decided by asking the thread: while a task runs
+         * on the timer, the calling thread answers "not primary", {@code minecraft().execute} sees a task
+         * that is already queued on the game thread and queues it behind itself, and the body runs one
+         * server tick BEFORE the task's own delay elapses. A timer task would then drift a tick early
+         * every period; TAB's belowname refresh hit this on the join path. So the timer says who it is,
+         * and a dispatch from it is always handed to the game's own queue.
+         */
+        void runOnGameThread(ServerImpl server, boolean fromTimer) {
             if (stopped()) {
                 state = ExecutionState.CANCELLED;
                 forget();
@@ -293,7 +311,7 @@ public final class ForbricSchedulers {
             }
             // The body is run here rather than re-dispatched: the timer thread is not the game thread, so
             // this hops onto it through the server's own queue when it has to.
-            if (server.isPrimaryThread()) {
+            if (!fromTimer && server.isPrimaryThread()) {
                 invoke();
                 forget();
             } else {

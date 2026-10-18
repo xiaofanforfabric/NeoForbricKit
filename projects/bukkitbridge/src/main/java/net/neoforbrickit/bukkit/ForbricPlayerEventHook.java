@@ -49,11 +49,11 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Raised once per client load, which is what makes it once per session: the injected call site is
-	 * guarded by a flag the processor puts on the listener itself, so the extra
-	 * {@code ServerboundPlayerLoadedPacket} a dimension change produces — a fresh listener, and a client that
-	 * legitimately finished loading terrain again — does not raise a second {@code PlayerJoinEvent}. See
-	 * {@code BukkitPlayerEventInjector#installJoinOnceGuard} for why the flag belongs to the listener.
+	 * <p>Raised once per SESSION, which is what the API promises: a listener is flagged so one client load
+	 * raises one event, and this method then checks that the player it was handed is the one the session
+	 * belongs to. Both halves are needed — a dimension change builds a fresh listener (so the flag is fresh
+	 * too) and a fresh {@code ServerPlayer} (so an identity check alone would not notice either). See
+	 * {@code BukkitPlayerEventInjector#installJoinOnceGuard} and {@link #raiseOncePerSession}.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {
@@ -67,18 +67,37 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
-			// Unconditional while the seam is being proven: the only other evidence an event fired is
-			// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
-			// not evidence at all. One line per join is nothing next to what the game already logs.
-			ForbricLog.info("[Forbric/Bukkit] raising PlayerJoinEvent for %s",
-							player.getScoreboardName());
-			// The default message, which a plugin may replace: the player's own display name, which is
-			// what the reference server shows and what a plugin reading joinMessage() expects to see.
-			// Passed as a Component rather than a legacy string because the legacy constructor formats
-			// through ChatColor, and this bridge hands plugins Adventure text everywhere else.
-			server.getPluginManager().callEvent(
-							new org.bukkit.event.player.PlayerJoinEvent(bukkitPlayer,
-									net.kyori.adventure.text.Component.text(player.getScoreboardName())));
+			// Recorded BEFORE the dispatch, so `counted` answers "does this session have a join event" even
+			// when a listener throws: recording afterwards would let a failing plugin turn one join into an
+			// event per dimension change.
+			boolean counted = raiseOncePerSession(bukkitPlayer, player);
+			try {
+				if (!counted) {
+					ForbricLog.info("[Forbric/Bukkit] %s is a dimension change, not a new session"
+									+ " — PlayerJoinEvent is not raised again", player.getScoreboardName());
+					return;
+				}
+				// Unconditional while the seam is being proven: the only other evidence an event fired is
+				// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
+				// not evidence at all. One line per join is nothing next to what the game already logs.
+				ForbricLog.info("[Forbric/Bukkit] raising PlayerJoinEvent for %s",
+								player.getScoreboardName());
+				// The default message, which a plugin may replace: the player's own display name, which is
+				// what the reference server shows and what a plugin reading joinMessage() expects to see.
+				// Passed as a Component rather than a legacy string because the legacy constructor formats
+				// through ChatColor, and this bridge hands plugins Adventure text everywhere else.
+				server.getPluginManager().callEvent(
+								new org.bukkit.event.player.PlayerJoinEvent(bukkitPlayer,
+										net.kyori.adventure.text.Component.text(player.getScoreboardName())));
+			} catch (Throwable failure) {
+				// The plugin's own listener threw. `callEvent` is documented as containing that, so this only
+				// arrives from code that is not a listener — and rethrowing would be attributed to the load
+				// packet and disconnect a player who has done nothing wrong. Reported instead, and the session
+				// keeps its event: a plugin that threw during the dispatch does not get it a second time on the
+				// next dimension change.
+				ForbricLog.error("[NeoFobric/Bukkit] PlayerJoinEvent dispatch failed for "
+								+ player.getScoreboardName() + "; the player stays connected", failure);
+			}
 		} catch (Throwable failure) {
 			// Reported and swallowed, never rethrown: this runs inside the client's own load packet,
 			// where an escaping exception would be attributed to the connection and could disconnect
@@ -120,6 +139,14 @@ public final class ForbricPlayerEventHook {
 			// registered on it. Dropping only the bridge's map would leave one dangling listener per bar per
 			// departed player, held by the plugin's own bar object, for the life of the server.
 			ForbricPlayer.forgetBossBarView(player);
+			// The session ended, so the next login is allowed to raise a join event again. Removed here rather
+			// than on quit alone: a player who leaves without the join hook ever running has no entry, and
+			// removing nothing is correct.
+			//
+			// Dropped unconditionally, not by value: by the time a quit runs the game may have rebuilt the
+			// player object (a disconnect straight out of a dimension change), and a `remove(key, value)` that
+			// matched nothing would leave an entry behind that suppresses that account's NEXT join event.
+			JOINED.remove(player.getUUID());
 		} catch (Throwable failure) {
 			// Same reasoning as the join hook: the player is already leaving, and an exception here
 			// would turn a normal disconnect into a failed one.
@@ -192,6 +219,55 @@ public final class ForbricPlayerEventHook {
 			// The plugin's own listener threw. Reported, not rethrown: this runs inside the login path.
 			ForbricLog.error("[Forbric/Bukkit] a pre-login handler for " + who + " threw", failed.getCause());
 		}
+	}
+
+	/**
+	 * The sessions that already have a {@code PlayerJoinEvent}: account UUID to the player as a plugin sees it.
+	 *
+	 * <p>Holding the wrapper rather than a bare marker is what makes the check able to notice {@code respawn}:
+	 * see {@link #raiseOncePerSession}.
+	 */
+	private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, org.bukkit.entity.Player> JOINED =
+			new java.util.concurrent.ConcurrentHashMap<>();
+
+	/**
+	 * Whether this call is a new session, recording it if so.
+	 *
+	 * <h2>Why the listener's own flag is not enough</h2>
+	 *
+	 * <p>Crossing the END portal runs {@code ServerPlayer.teleport} → {@code PlayerList.respawn} →
+	 * {@code placeNewPlayer}, which builds a NEW listener AND a NEW {@code ServerPlayer}: the old player object
+	 * is discarded, not handed back. The listener's flag leaves with the listener it was set on, and the object
+	 * the bridge remembered is no longer the one the game calls it with — so neither check alone sees a second
+	 * raise. The account's UUID is the only thing that survives a dimension change.
+	 *
+	 * <p>The comparison is by identity on purpose. Bukkit's contract is that a {@code Player} object is stable
+	 * for a session, so "same UUID, different object" is not a plugin's problem, it is the game having rebuilt
+	 * the player underneath us — which is precisely a dimension change. A disconnect removes the entry, from
+	 * {@code PlayerList.remove}: the same place a real session ends, and the last moment a
+	 * {@code PlayerQuitEvent} can still be raised with the player's state readable.
+	 *
+	 * <h2>The cost if the bookkeeping is ever wrong</h2>
+	 *
+	 * <p>Each branch below fails towards "one missing event", never towards a disconnect: a raise that is
+	 * wrongly suppressed costs a plugin one {@code PlayerJoinEvent}, and the entry is dropped again on the next
+	 * quit. Nothing here can throw — a map insert and an identity comparison — so the caller's own guard is
+	 * never bypassed.
+	 */
+	private static boolean raiseOncePerSession(org.bukkit.entity.Player bukkitPlayer, ServerPlayer player) {
+		org.bukkit.entity.Player previous = JOINED.putIfAbsent(player.getUUID(), bukkitPlayer);
+		if (previous == null || previous == bukkitPlayer) {
+			return true;
+		}
+		if (!previous.isOnline()) {
+			// The previous object is gone but no quit hook has run for it (the player was dropped before the
+			// bridge could raise one). Adopt this object as the session and raise.
+			JOINED.put(player.getUUID(), bukkitPlayer);
+			return true;
+		}
+		// Same account, still online, rebuilt object: a dimension change. Keep the known object under the UUID
+		// rather than swapping it, so repeated teleports compare against one stable wrapper.
+		return false;
 	}
 
 	/**

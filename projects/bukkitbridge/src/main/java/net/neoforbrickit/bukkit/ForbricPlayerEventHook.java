@@ -50,11 +50,10 @@ public final class ForbricPlayerEventHook {
 	 * because the injected call has no way to name the bridge — the hook's caller is the game's
 	 * network thread, which holds a {@code ServerPlayer} and nothing else about this bridge.
 	 *
-	 * <p>Raised once per client load, which is what makes it once per session: the injected call site is
-	 * guarded by a flag the processor puts on the listener itself, so the extra
-	 * {@code ServerboundPlayerLoadedPacket} a dimension change produces — a fresh listener, and a client that
-	 * legitimately finished loading terrain again — does not raise a second {@code PlayerJoinEvent}. See
-	 * {@code BukkitPlayerEventInjector#installJoinOnceGuard} for why the flag belongs to the listener.
+	 * <p>Raised once per SESSION. The two halves are a flag on the listener, so one client load raises one
+	 * event even though its packet is entered twice ({@code BukkitPlayerEventInjector#installJoinOnceGuard}),
+	 * and {@link #connectionIsLive}, so the load that arrives while a move between worlds is completing does
+	 * not raise a second one.
 	 */
 	public static void playerJoined(ServerPlayer player) {
 		try {
@@ -68,6 +67,9 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
+			if (!connectionIsLive(player)) {
+				return;
+			}
 			// Unconditional while the seam is being proven: the only other evidence an event fired is
 			// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
 			// not evidence at all. One line per join is nothing next to what the game already logs.
@@ -193,6 +195,49 @@ public final class ForbricPlayerEventHook {
 			// The plugin's own listener threw. Reported, not rethrown: this runs inside the login path.
 			ForbricLog.error("[Forbric/Bukkit] a pre-login handler for " + who + " threw", failed.getCause());
 		}
+	}
+
+	/**
+	 * Whether the connection this load arrived on is still up, i.e. whether a session is STARTING on it.
+	 *
+	 * <h2>The shape in the log</h2>
+	 *
+	 * <p>09:59:33 a load raises the join event. 09:59:41 — eight seconds later, no login line anywhere in
+	 * between, the same virtual connection, the same voice-chat handshake — a second load raises it again and
+	 * the client dies on TAB's scoreboard. Eight seconds is not a portal walk. The second load exists because
+	 * the game rebuilt the player ({@code PlayerList.respawn}) while the client was being handed the new
+	 * dimension, which is exactly what a finished move looks like from here.
+	 *
+	 * <h2>Why the obvious tests are wrong</h2>
+	 *
+	 * <p>"Waited a while" cannot be it: a player standing still for ten seconds in the nether would then get a
+	 * second join event, and one who jumps through a portal in three would still get one per move.
+	 *
+	 * <p>"The player object changed" cannot be it either: {@link ForbricPlayer#of} wraps on every call, so
+	 * every raise "changes" the player, the first join included.
+	 *
+	 * <h2>What a move actually does to the connection</h2>
+	 *
+	 * <p>Nothing — and that is the answer. The virtual connection outlives the move, so a load that arrives on
+	 * a live connection is a session starting on it; the first load of a session is one, and a load that only
+	 * finishes a move is riding on the same live connection. A connection that is no longer live cannot be
+	 * starting a session either: its load belongs to a torn-down listener, and nobody is left to receive it.
+	 *
+	 * <p>Asked of the listener rather than of the player's own flag, because the two disagree for exactly the
+	 * case that matters: a rebuilt player carries a connection the game has already shut down.
+	 *
+	 * <p>Fails towards one missing event, never towards a disconnect, and it keeps no state of its own — so
+	 * there is nothing to prune, and nothing that can go stale between two sessions.
+	 */
+	static boolean connectionIsLive(net.minecraft.server.level.ServerPlayer player) {
+		net.minecraft.server.network.ServerGamePacketListenerImpl connection = player.connection;
+		if (connection == null || connection.isDisconnected()) {
+			ForbricLog.info("[Forbric/Bukkit] %s is loading on a connection that is already closed"
+							+ " — a finished move between worlds does not raise PlayerJoinEvent again",
+							player.getScoreboardName());
+			return false;
+		}
+		return true;
 	}
 
 	/**

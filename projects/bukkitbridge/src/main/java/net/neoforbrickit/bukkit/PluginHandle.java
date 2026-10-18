@@ -71,11 +71,21 @@ final class PluginHandle {
 		PluginDescriptionFile description = readDescription(jarPath);
 
 		Path dataFolder = dataRoot.resolve(description.getName());
+		// The jars this plugin asked for under `libraries:` in its own plugin.yml, fetched before its loader is
+		// built. Before, not after: the very first class the loader defines is the plugin's main class, and one
+		// that extends or references a declared library would otherwise fail its own definition and report
+		// "could not load", which reads as a broken plugin rather than a missing dependency.
+		//
+		// dataRoot is the server directory (the plugins folder is its child), which is where the shared library
+		// cache belongs -- see ForbricPluginLibraries.
+		java.util.List<Path> libraries = ForbricPluginLibraries.resolve(description, dataRoot,
+				description.getName());
 		// Everything JavaPlugin.init(...) would assign, handed to the loader so it can fill those fields from
 		// inside JavaPlugin's constructor. See PluginClassLoader#init for why that is necessary rather than an
 		// optimisation: a plugin that reads getLogger()/getServer() from its own constructor would see null.
 		PluginClassLoader loader = new PluginClassLoader(jarPath, parent, description,
-				new PluginClassLoader.PluginFields(server, description, dataFolder.toFile(), jarPath.toFile(), logger));
+				new PluginClassLoader.PluginFields(server, description, dataFolder.toFile(), jarPath.toFile(), logger),
+				libraries);
 		// Before the main class is defined, so a plugin whose own constructor already reaches for a peer's
 		// type resolves it instead of caching a "not found" for the class it needs.
 		loader.joinGroup(group);

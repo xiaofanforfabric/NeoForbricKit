@@ -986,12 +986,30 @@ public final class ServerImpl implements org.bukkit.Server {
 
 	@Override
 	public java.io.File getWorldContainer() {
-		throw notYet("getWorldContainer");
+		// Bukkit's "world container" is the folder the world folders live in -- the server's own directory,
+		// which is where `world`, `world_nether`, `world_the_end` sit. Asked of the game rather than built from
+		// a relative path, because a server launched with `--universe` or from another working directory would
+		// otherwise be told the wrong place.
+		return this.minecraft.getServerDirectory().toFile();
 	}
 
 	@Override
 	public java.nio.file.Path getLevelDirectory() {
-		throw notYet("getLevelDirectory");
+		// NOT the server directory: Bukkit's "level directory" is the folder `level-name` in server.properties
+		// points at -- `<server>/world` on a stock setup -- and a map plugin walks it expecting `level.dat` and
+		// `region` inside. Answering the server directory instead hands such a plugin the folder that holds
+		// `mods/`, `plugins/` and `world/`, where there is no `level.dat` and no chunks, and it quietly renders
+		// nothing. (BlueMap 5.29 takes this value verbatim as its world folder; it never calls
+		// `World.getWorldFolder`, so getting this one wrong is the same as getting every world wrong.)
+		//
+		// Ask the game for its save root rather than appending the level name by hand: `--universe` and a
+		// renamed `level-name` both move it, and the game already knows where it put the files.
+		//
+		// Absolute, because the game answers this as a path relative to its working directory, and a plugin
+		// that resolves a relative path later does so against *its* notion of the current directory. The
+		// lookup itself is fine either way; a value that means the same thing to every caller is not.
+		return this.minecraft.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+				.toAbsolutePath().normalize();
 	}
 
 	@Override

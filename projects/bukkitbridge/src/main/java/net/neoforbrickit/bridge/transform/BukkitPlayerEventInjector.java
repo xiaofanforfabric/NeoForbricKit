@@ -457,10 +457,22 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		return ComputeFlags.COMPUTE_FRAMES;
 	}
 
-	/** {@code (Lnet/minecraft/server/level/ServerPlayer;)V} — both hooks take one player. */
+	/** {@code (Lnet/minecraft/server/level/ServerPlayer;)V} — the join and quit hooks take one player. */
 	private static String hookDesc() {
 		return "(" + PLAYER_DESC + ")V";
 	}
+
+	/**
+	 * {@code (Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/network/Connection;)V} — the pre-login
+	 * hook also takes the connection being attached, which the player does not have yet.
+	 *
+	 * <p>Emitted as text, like {@link #PLAYER_DESC}: this layer must not name a {@code net.minecraft.*} type as
+	 * a class literal.
+	 */
+	static final String PRE_LOGIN_HOOK_DESC = "(" + PLAYER_DESC + "Lnet/minecraft/network/Connection;)V";
+
+	/** The pre-login hook as it was emitted before it needed the connection; matched so an old build re-emits. */
+	static final String PRE_LOGIN_HOOK_DESC_V1 = "(" + PLAYER_DESC + ")V";
 
 	/**
 	 * {@code PlayerList.placeNewPlayer}: prepend a call naming the player, before it is put in the world.
@@ -482,19 +494,51 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			return ComputeFlags.NO_REWRITE;
 		}
 		if (alreadyInjected(target, PRE_LOGIN_HOOK)) {
-			return ComputeFlags.NO_REWRITE;
-		}
-		if (headIsBranchTarget(target)) {
-			context.audit("neofobric:bukkit_player_events declined " + context.type().getClassName()
-					+ "." + PRE_LOGIN_METHOD
-					+ ": the entry is a branch target, where a prepended hook cannot be first");
-			return ComputeFlags.NO_REWRITE;
+			// A hook emitted by an earlier build takes only the player and leaves the connection unreachable,
+			// which is how a refused login became advisory. The class is rewritten if it still carries that
+			// signature; the injected call is what a cached class carries, so it is replaced by the two-argument
+			// form below. Both in one pass: this runs on already-transformed classes as well.
+			boolean stale = false;
+			for (AbstractInsnNode instruction : target.instructions) {
+				if (instruction instanceof MethodInsnNode call
+						&& call.owner.equals(HOOK_OWNER) && call.name.equals(PRE_LOGIN_HOOK)
+						&& call.desc.equals(PRE_LOGIN_HOOK_DESC_V1)) {
+					target.instructions.remove(call);
+					// The player load that fed it: `ALOAD 2` immediately before, and nothing else does.
+					AbstractInsnNode previous = instruction.getPrevious();
+					while (previous != null && previous.getOpcode() < 0) {
+						previous = previous.getPrevious();
+					}
+					if (previous instanceof VarInsnNode load && load.var == 2) {
+						target.instructions.remove(load);
+					}
+					stale = true;
+				}
+			}
+			if (!stale) {
+				return ComputeFlags.NO_REWRITE;
+			}
+			context.audit("neofobric:bukkit_player_events re-emitted " + PRE_LOGIN_HOOK
+					+ " with the connection, so a refused login is honoured");
+		} else {
+			if (headIsBranchTarget(target)) {
+				context.audit("neofobric:bukkit_player_events declined " + context.type().getClassName()
+						+ "." + PRE_LOGIN_METHOD
+						+ ": the entry is a branch target, where a prepended hook cannot be first");
+				return ComputeFlags.NO_REWRITE;
+			}
 		}
 
-		// Argument 1 of an instance method: slot 0 is `this`, slot 1 the Connection, slot 2 the player.
+		// Arguments 1 and 2 of an instance method: slot 0 is `this`, slot 1 the Connection, slot 2 the player.
+		//
+		// The Connection is passed because the hook cannot get it from the player: this method ATTACHES it,
+		// so `player.connection` is still null here — and the hook's refusal path used to ask the player for
+		// its connection (via a method that does not exist), which both failed to compile and, once fixed that
+		// way, could never have disconnected anybody.
 		InsnList code = new InsnList();
 		code.add(new VarInsnNode(Opcodes.ALOAD, 2));
-		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, PRE_LOGIN_HOOK, hookDesc(), false));
+		code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, PRE_LOGIN_HOOK, PRE_LOGIN_HOOK_DESC, false));
 		target.instructions.insert(code);
 
 		ForbricLog.info("[NeoFobric/Bukkit] %s raises AsyncPlayerPreLoginEvent from %s"

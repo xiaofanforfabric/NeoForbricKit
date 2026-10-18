@@ -3,6 +3,7 @@
  */
 package net.neoforbrickit.bukkit;
 
+import net.minecraft.network.Connection;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforbrickit.bridge.util.ForbricLog;
 
@@ -214,9 +215,11 @@ public final class ForbricPlayerEventHook {
 	 * is one login's worth of latency rather than a wrong answer for the whole session.
 	 *
 	 * <p>Because it is the event plugins DISALLOW logins with, the result is honoured: a handler that calls
-	 * {@code disallow} disconnects the player, which is the behaviour a whitelist or ban plugin relies on.
+	 * {@code disallow} disconnects the player with the handler's own message, which is the behaviour a whitelist
+	 * or ban plugin relies on. The connection to close is taken as an ARGUMENT — see the note in the body about
+	 * why asking the player for it cannot work at this point in the login.
 	 */
-	public static void playerPreLogin(ServerPlayer player) {
+	public static void playerPreLogin(ServerPlayer player, Connection connection) {
 		try {
 			if (player == null) {
 				return;
@@ -225,16 +228,20 @@ public final class ForbricPlayerEventHook {
 			if (server == null) {
 				return;
 			}
-			// The address comes from the player's own connection WHEN THERE IS ONE, and is null otherwise.
+			// The address comes from the CONNECTION ARGUMENT, not from the player.
 			//
-			// It must not be a guard. This hook runs at the head of `placeNewPlayer`, which is the method that
-			// ATTACHES the connection -- so `player.connection` is genuinely null here, and an early return on
-			// that was the reason this event never fired. A null address is a real value for the event (a
-			// local or already-closed connection), and a plugin that bans by IP simply has nothing to match
-			// against.
+			// It must not be a guard, and `player.connection` must not be read here at all. This hook runs at
+			// the head of `placeNewPlayer`, which is the method that ATTACHES the connection -- so
+			// `player.connection` is genuinely null at this point, and an early return on it was the reason
+			// this event never fired. Reading it once more below to disconnect a refused login was worse than
+			// useless: the branch could never be taken, so a whitelist plugin's `disallow` was advisory.
+			//
+			// The connection `placeNewPlayer` was handed is the one being attached, so it is both available
+			// and the right thing to close. A null address stays a real value for the event (a local or
+			// already-closed connection), and a plugin that bans by IP simply has nothing to match against.
 			java.net.InetAddress address = null;
-			if (player.connection != null) {
-				java.net.SocketAddress remote = player.connection.getRemoteAddress();
+			if (connection != null) {
+				java.net.SocketAddress remote = connection.getRemoteAddress();
 				address = remote instanceof java.net.InetSocketAddress inet ? inet.getAddress() : null;
 			}
 			org.bukkit.event.player.AsyncPlayerPreLoginEvent event =
@@ -245,25 +252,49 @@ public final class ForbricPlayerEventHook {
 				// The plugin refused this login. Disconnect with ITS message, which is what a reference server
 				// shows -- a generic "disconnected" would leave the player with no idea why.
 				net.kyori.adventure.text.Component reason = event.kickMessage();
-				ForbricLog.info("[Forbric/Bukkit] %s was refused at pre-login: %s",
-						player.getScoreboardName(), reason);
 				net.kyori.adventure.text.Component shown = reason == null
 						? net.kyori.adventure.text.Component.text("Disconnected")
 						: reason;
-				// The connection is not attached yet, so there is nothing to disconnect through. Refusing at
-				// this point still has to take effect, or a whitelist plugin would be advisory: the player is
-				// marked by throwing out of placeNewPlayer, which the game reports as a failed login.
-				if (player.connection != null) {
-					player.connection.getConnection().disconnect(
-							net.minecraft.network.chat.Component.literal(
-									net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
-											.plainText().serialize(shown)));
+				String plain = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
+						.plainText().serialize(shown);
+				ForbricLog.info("[Forbric/Bukkit] %s was refused at pre-login: %s",
+						player.getScoreboardName(), plain);
+				// Closed through the connection this hook was handed, which is NOT yet attached to the player.
+				// Asking the player for it was the bug: `player.connection` is null here, so the refusal
+				// silently did nothing and a whitelist plugin was advisory.
+				//
+				// Out of placeNewPlayer rather than just closing: the disconnect is queued on the channel, and
+				// the game would go on to put this player in the world in the meantime. The exception is the
+				// failed login the caller reports, which is what makes the refusal take effect now.
+				if (connection != null) {
+					connection.disconnect(net.minecraft.network.chat.Component.literal(plain));
 				}
+				throw new LoginRefused(player.getScoreboardName() + " was refused at pre-login: " + plain);
 			}
+		} catch (LoginRefused refused) {
+			// Deliberately not contained: a plugin said no, and letting the login continue would hand it a
+			// player it asked not to have.
+			throw refused;
 		} catch (Throwable failure) {
-			// Never rethrown: this runs inside the login path, and an escaping exception would be attributed to
-			// the connection and could disconnect a player who has done nothing wrong.
+			// Everything else is reported and swallowed: this runs inside the login path, and an escaping
+			// exception would be attributed to the connection and could disconnect a player who has done
+			// nothing wrong.
 			ForbricLog.error("[NeoFobric/Bukkit] could not raise AsyncPlayerPreLoginEvent", failure);
+		}
+	}
+
+	/**
+	 * A login a plugin refused, thrown out of {@link #playerPreLogin} to abort the placement.
+	 *
+	 * <p>Extends {@link Error} so nothing on the way out mistakes it for a bridge failure and contains it the
+	 * way plugin failures are contained; the stack trace is suppressed because where it was raised is known
+	 * and the message already says who and why.
+	 */
+	public static final class LoginRefused extends Error {
+		private static final long serialVersionUID = 1L;
+
+		LoginRefused(String message) {
+			super(message, null, false, false);
 		}
 	}
 }

@@ -50,6 +50,13 @@ public final class ForbricRegistryAccess implements RegistryAccess {
     /**
      * The registry a {@code RegistryKey} names.
      *
+     * <p><b>Which keys are answered, and why those and not others.</b> A key is answered when
+     * something in the API resolves it inside a static initialiser and would be left permanently
+     * unusable by a miss: {@code ITEM} ({@code Material.asItemType()}), {@code SOUND_EVENT}
+     * ({@code Sound}'s two thousand constants) and {@code POTION_EFFECT_TYPE} ({@code PotionEffectType}'s
+     * constants, the first of which is {@code minecraft:speed}). Everything else can honestly answer
+     * "nothing here", because nothing resolves it eagerly.
+     *
      * <p><b>An unanswered key returns an EMPTY registry for the same reason the class overload does,
      * and the reason is worth repeating because the failure is so indirect.</b> {@code Registry}'s
      * static initialiser builds every legacy constant — {@code ATTRIBUTE}, {@code BLOCK},
@@ -74,6 +81,11 @@ public final class ForbricRegistryAccess implements RegistryAccess {
             @SuppressWarnings("unchecked")
             org.bukkit.Registry<T> sounds = (org.bukkit.Registry<T>) ForbricSoundRegistry.INSTANCE;
             return sounds;
+        }
+        if (key == RegistryKey.POTION_EFFECT_TYPE) {
+            @SuppressWarnings("unchecked")
+            org.bukkit.Registry<T> effects = (org.bukkit.Registry<T>) ForbricPotionEffectTypeRegistry.INSTANCE;
+            return effects;
         }
         return new ForbricEmptyRegistry<>(key);
     }
@@ -104,6 +116,11 @@ public final class ForbricRegistryAccess implements RegistryAccess {
             @SuppressWarnings("unchecked")
             org.bukkit.Registry<T> items = (org.bukkit.Registry<T>) ForbricItemRegistry.INSTANCE;
             return items;
+        }
+        if (type == org.bukkit.potion.PotionEffectType.class) {
+            @SuppressWarnings("unchecked")
+            org.bukkit.Registry<T> effects = (org.bukkit.Registry<T>) ForbricPotionEffectTypeRegistry.INSTANCE;
+            return effects;
         }
         return new ForbricEmptyRegistry<>(type);
     }
@@ -328,6 +345,123 @@ public final class ForbricRegistryAccess implements RegistryAccess {
 
         @Override
         public java.util.Iterator<org.bukkit.inventory.ItemType> iterator() {
+            return stream().iterator();
+        }
+    }
+
+    /**
+     * The game's mob effects, as {@code Registry.EFFECT}.
+     *
+     * <p><b>This one cannot be empty either, and the failure it caused is why it exists.</b>
+     * {@code org.bukkit.potion.PotionEffectType} resolves every constant in its static initialiser through
+     * {@code Registry.EFFECT.getOrThrow(key)}, starting with {@code minecraft:speed}. An empty registry
+     * raises {@code NoSuchElementException} out of that initialiser, so the class is left permanently
+     * unusable — and everything that touches a mob effect afterwards dies with
+     * {@code NoClassDefFoundError: Could not initialize class org.bukkit.potion.PotionEffectType}, blaming
+     * whichever plugin asked. BlueMap asks while updating a player on join, which is how it surfaced.
+     *
+     * <p>So the answers come from the game's own {@code MOB_EFFECT} registry, walked through
+     * {@code net.neoforbrickit.bukkit.ForbricPotionEffectType} — the game-layer half, reached by name
+     * because this class is defined by the layer that cannot see {@code net.minecraft.*}.
+     */
+    static final class ForbricPotionEffectTypeRegistry
+                    implements org.bukkit.Registry<org.bukkit.potion.PotionEffectType> {
+
+        static final ForbricPotionEffectTypeRegistry INSTANCE = new ForbricPotionEffectTypeRegistry();
+
+        /** Set by the first reflective failure, so the stack is printed once rather than per constant. */
+        private static final java.util.concurrent.atomic.AtomicBoolean REPORTED =
+                        new java.util.concurrent.atomic.AtomicBoolean();
+
+        private ForbricPotionEffectTypeRegistry() {
+        }
+
+        /**
+         * The class in the layer that can see Minecraft, loaded by name through the published registries.
+         *
+         * <p>The game's {@code RegistryAccess} object is what names that layer, exactly as
+         * {@link ForbricItemRegistry#gameLayerHalf} does it: this class cannot see {@code net.minecraft.*},
+         * and the wrapper's body can.
+         */
+        private static Class<?> gameLayerHalf() throws ClassNotFoundException {
+            Object registries = ForbricRegistries.access();
+            ClassLoader gameLayer = registries == null
+                            ? ForbricPotionEffectTypeRegistry.class.getClassLoader()
+                            : registries.getClass().getClassLoader();
+            return Class.forName("net.neoforbrickit.bukkit.ForbricPotionEffectType", true, gameLayer);
+        }
+
+        /**
+         * One effect, or null when the game has no such id.
+         *
+         * <p>Null is the GAME's answer, asked of its own registry; a bridge-side failure is reported rather
+         * than turned into the same null, because "the game has no such effect" and "the bridge cannot see
+         * the game" have to stay distinguishable.
+         */
+        @Override
+        public org.bukkit.potion.PotionEffectType get(org.bukkit.NamespacedKey key) {
+            if (key == null) {
+                return null;
+            }
+            try {
+                return gameLayerHalf().getMethod("of", org.bukkit.NamespacedKey.class)
+                                .invoke(null, key);
+            } catch (Throwable failure) {
+                if (REPORTED.compareAndSet(false, true)) {
+                    ForbricLog.warn("[Forbric/Bukkit] could not read the game's mob effect registry", failure);
+                }
+                return null;
+            }
+        }
+
+        @Override
+        public org.bukkit.NamespacedKey getKey(org.bukkit.potion.PotionEffectType effect) {
+            return effect == null ? null : effect.getKey();
+        }
+
+        @Override
+        public boolean hasTag(TagKey<org.bukkit.potion.PotionEffectType> key) {
+            return false;
+        }
+
+        @Override
+        public Tag<org.bukkit.potion.PotionEffectType> getTag(TagKey<org.bukkit.potion.PotionEffectType> key) {
+            throw new java.util.NoSuchElementException(
+                            "[Forbric/Bukkit] this bridge has no mob effect tags, so it has no tag " + key);
+        }
+
+        @Override
+        public Collection<Tag<org.bukkit.potion.PotionEffectType>> getTags() {
+            return java.util.List.of();
+        }
+
+        @Override
+        public Stream<org.bukkit.potion.PotionEffectType> stream() {
+            return keyStream().map(this::get).filter(java.util.Objects::nonNull);
+        }
+
+        @Override
+        public Stream<org.bukkit.NamespacedKey> keyStream() {
+            try {
+                @SuppressWarnings("unchecked")
+                java.util.List<org.bukkit.NamespacedKey> keys = (java.util.List<org.bukkit.NamespacedKey>)
+                                gameLayerHalf().getMethod("gameKeys").invoke(null);
+                return keys.stream();
+            } catch (Throwable failure) {
+                if (REPORTED.compareAndSet(false, true)) {
+                    ForbricLog.warn("[Forbric/Bukkit] could not list the game's mob effects", failure);
+                }
+                return Stream.empty();
+            }
+        }
+
+        @Override
+        public int size() {
+            return (int) keyStream().count();
+        }
+
+        @Override
+        public java.util.Iterator<org.bukkit.potion.PotionEffectType> iterator() {
             return stream().iterator();
         }
     }

@@ -35,11 +35,20 @@ final class ForbricBlock implements org.bukkit.block.Block {
         private final int y;
         private final int z;
 
-        private ForbricBlock(ForbricWorld world, int x, int y, int z) {
+        /**
+         * Whether this corner's chunk is in memory, and so whether reading it is allowed.
+         *
+         * <p>False only for a handle made by {@code at(..., false)}; a handle from the ordinary path is always
+         * readable, because that path is allowed to load. See {@link #at(ForbricWorld, int, int, int, boolean)}.
+         */
+        private final boolean readable;
+
+        private ForbricBlock(ForbricWorld world, int x, int y, int z, boolean readable) {
                 this.world = world;
                 this.x = x;
                 this.y = y;
                 this.z = z;
+                this.readable = readable;
         }
 
         /**
@@ -50,7 +59,19 @@ final class ForbricBlock implements org.bukkit.block.Block {
          * would have to be invalidated when the chunk unloads, which is a correctness problem bought for nothing.
          */
         static ForbricBlock at(ForbricWorld world, int x, int y, int z) {
-                return new ForbricBlock(world, x, y, z);
+                return new ForbricBlock(world, x, y, z, true);
+        }
+
+        /**
+         * A corner that may or may not be in memory, for callers that must not load it.
+         *
+         * <p>{@code readable == false} means the chunk is not loaded and the caller cannot afford to load it
+         * (a render thread, see {@code ForbricWorld#getBlockAt(int, int, int, boolean)}). Every read of such a
+         * handle answers air rather than pulling the chunk in: a load asked for from the wrong thread does not
+         * complete, and a plugin that hangs looks exactly like a server that stopped.
+         */
+        static ForbricBlock at(ForbricWorld world, int x, int y, int z, boolean readable) {
+                return new ForbricBlock(world, x, y, z, readable);
         }
 
         /** The corner as a game position, for the bridge's own use and the event layer. */
@@ -58,8 +79,15 @@ final class ForbricBlock implements org.bukkit.block.Block {
                 return new net.minecraft.core.BlockPos(x, y, z);
         }
 
+        /**
+         * What is at this corner, as the game's own state.
+         *
+         * <p>The one place a read happens, and the one place {@link #readable} is honoured: an unreadable
+         * handle answers {@code null}, which every caller here turns into air. Reading the level directly
+         * would be a chunk load, and that is the thing this handle exists to refuse.
+         */
         private net.minecraft.world.level.block.state.BlockState state() {
-                return world.level().getBlockState(pos());
+                return readable ? world.level().getBlockState(pos()) : null;
         }
 
         private static UnsupportedOperationException notYet(String what) {
@@ -105,8 +133,13 @@ final class ForbricBlock implements org.bukkit.block.Block {
          */
         @Override
         public org.bukkit.Material getType() {
+                net.minecraft.world.level.block.state.BlockState state = state();
+                if (state == null) {
+                        // Unreadable handle: the chunk is not in memory and this caller may not load it.
+                        return org.bukkit.Material.AIR;
+                }
                 net.minecraft.resources.Identifier id =
-                                net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state().getBlock());
+                                net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
                 org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
                 if (material == null) {
 			// A block this bridge's copy of the Bukkit API has never heard of: a mod-added one, or a newer
@@ -190,13 +223,15 @@ final class ForbricBlock implements org.bukkit.block.Block {
          */
         @Override
         public boolean isEmpty() {
-                return state().isAir();
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null || state.isAir();
         }
 
         /** Whether what is here is a liquid. */
         @Override
         public boolean isLiquid() {
-                return !state().getFluidState().isEmpty();
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null || !state.getFluidState().isEmpty();
         }
 
         /**
@@ -207,7 +242,8 @@ final class ForbricBlock implements org.bukkit.block.Block {
          */
         @Override
         public boolean isPassable() {
-                return !state().blocksMotion();
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null || !state.blocksMotion();
         }
 
         /** The light level where this block sits, 0-15. */
@@ -219,7 +255,8 @@ final class ForbricBlock implements org.bukkit.block.Block {
         /** This block's state as Bukkit block data, which is how a plugin reads or sets properties like facing. */
         @Override
         public org.bukkit.block.data.BlockData getBlockData() {
-                return dataOf(state());
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null ? org.bukkit.Material.AIR.createBlockData() : dataOf(state);
         }
 
         /** Replaces this block's state, properties and all. */

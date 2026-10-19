@@ -529,9 +529,13 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		// The join trace is named here on purpose: it is the one line that says whether the jar carrying it is
 		// the one running. A report of "the probe was on and printed nothing" is otherwise unanswerable —
 		// the switch and the printer lived in code a different build did not have.
-		ForbricLog.info("[NeoFobric/Bukkit] %s.%s raises PlayerJoinEvent once per client load"
-						+ " — hooked before %s(), behind a per-listener flag, join trace %s",
-						simpleName(node.name), JOIN_METHOD, MARK_LOADED_NAME, JOIN_TRACE ? "on" : "off");
+		// One line, one fixed wording, written to be grepped. Whether the jar in the operator's hands carries
+		// this hook at all is the first question any report has to answer, and it has now been misread once per
+		// revision because each revision worded the sentence differently. The guard field name and the trace
+		// switch ride along: "installed" and "installed and armed" are not the same claim.
+		ForbricLog.info("[NeoFobric/Bukkit] PlayerJoinEvent hook installed on %s.%s"
+						+ " (once-per-load guard armed: %s, join trace %s)",
+						simpleName(node.name), JOIN_METHOD, JOINED_FIELD, JOIN_TRACE ? "on" : "off");
 	}
 
 	/**

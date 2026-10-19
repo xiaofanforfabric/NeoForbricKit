@@ -778,7 +778,10 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public boolean isSneaking() {
-		throw notYet("isSneaking");
+		// The client's shift flag, which is what upstream reads too: this is the pose the player is
+		// asking for, not the one the game has settled on, and a plugin testing "is this player
+		// crouching" wants the input rather than a collision-derived state.
+		return player.isShiftKeyDown();
 	}
 
 	@Override
@@ -2358,22 +2361,95 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public boolean hasPotionEffect(org.bukkit.potion.PotionEffectType arg0) {
-		throw notYet("hasPotionEffect");
+		// Matched by registry id rather than by object identity: PotionEffectType instances are wrappers
+		// built per call (see ForbricPotionEffectType), so two of them for one effect are never `==`.
+		// A null argument means "no effect", and the answer to "has none" is false.
+		net.minecraft.resources.Identifier id = effectId(arg0);
+		if (id == null) {
+			return false;
+		}
+		net.minecraft.world.effect.MobEffect effect = net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT
+				.getValue(id);
+		if (effect == null) {
+			return false;
+		}
+		// The game keeps its effects keyed by Holder, so the lookup goes through the registry rather
+		// than through hasEffect(Holder) -- a Holder.Reference for the same id compares equal, but
+		// constructing one by hand is not how this bridge reaches the game elsewhere either.
+		for (net.minecraft.world.effect.MobEffectInstance active : player.getActiveEffects()) {
+			if (active.getEffect().value() == effect) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	@Override
 	public org.bukkit.potion.PotionEffect getPotionEffect(org.bukkit.potion.PotionEffectType arg0) {
-		throw notYet("getPotionEffect");
+		net.minecraft.resources.Identifier id = effectId(arg0);
+		if (id == null) {
+			return null;
+		}
+		net.minecraft.world.effect.MobEffect effect = net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT
+				.getValue(id);
+		if (effect == null) {
+			return null;
+		}
+		for (net.minecraft.world.effect.MobEffectInstance active : player.getActiveEffects()) {
+			if (active.getEffect().value() == effect) {
+				return toBukkitEffect(effect, active);
+			}
+		}
+		return null;
+	}
+
+	@Override
+	public java.util.Collection<org.bukkit.potion.PotionEffect> getActivePotionEffects() {
+		// A snapshot, like the game's own getActiveEffects: the collection is the level's live map and
+		// iterating it while a plugin removes an effect would otherwise be a concurrent modification.
+		java.util.List<org.bukkit.potion.PotionEffect> effects = new java.util.ArrayList<>();
+		for (net.minecraft.world.effect.MobEffectInstance active : player.getActiveEffects()) {
+			effects.add(toBukkitEffect(active.getEffect().value(), active));
+		}
+		return effects;
+	}
+
+	/**
+	 * The registry id a Bukkit effect type names, or null when it names none.
+	 *
+	 * <p>Null rather than a throw for an effect the game does not have: a plugin holding an effect
+	 * from a datapack that has since been removed should see "the player does not have it", not an
+	 * exception from a read.
+	 */
+	private static net.minecraft.resources.Identifier effectId(org.bukkit.potion.PotionEffectType type) {
+		if (type == null) {
+			return null;
+		}
+		org.bukkit.NamespacedKey key = type.getKey();
+		if (key == null) {
+			return null;
+		}
+		return net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
+	}
+
+	/** One active effect, in the shape Bukkit plugins consume. */
+	private static org.bukkit.potion.PotionEffect toBukkitEffect(
+			net.minecraft.world.effect.MobEffect effect,
+			net.minecraft.world.effect.MobEffectInstance active) {
+		net.minecraft.resources.Identifier id = net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT
+				.getKey(effect);
+		org.bukkit.potion.PotionEffectType type = ForbricPotionEffectType
+				.of(new org.bukkit.NamespacedKey(id.getNamespace(), id.getPath()));
+		if (type == null) {
+			return null;
+		}
+		return new org.bukkit.potion.PotionEffect(type, active.getDuration(), active.getAmplifier(),
+				active.isAmbient(), active.isVisible(), active.showIcon());
 	}
 
 	@Override
 	public void removePotionEffect(org.bukkit.potion.PotionEffectType arg0) {
 		throw notYet("removePotionEffect");
-	}
-
-	@Override
-	public java.util.Collection<org.bukkit.potion.PotionEffect> getActivePotionEffects() {
-		throw notYet("getActivePotionEffects");
 	}
 
 	@Override
@@ -3353,7 +3429,10 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public io.papermc.paper.threadedregions.scheduler.EntityScheduler getScheduler() {
-		throw notYet("getScheduler");
+		// The player's own scheduler, which is the entity scheduler for the player's game object. BlueMap
+		// starts its per-player position refresh from here on every join, so refusing it drops the player
+		// from the map with an exception in an event handler.
+		return server.schedulers().entity(player);
 	}
 
 	@Override

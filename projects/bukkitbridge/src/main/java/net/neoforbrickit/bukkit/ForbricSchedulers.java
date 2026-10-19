@@ -107,6 +107,19 @@ public final class ForbricSchedulers {
         return new Async();
     }
 
+    /**
+     * An entity's scheduler.
+     *
+     * <p>A fresh handle per call, like every other wrapper this bridge hands out: the scheduler holds
+     * nothing but the entity, and the tasks it hands out live in this object's own registry, which is
+     * shared. So two calls for one entity are interchangeable and a plugin does not have to keep the
+     * first one.
+     */
+    public io.papermc.paper.threadedregions.scheduler.EntityScheduler entity(
+                    net.minecraft.world.entity.Entity entity) {
+        return new Entity(entity);
+    }
+
     /** Stops every timer, for a clean shutdown. */
     public void shutdown() {
         gameTimer.shutdownNow();
@@ -614,6 +627,143 @@ public final class ForbricSchedulers {
             if (task.plugin == plugin) {
                 task.cancel();
                 tasks.remove(task);
+            }
+        }
+    }
+
+    /**
+     * The entity scheduler, which on this bridge is the global one wearing an entity.
+     *
+     * <p>Folia runs each entity on the thread that owns its region, and the scheduler exists so a plugin
+     * can reach that thread without knowing which one it is. There is one thread here, so every entity's
+     * work lands in the same place — the region arguments are simply not consulted.
+     *
+     * <p>The one behaviour that is NOT the same is retirement. On Folia a task queued for an entity runs
+     * only while the entity exists, and the {@code retired} runnable fires instead when it is gone. This
+     * implementation keeps the same contract: {@link #execute} answers {@code false} once the entity has
+     * been removed or the world has unloaded, and the delivered-task paths call {@code retired} rather
+     * than running a body against a dead handle. A plugin that assumes the callback never fires would
+     * otherwise leave a timer running against an entity that is gone.
+     */
+    public final class Entity implements io.papermc.paper.threadedregions.scheduler.EntityScheduler {
+
+        private final net.minecraft.world.entity.Entity entity;
+
+        Entity(net.minecraft.world.entity.Entity entity) {
+            this.entity = entity;
+        }
+
+        @Override
+        public boolean execute(Plugin plugin, Runnable runnable, Runnable retired, long delayTicks) {
+            if (!alive()) {
+                if (retired != null) {
+                    retired.run();
+                }
+                return false;
+            }
+            Task task = new Task(plugin, ignored -> runnable.run(), false);
+            tasks.add(task);
+            scheduleEntity(task, delayTicks);
+            return true;
+        }
+
+        @Override
+        public ScheduledTask run(Plugin plugin, Consumer<ScheduledTask> task, Runnable retired) {
+            return schedule(plugin, task, retired, 0L, 0L, false);
+        }
+
+        @Override
+        public ScheduledTask runDelayed(Plugin plugin, Consumer<ScheduledTask> task, Runnable retired,
+                        long delayTicks) {
+            return schedule(plugin, task, retired, delayTicks, 0L, false);
+        }
+
+        @Override
+        public ScheduledTask runAtFixedRate(Plugin plugin, Consumer<ScheduledTask> task, Runnable retired,
+                        long initialDelayTicks, long periodTicks) {
+            return schedule(plugin, task, retired, initialDelayTicks, periodTicks, true);
+        }
+
+        private ScheduledTask schedule(Plugin plugin, Consumer<ScheduledTask> body, Runnable retired,
+                        long delayTicks, long periodTicks, boolean repeating) {
+            // A retired entity still gets a handle back rather than null: the API says the return value is
+            // a task, and a plugin that keeps it to cancel later must not have to null-check it.
+            Task task = new Task(plugin, body, repeating);
+            tasks.add(task);
+            if (!alive()) {
+                // Not queued at all, and already finished as far as the handle is concerned. The retired
+                // callback fires on the game thread, like every other callback this class delivers.
+                task.markRunning();
+                if (retired != null) {
+                    onGameThread(retired::run);
+                }
+                task.cancel();
+                return task;
+            }
+            if (repeating) {
+                scheduleEntityRepeating(task, delayTicks, periodTicks);
+            } else {
+                scheduleEntity(task, delayTicks);
+            }
+            return task;
+        }
+
+        /** Queues a one-shot on the game timer, which is the one thread that ticks entities. */
+        private void scheduleEntity(Task task, long delayTicks) {
+            if (delayTicks <= 0L) {
+                onGameThread(() -> runIfAlive(task, null));
+            } else {
+                gameTimer.schedule(() -> onGameThread(() -> runIfAlive(task, null)),
+                                delayTicks * MILLIS_PER_TICK, TimeUnit.MILLISECONDS);
+            }
+        }
+
+        /** Repeating tasks keep the same timer the region scheduler uses, for the same reason. */
+        private void scheduleEntityRepeating(Task task, long delayTicks, long periodTicks) {
+            long period = Math.max(1L, periodTicks) * MILLIS_PER_TICK;
+            gameTimer.scheduleAtFixedRate(() -> onGameThread(() -> runIfAlive(task, null)),
+                            Math.max(0L, delayTicks) * MILLIS_PER_TICK, period, TimeUnit.MILLISECONDS);
+        }
+
+        /**
+         * Runs the body, unless the entity has gone since the task was queued.
+         *
+         * <p>The check is here rather than only at scheduling time because the interesting case is
+         * exactly this one: a task queued while the entity was alive, for an entity that dies before the
+         * delay elapses.
+         */
+        private void runIfAlive(Task task, Runnable retired) {
+            if (!alive()) {
+                // A live repeating task whose entity vanished: cancel it, or the timer keeps firing
+                // forever against a handle that will never come back.
+                task.markRunning();
+                task.cancel();
+                if (retired != null) {
+                    retired.run();
+                }
+                return;
+            }
+            if (task.stopped()) {
+                return;
+            }
+            task.markRunning();
+            try {
+                task.runBody();
+            } catch (Throwable pluginBug) {
+                task.fail(pluginBug);
+            }
+        }
+
+        /** Whether the game still has this entity in a level. */
+        private boolean alive() {
+            return entity != null && !entity.isRemoved() && entity.level() != null;
+        }
+
+        private void onGameThread(Runnable work) {
+            if (isGameThread()) {
+                work.run();
+            } else {
+                server.minecraft().execute(work);
             }
         }
     }

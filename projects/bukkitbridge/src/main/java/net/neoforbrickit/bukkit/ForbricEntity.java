@@ -787,7 +787,10 @@ class ForbricEntity extends net.neoforbrickit.bukkit.entity.CraftEntity
 
 	@Override
 	public io.papermc.paper.threadedregions.scheduler.EntityScheduler getScheduler() {
-		throw notYet("getScheduler");
+		// Answered rather than refused: this is how a Folia-aware plugin reaches the thread that owns an
+		// entity, and on this bridge that is the one game thread. BlueMap calls it on every join to set up
+		// its per-player refresh, and a refusal there takes the whole event handler down.
+		return server.schedulers().entity(entity);
 	}
 
 	@Override

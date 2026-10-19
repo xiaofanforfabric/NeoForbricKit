@@ -34,15 +34,10 @@ package net.neoforbrickit.bukkit;
  *
  * <h2>What is not answered here</h2>
  *
- * <p><b>The snapshot methods are refused rather than approximated.</b> A snapshot must be an immutable copy of
- * the chunk's blocks, biomes and heightmaps taken at one moment, and building a wrong one is worse than an
+ * <p>The snapshot methods are refused rather than approximated. A snapshot must be an immutable copy of the
+ * chunk's blocks, biomes and heightmaps taken at one moment, and building a wrong one is worse than an
  * exception: a plugin that reads a snapshot and gets live data would see the world change under it, with
  * nothing to point at. The exception names the method, which is what a plugin's own stack trace then shows.
- *
- * <p>That judgement holds for a pre-generator (Chunky asks {@code isGenerated}, never for blocks) and stops
- * holding for a renderer: BlueMap reads a column at a time through {@code getBlock} here, and a refusal it
- * cannot distinguish from "empty chunk" is why its maps came out blank. So the block reads below are answered,
- * live, without pretending to be a snapshot.
  */
 final class ForbricChunk implements org.bukkit.Chunk {
 
@@ -154,54 +149,19 @@ final class ForbricChunk implements org.bukkit.Chunk {
 		return world.getBlockAt((x << 4) + bx, by, (z << 4) + bz);
 	}
 
-	/**
-	 * The same handle, with the API's "load it if it is not in memory" flag.
-	 *
-	 * <p>Deliberately the same answer as {@link #getBlock(int, int, int)}: the flag asks for the chunk to be
-	 * brought in so its contents can be read, and the handle returned here reads the world either way, which
-	 * means the load would only cost a chunk. A renderer walking a region asks for this overload for every
-	 * coordinate it draws, so the load cannot be the point of the call.
-	 */
-	@Override
-	public org.bukkit.block.Block getBlock(int bx, int by, int bz, boolean load) {
-		return world.getBlockAt((x << 4) + bx, by, (z << 4) + bz);
-	}
-
-	@Override
-	public org.bukkit.Material getType(int bx, int by, int bz) {
-		return getBlock(bx, by, bz).getType();
-	}
-
-	@Override
-	public org.bukkit.block.data.BlockData getBlockData(int bx, int by, int bz) {
-		return getBlock(bx, by, bz).getBlockData();
-	}
-
-	@Override
-	public void setBlock(int bx, int by, int bz, org.bukkit.Material material) {
-		getBlock(bx, by, bz).setType(material);
-	}
-
-	@Override
-	public void setBlockData(int bx, int by, int bz, org.bukkit.block.data.BlockData data) {
-		getBlock(bx, by, bz).setBlockData(data);
-	}
-
-	@Override
-	public int getHighestBlockYAt(int bx, int bz) {
-		// The heightmap question is about a column of the world; a chunk is only a window onto it.
-		return world.getHighestBlockYAt((x << 4) + bx, (z << 4) + bz);
-	}
-
-	@Override
-	public int getHighestBlockYAt(int bx, int bz, org.bukkit.HeightMap heightMap) {
-		return world.getHighestBlockYAt((x << 4) + bx, (z << 4) + bz, heightMap);
-	}
-
 	@Override
 	public org.bukkit.ChunkSnapshot getChunkSnapshot(boolean includeMaxBlockY, boolean includeBiome,
 					boolean includeBiomeTempRain, boolean includeLightData) {
-		throw notYet("getChunkSnapshot");
+		// Answered from the loaded chunk rather than refused. A renderer takes a snapshot per chunk and
+		// reads blocks out of it; a refusal it cannot tell from "empty chunk" is what left BlueMap's maps
+		// blank with nothing in any log. The block and data arrays are the part every caller reads, so
+		// they are what gets captured; biomes and light are answered live and say so in ForbricChunkSnapshot.
+		if (handle == null) {
+			throw new IllegalStateException(
+					"[Forbric/Bukkit] Chunk.getChunkSnapshot() needs the chunk in memory; " + x + "," + z
+							+ " is not loaded (call load() first)");
+		}
+		return new ForbricChunkSnapshot(world, handle, includeMaxBlockY);
 	}
 
 	@Override

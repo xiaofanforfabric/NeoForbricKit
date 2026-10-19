@@ -109,27 +109,52 @@ final class ForbricBlock implements org.bukkit.block.Block {
                                 net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state().getBlock());
                 org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
                 if (material == null) {
-                        // A block this bridge's copy of the Bukkit API has never heard of: a mod-added one, or a
-                        // newer game than the API was built against. Named in the log, because air is a lie that a
-                        // reader cannot tell from an empty corner -- but not thrown: a renderer walking a column
-                        // hits modded blocks constantly (a modded world is the whole reason this bridge exists),
-                        // and one exception per unknown block turns the map it was drawing into nothing at all.
-                        warnUnknownBlock("getType", id);
-                        return org.bukkit.Material.AIR;
-                }
-                return material;
-        }
+			// A block this bridge's copy of the Bukkit API has never heard of: a mod-added one, or a newer
+			// game than the API was built against.
+			//
+			// Named in the log, but NOT thrown. A renderer walks millions of blocks, and a modded world is
+			// the whole reason this bridge exists -- one exception per unknown block would abort the map
+			// rather than leave a hole in it. AIR is the honest answer for "no Bukkit material names this".
+			warnUnknownBlock("getType", id);
+			return org.bukkit.Material.AIR;
+		}
+		return material;
+	}
 
-        /** One line per unknown block id, not one per read: a renderer reads the same block a few million times. */
-        private static final java.util.Set<net.minecraft.resources.Identifier> reported =
-                        java.util.concurrent.ConcurrentHashMap.newKeySet();
+	/**
+	 * The Bukkit material for a game state, or {@code AIR} when this API has no name for it.
+	 *
+	 * <p>Package-visible because the chunk snapshot resolves millions of these and must resolve them the
+	 * same way a single block read does — two spellings of "which material is this" would drift.
+	 *
+	 * <p>Unknown blocks answer {@code AIR} rather than throwing: see {@link #getType()}.
+	 */
+	static org.bukkit.Material materialOf(net.minecraft.world.level.block.state.BlockState state) {
+		net.minecraft.resources.Identifier id =
+				net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
+		org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
+		if (material == null) {
+			warnUnknownBlock("getType", id);
+			return org.bukkit.Material.AIR;
+		}
+		return material;
+	}
 
-        private static void warnUnknownBlock(String what, net.minecraft.resources.Identifier id) {
-                if (reported.add(id)) {
-                        net.neoforbrickit.bridge.util.ForbricLog.warn(
-                                        "[Forbric/Bukkit] Block.%s() has no Bukkit material for %s; answering AIR",
-                                        what, id);
-                }
+	/**
+	 * One line per unknown block id, not one per read.
+	 *
+	 * <p>A renderer reads the same block a few million times, so a per-read warning would be both useless
+	 * and enormous. The set is static because the id is the identity: two wrappers over the same block
+	 * report the same gap.
+	 */
+	private static final java.util.Set<net.minecraft.resources.Identifier> REPORTED_UNKNOWN =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	private static void warnUnknownBlock(String what, net.minecraft.resources.Identifier id) {
+		if (REPORTED_UNKNOWN.add(id)) {
+			net.neoforbrickit.bridge.util.ForbricLog.warn(
+					"[Forbric/Bukkit] Block.%s() has no Bukkit material for %s; answering AIR", what, id);
+		}
         }
 
         /**
@@ -206,23 +231,19 @@ final class ForbricBlock implements org.bukkit.block.Block {
                 world.level().setBlock(pos(), stateOf(data), 3);
         }
 
-        /**
-         * This corner as a {@code BlockState}.
-         *
-         * <p>The API has no state-less base a bridge could fill in, and this one has no {@code ForbricBlockState} to
-         * hand back, so the object returned is a {@code Block} itself -- which is what a caller reads a state through
-         * anyway: {@code getType}, {@code getBlockData}, {@code getX}/{@code getY}/{@code getZ}. A map renderer asks
-         * {@code World#getBlockState} once per block and then reads only those, so answering with the live handle is
-         * the difference between a terrain and an empty column; refusing here is what left BlueMap drawing nothing.
-         *
-         * <p>It is a handle rather than a copy, which is the one place this differs from Bukkit's contract: a caller
-         * that holds the result and expects it to stay put while the world changes will see the change. Nothing in
-         * the bridge keeps such a reference, and the alternative -- a state type that only half the API accepts --
-         * would be a worse lie.
-         */
-        @Override
-        public org.bukkit.block.BlockState getState() {
-                return this;
+/**
+	 * This block as a {@code BlockState}.
+	 *
+	 * <p>A live handle rather than a copy — see {@link ForbricBlockState}, which states the difference and
+	 * offers {@code copy()} for callers that need the API's usual detached behaviour.
+	 *
+	 * <p>Answered rather than refused because a map renderer asks for it once per block and then reads
+	 * only {@code getType} and {@code getBlockData}: refusing it leaves the renderer with nothing it can
+	 * distinguish from an empty world.
+	 */
+	@Override
+	public org.bukkit.block.BlockState getState() {
+		return new ForbricBlockState(this);
         }
 
         /**
@@ -240,38 +261,37 @@ final class ForbricBlock implements org.bukkit.block.Block {
         /**
          * A game state as Bukkit block data.
          *
-         * <p>Parsed by the material's own {@code createBlockData(String)} from the game's state string, so the
-         * properties a plugin sees are the ones registered for that block and carry the values that are actually
-         * there — the game's state string and Bukkit's property names are not the same spelling, and letting the API
-         * do the translation is what keeps them in step.
+         * <p>Goes through the material's own {@code createBlockData}, so the properties a plugin sees are the ones
+         * the API registered for that block — the game's state string and Bukkit's property names are not the same
+         * spelling, and letting the API do the translation is what keeps them in step.
          */
-        private static org.bukkit.block.data.BlockData dataOf(
+        static org.bukkit.block.data.BlockData dataOf(
                         net.minecraft.world.level.block.state.BlockState state) {
                 net.minecraft.resources.Identifier id =
                                 net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
                 org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
                 if (material == null) {
-                        warnUnknownBlock("getBlockData", id);
-                        return org.bukkit.Material.AIR.createBlockData();
-                }
-                // The API parses the game's own state string, so the properties a plugin reads are the ones that are
-                // actually there -- `minecraft:oak_stairs[facing=east,half=top]` -- instead of the default state a
-                // `createBlockData()` would give. A renderer reading orientation or water level needs the difference,
-                // and `createBlockData(default)` is only right when the block IS in its default state.
-                try {
-                        return material.createBlockData(state.toString());
-                } catch (RuntimeException unsupported) {
-                        // A property the API's copy of this block does not model (a newer game, or a mod). The
-                        // material is still right, and default-shaped data beats no block at all.
-                        return material.createBlockData();
-                }
+			warnUnknownBlock("getBlockData", id);
+			return org.bukkit.Material.AIR.createBlockData();
+		}
+		// The game's own state string, so the properties a plugin reads are the ones that are actually
+		// there -- `minecraft:oak_stairs[facing=east,half=top]` rather than the default state a bare
+		// createBlockData() would give. A renderer reading orientation, water level or slab half needs
+		// the difference, and a default state is only right when the block IS in its default state.
+		try {
+			return material.createBlockData(state.toString());
+		} catch (RuntimeException unsupported) {
+			// A property this API's copy of the block does not model (a newer game, or a mod). The
+			// material is still right, and default-shaped data beats no block at all.
+			return material.createBlockData();
+		}
         }
 
         /**
          * Bukkit block data as a game state.
          *
-         * <p>The round trip is name-based on both ends: the data's material names the block, and the game's default
-         * state for it is what gets written. Properties the API models but the game does not (or spells differently)
+         * <p>The round trip is name-based on both ends: the data's material names the block, and the game's
+         * default state for it is what gets written. Properties the API models but the game does not (or spells differently)
          * are dropped rather than guessed at.
          */
         private static net.minecraft.world.level.block.state.BlockState stateOf(

@@ -1125,39 +1125,7 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 		// Asked of the chunk source, which knows about chunks on disk: true for a chunk that exists whether or
 		// not anyone is holding it. This is the question a pre-generator asks to decide whether a coordinate
 		// still needs work, and answering it from "is it loaded" would send it over the whole region again.
-		//
-		// A renderer asks the same question to decide whether it has anything to draw, and "the game has never
-		// loaded this one" is not the same as "there is nothing on disk" -- a fresh start has no chunk in memory
-		// and a whole save on disk. So the memory probe is not the answer: ask the source for the chunk
-		// information (reads the region index, does not generate or load).
-		//
-		// For the dimensions the game actually creates -- overworld, nether, end -- that one read is the whole
-		// answer: every chunk a server has is saved under its dimension folder, so an absent record means nothing was
-		// ever there. Asking further would be asking "is this chunk in memory", which is false for a world nobody has
-		// walked through yet and is the answer that left a renderer with no regions to draw.
-		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD
-				|| level.dimension() == net.minecraft.world.level.Level.NETHER
-				|| level.dimension() == net.minecraft.world.level.Level.END) {
-			try {
-				return level.getChunkSource().chunkMap.readChunk(arg0, arg1) != null;
-			} catch (RuntimeException unreadable) {
-				// A region file that is half-written or corrupt: no chunk to render either way, and an exception
-				// here would stop a renderer's whole walk rather than skip one coordinate.
-				return false;
-			}
-		}
-		// A datapack dimension that has never been loaded lives only in the world-gen memory store, so its
-		// on-disk answer is "absent" until something touches it. Keep the game's own view as the fallback.
-		if (level.getChunkSource().getChunkNow(arg0, arg1) != null) {
-			return true;
-		}
-		try {
-			return level.getChunkSource().chunkMap.readChunk(arg0, arg1) != null;
-		} catch (RuntimeException unreadable) {
-			// A region file that is half-written or corrupt. There is no chunk to render either way, and an
-			// exception here would stop a renderer's whole walk rather than skip one coordinate.
-			return false;
-		}
+		return level.getChunkSource().hasChunk(arg0, arg1);
 	}
 
 	@Override
@@ -1628,7 +1596,10 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.ChunkSnapshot getEmptyChunkSnapshot(int arg0, int arg1, boolean arg2, boolean arg3) {
-		throw notYet("getEmptyChunkSnapshot");
+		// An EMPTY snapshot, which is what the API promises: a chunk-shaped block of air and no
+		// terrain. A renderer fills the area outside the map with it, so answering with real blocks
+		// would put things where the caller asked for nothing.
+		return ForbricChunkSnapshot.empty(this, arg0, arg1);
 	}
 
 	@Override
@@ -1958,11 +1929,8 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	}
 
 	@Override
-	public org.bukkit.block.BlockState getBlockState(int x, int y, int z) {
-		// The snapshot form of the same corner getBlockAt wraps. Answered from the live block because this bridge has
-		// no BlockState type of its own yet, and a map renderer reading a column wants the blocks that are there now
-		// -- refusing here is what left BlueMap with nothing to draw.
-		return getBlockAt(x, y, z).getState();
+	public org.bukkit.block.BlockState getBlockState(int arg0, int arg1, int arg2) {
+		throw notYet("getBlockState");
 	}
 
 	@Override
@@ -1971,16 +1939,13 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	}
 
 	@Override
-	public org.bukkit.block.data.BlockData getBlockData(int x, int y, int z) {
-		// Not a refusal any more: a renderer reading one block at a time takes this route, and an exception per block
-		// reads to it as "this world has no blocks". The data is the API's own translation of the game state (see
-		// ForbricBlock#dataOf), which the bridge already uses for Block#getBlockData.
-		return getBlockAt(x, y, z).getBlockData();
+	public org.bukkit.block.data.BlockData getBlockData(int arg0, int arg1, int arg2) {
+		throw notYet("getBlockData");
 	}
 
 	@Override
-	public org.bukkit.Material getType(int x, int y, int z) {
-		return getBlockAt(x, y, z).getType();
+	public org.bukkit.Material getType(int arg0, int arg1, int arg2) {
+		throw notYet("getType");
 	}
 
 	@Override
@@ -2040,63 +2005,23 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	}
 
 	@Override
-	public int getHighestBlockYAt(int x, int z) {
-		// Bukkit's "highest block" is the first one above the bottom of the world that is not air -- MOTION_BLOCKING
-		// with its documented fallback. Answered by the game's own heightmap rather than a column scan: the heightmap
-		// is what the game maintains for exactly this question, and a hand-written loop would answer the same thing
-		// for a thousand times the cost, on a thread the renderer calls per column.
-		return highestYAt(x, z, org.bukkit.HeightMap.MOTION_BLOCKING);
+	public int getHighestBlockYAt(int arg0, int arg1) {
+		throw notYet("getHighestBlockYAt");
 	}
 
 	@Override
-	public int getHighestBlockYAt(org.bukkit.Location location) {
-		return getHighestBlockYAt(location.getBlockX(), location.getBlockZ());
+	public int getHighestBlockYAt(org.bukkit.Location arg0) {
+		throw notYet("getHighestBlockYAt");
 	}
 
 	@Override
-	public int getHighestBlockYAt(int x, int z, org.bukkit.HeightMap heightMap) {
-		return highestYAt(x, z, heightMap);
+	public int getHighestBlockYAt(int arg0, int arg1, org.bukkit.HeightMap arg2) {
+		throw notYet("getHighestBlockYAt");
 	}
 
 	@Override
-	public int getHighestBlockYAt(org.bukkit.Location location, org.bukkit.HeightMap heightMap) {
-		return highestYAt(location.getBlockX(), location.getBlockZ(), heightMap);
-	}
-
-	/**
-	 * The game's heightmap answer for one column.
-	 *
-	 * <p>The two enums are not parallel: Bukkit has four maps, the game has five, and the extra ones are the
-	 * world-gen variants ({@code OCEAN_FLOOR_WG}, {@code WORLD_SURFACE_WG}) that the game keeps for chunk
-	 * generation and that no plugin asks for. The four that do line up are translated here, one for one.
-	 *
-	 * <p>A column that is not in memory answers "nothing here", which is the same answer the game gives for an
-	 * empty column: one below the bottom of the world.
-	 */
-	private int highestYAt(int x, int z, org.bukkit.HeightMap heightMap) {
-		net.minecraft.world.level.chunk.ChunkAccess chunk = level.getChunkSource().getChunkNow(x >> 4, z >> 4);
-		net.minecraft.world.level.levelgen.Heightmap.Types type = heightmapType(heightMap);
-		if (chunk == null) {
-			// Not in memory: the answer the game would give is "nothing here", and loading the chunk from a renderer's
-			// thread to find that out would generate terrain nobody asked for.
-			return level.getMinY() - 1;
-		}
-		// The game's heightmap is one above the top block it found, which is how Bukkit's highest-Y-minus-one lines
-		// up; the clamp keeps an empty column at the bottom of the world rather than one below it.
-		return Math.max(level.getMinY() - 1, chunk.getHeight(type, x & 15, z & 15) - 1);
-	}
-
-	private static net.minecraft.world.level.levelgen.Heightmap.Types heightmapType(org.bukkit.HeightMap heightMap) {
-		if (heightMap == null) {
-			return net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING;
-		}
-		return switch (heightMap) {
-			case MOTION_BLOCKING -> net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING;
-			case MOTION_BLOCKING_NO_LEAVES -> net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES;
-			case OCEAN_FLOOR -> net.minecraft.world.level.levelgen.Heightmap.Types.OCEAN_FLOOR;
-			// Bukkit's WORLD_SURFACE is the map with no filter; the game keeps it under the WG (world-gen) name.
-			case WORLD_SURFACE -> net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE;
-		};
+	public int getHighestBlockYAt(org.bukkit.Location arg0, org.bukkit.HeightMap arg1) {
+		throw notYet("getHighestBlockYAt");
 	}
 
 	@Override

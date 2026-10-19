@@ -380,16 +380,23 @@ both directions.
 - **The CraftBukkit layer is still being filled in.** A couple of files do not compile on
   `universal.jar`'s classpath (known, see the `exclude`s in
   `projects/neoforge/build.gradle`), so those API pieces are currently missing.
-- **BlueMap's "`No regions found`" is about the world name, not a missing folder.**
-  `Server#getLevelDirectory` and `World#getWorldFolder` already answer the 26.2 save layout
-  correctly (see #42); what was left is `World#getName()`, which returned the dimension key's
-  path segment (`the_nether`) where Bukkit's world name is the **folder name**
-  (`world_nether`). BlueMap builds a map id out of that name (the overworld keeps the
-  configured id, every other dimension prefixes it — `_the_nether`, `_the_end`), so a wrong
-  name renames the maps with it.<br>⚠️ **Not verified on a live server**: this environment
-  has no JDK, so the change was only read through by hand. Run it on your server and the
-  warning going away is the evidence; if it persists, post the folder names under
-  `plugins/BlueMap/maps/` and the `world:` line from `blueMap.conf`.
+- **BlueMap's "`No regions found`" has two layers, and both are now answered.**
+  1. *The world name*: `Server#getLevelDirectory` and `World#getWorldFolder` already answer the
+     26.2 save layout correctly (see #42); what was left is `World#getName()`, which returned the
+     dimension key's path segment (`the_nether`) where Bukkit's world name is the **folder name**
+     (`world_nether`). BlueMap builds a map id out of that name (every other dimension prefixes the
+     configured id — `_the_nether`, `_the_end`), so a wrong name renames the maps with it.
+  2. *Whether there are any chunks*: `World#isChunkGenerated` asked "is this chunk in memory". On a
+     fresh start nothing is, so the renderer was told the dimension holds no chunks and never
+     created its update task. It now asks the save (`ChunkMap#readChunk`: reads the region index,
+     generates and loads nothing).
+  <br>The layer the render actually reads is filled in too: `World#getType/getBlockData/getBlockState`,
+  the four `getHighestBlockYAt` (through the game's own Heightmap), `Chunk#getType/getBlockData/setBlock`,
+  `Block#getBlockData` carrying real properties (`oak_stairs[facing=east]`, not the default state), and
+  a modded block no longer throws — one WARN, then AIR.
+  <br>⚠️ **Not verified on a live server**: this environment has no JDK, so the changes were only read
+  through by hand. Run it and the warnings going away is the evidence; if they persist, post the folder
+  names under `plugins/BlueMap/maps/` and the `world:` line from `blueMap.conf`.
 
 ---
 

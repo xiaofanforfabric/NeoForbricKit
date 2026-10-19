@@ -169,52 +169,10 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	static final String JOINED_FIELD = "neofobric$joinEventRaised";
 	static final String FLAG_DESC = "Z";
 
-	/**
-	 * Whether the hook prints a stack per raise, as read HERE for the startup line only.
-	 *
-	 * <p>Duplicated rather than shared: this class runs on the FML plugin layer, which never loads the
-	 * bridge's own classes, so asking {@code ForbricPlayerEventHook} would be the class-literal mistake this
-	 * file's header warns about. One property, one default, two readers.
-	 */
-	private static final boolean JOIN_TRACE = !("off".equalsIgnoreCase(
-			System.getProperty("neofobric.joinTrace", "on"))
-			|| "0".equals(System.getProperty("neofobric.joinTrace", "on"))
-			|| "false".equalsIgnoreCase(System.getProperty("neofobric.joinTrace", "on")));
-
 	/** The leave point's class and method. */
 	static final String PLAYER_LIST_DOT = "net.minecraft.server.players.PlayerList";
 	static final String QUIT_METHOD = "remove";
 	static final String QUIT_DESC = "(Lnet/minecraft/server/level/ServerPlayer;)V";
-
-	/**
-	 * How many times the injected join hook has been ENTERED, as opposed to how many times it raised.
-	 *
-	 * <p>The two numbers answer different questions and this issue has needed both: the raise counter (in the
-	 * hook) says how many events reached a plugin, while this one says how many times the anchor itself was
-	 * reached. A load whose enter count went up while the raise count did not is a raise a guard swallowed; a
-	 * load where neither moved never got to the anchor at all. Without that pair, "no event" and "no injection"
-	 * read the same in a log.
-	 *
-	 * <p>Not reset on quit: the whole point is to compare the connection that was kicked with the one after it.
-	 */
-	public static final java.util.concurrent.atomic.AtomicInteger LOADS_OF =
-			new java.util.concurrent.atomic.AtomicInteger();
-
-	/**
-	 * How many of those loads a guard turned away before the hook raised anything.
-	 *
-	 * <p>Paired with {@link #LOADS_OF} this is the whole picture in two numbers: reached, and reached-again.
-	 * Both are read in the hook's own trace line, so one run of one join answers "was it re-reached" without a
-	 * second build.
-	 */
-	public static final java.util.concurrent.atomic.AtomicInteger TURNED_AWAY =
-			new java.util.concurrent.atomic.AtomicInteger();
-
-	/** Bumped by the injected call before it reaches the hook — see {@link #LOADS_OF}. */
-	static final String COUNT_HOOK = "countJoinLoad";
-	/** Bumped by the injected guard before it returns — see {@link #TURNED_AWAY}. */
-	static final String TURNED_AWAY_HOOK = "countJoinTurnedAway";
-	static final String COUNT_HOOK_OWNER = "net/neoforbrickit/bridge/transform/BukkitPlayerEventInjector";
 
 	/** The static hooks the injected calls reach. */
 	static final String HOOK_OWNER = "net/neoforbrickit/bukkit/ForbricPlayerEventHook";
@@ -307,9 +265,6 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		}
 		MethodInsnNode existingHook = hookCallIn(target);
 		if (existingHook != null) {
-			// Counted even when the hook itself is already installed: a build from before the counter existed
-			// has a hook and no counter, and the class is being rewritten anyway.
-			installLoadCounter(target, existingHook);
 			// Already hooked. The guard may still be missing — an older build of this bridge, or a class
 			// assembled from a cached copy — and leaving it off is exactly the duplicate this class is about,
 			// so it is installed either way, and the flag field is only added when it is genuinely absent.
@@ -342,9 +297,6 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 
 		MethodInsnNode hookCall = new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, JOIN_HOOK, hookDesc(), false);
 		InsnList code = new InsnList();
-		// Counted here, at the anchor itself, and ahead of the guard: an enter count that moves while the raise
-		// count does not is exactly the duplicate this issue keeps chasing, and it is invisible from the hook.
-		code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, COUNT_HOOK_OWNER, COUNT_HOOK, "()V", false));
 		code.add(new VarInsnNode(Opcodes.ALOAD, 0));
 		code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, player.name, player.desc));
 		code.add(hookCall);
@@ -424,33 +376,6 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 	}
 
 	/**
-	 * Puts the load counter in front of the hook call, once.
-	 *
-	 * <p>In front of the GUARD, not inside the hook: a load the guard turns away never reaches the hook, and
-	 * those are exactly the loads this year's debugging needed to count. Emitted from text like everything else
-	 * in this processor — the counter lives on this class, which the transformed class reaches by name.
-	 *
-	 * <p>Searched backwards over the instructions immediately preceding the hook for an existing counter call,
-	 * so a class that already carries one (a cached transform, a second pass) is left alone rather than counted
-	 * twice per load.
-	 */
-	private static void installLoadCounter(MethodNode target, AbstractInsnNode hookCall) {
-		for (AbstractInsnNode at = hookCall.getPrevious(); at != null; at = at.getPrevious()) {
-			if (at instanceof MethodInsnNode call
-					&& call.owner.equals(COUNT_HOOK_OWNER) && call.name.equals(COUNT_HOOK)) {
-				return;
-			}
-			// Stop at the first real instruction other than the hook's own argument load: anything further back
-			// belongs to whatever vanilla code happens to precede the anchor.
-			if (at.getOpcode() >= 0 && at.getOpcode() != Opcodes.ALOAD) {
-				break;
-			}
-		}
-		target.instructions.insertBefore(hookCall,
-				new MethodInsnNode(Opcodes.INVOKESTATIC, COUNT_HOOK_OWNER, COUNT_HOOK, "()V", false));
-	}
-
-	/**
 	 * Makes the join hook fire once per LISTENER, so one client load raises one {@code PlayerJoinEvent}.
 	 *
 	 * <h2>What actually went wrong on the END portal</h2>
@@ -509,10 +434,6 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
 		guard.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, flag.name, flag.desc));
 		guard.add(new JumpInsnNode(Opcodes.IFEQ, raise));
-		// The turned-away pass is counted before it returns: this is the branch that produced "the probe was on
-		// and said nothing" — the load was counted as reached, and the raise as withheld, which together say
-		// the duplicate was real and the guard ate it.
-		guard.add(new MethodInsnNode(Opcodes.INVOKESTATIC, COUNT_HOOK_OWNER, TURNED_AWAY_HOOK, "()V", false));
 		guard.add(new InsnNode(Opcodes.RETURN));
 		guard.add(raise);
 		target.instructions.insertBefore(hookCall, guard);
@@ -526,16 +447,9 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 		// copy of this bridge in the same JVM. Two different reasons looked identical; only one of them
 		// leaves this line. The seam names the anchor it used, so a later change to the anchor shows up
 		// here rather than in a client crash report.
-		// The join trace is named here on purpose: it is the one line that says whether the jar carrying it is
-		// the one running. A report of "the probe was on and printed nothing" is otherwise unanswerable —
-		// the switch and the printer lived in code a different build did not have.
-		// One line, one fixed wording, written to be grepped. Whether the jar in the operator's hands carries
-		// this hook at all is the first question any report has to answer, and it has now been misread once per
-		// revision because each revision worded the sentence differently. The guard field name and the trace
-		// switch ride along: "installed" and "installed and armed" are not the same claim.
 		ForbricLog.info("[NeoFobric/Bukkit] PlayerJoinEvent hook installed on %s.%s"
-						+ " (once-per-load guard armed: %s, join trace %s)",
-						simpleName(node.name), JOIN_METHOD, JOINED_FIELD, JOIN_TRACE ? "on" : "off");
+						+ " (once-per-load guard armed: %s)",
+						simpleName(node.name), JOIN_METHOD, JOINED_FIELD);
 	}
 
 	/**
@@ -752,20 +666,6 @@ public final class BukkitPlayerEventInjector implements ClassProcessor {
 			}
 		}
 		return null;
-	}
-
-	/**
-	 * Called by the injected code once per load packet that reaches the join anchor.
-	 *
-	 * <p>Static and public because the transformed class calls it by name from another loader layer.
-	 */
-	public static void countJoinLoad() {
-		LOADS_OF.incrementAndGet();
-	}
-
-	/** Called by the injected guard when it lets the load pass no further — see {@link #TURNED_AWAY}. */
-	public static void countJoinTurnedAway() {
-		TURNED_AWAY.incrementAndGet();
 	}
 
 	private static String simpleName(String internal) {

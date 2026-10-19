@@ -67,15 +67,7 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
-			// Traced BEFORE the claim, so the raise the guard would have swallowed is in the log too. That is
-			// the whole point of this probe: a suppressed raise and no raise at all look identical from the
-			// outside, and this issue has already been diagnosed once with the wrong one assumed.
-			boolean claimed = joinClaim(player);
-			// Traced with the decision in hand, so one record says both what happened and which code made it
-			// happen. Printed before the branch, so a raise the guard eats leaves the same trace as one it let
-			// through - the ambiguity that cost this issue four rounds of reading an empty log.
-			traceRaise(player, claimed);
-			if (!claimed) {
+			if (!joinClaim(player)) {
 				// The same session, asked for another join. Not hypothetical: the anchor is reached again from
 				// PlayerList.respawn on a move between worlds, and TAB rebuilds its scoreboard each time. The
 				// FIRST event was delivered and the plugin acted on it; a second one makes the client throw the
@@ -312,90 +304,6 @@ public final class ForbricPlayerEventHook {
 	}
 
 	/**
-	 * Whether the join path prints WHO raised it, which is the only evidence that tells the candidates apart.
-	 *
-	 * <h2>Why this exists at all</h2>
-	 *
-	 * <p>Every guard written for this issue so far answered a question about the raise and got it wrong,
-	 * because the trigger was never identified — only its frequency measured. Which code path reaches the
-	 * anchor a second time is what a stack trace settles in one run: the load packet again, {@code respawn}
-	 * during a move between worlds, or a re-dispatch from somewhere that is not the join path at all.
-	 *
-	 * <h2>Why it is ON unless switched off</h2>
-	 *
-	 * <p>It shipped default-off, and a report came back saying the switch had been on for two runs with no
-	 * trace in the log. Both statements were true: the switch was on, and no trace was possible, because the
-	 * only branch that could reach the printer belonged to the raise the guard had already suppressed. A
-	 * probe that is silent when the bug is present is worse than no probe — it reads as proof of absence.
-	 *
-	 * <p>So it prints on every raise the anchor reaches — delivered or dropped — and it is on by default: the
-	 * cost is one trace per join, and the alternative is another round of guessing.
-	 * {@code -Dneofobric.joinTrace=off} turns it off. The counters are kept after the player leaves, because a
-	 * reconnect is the case worth comparing against the join it followed.
-	 */
-	private static final boolean JOIN_TRACE = traceEnabled();
-
-	private static boolean traceEnabled() {
-		String value = System.getProperty("neofobric.joinTrace", "on");
-		return !("off".equalsIgnoreCase(value) || "0".equals(value) || "false".equalsIgnoreCase(value));
-	}
-
-	/**
-	 * How many traces each account has had — the sequence number on the line, not a cap.
-	 *
-	 * <p>Not a cap on purpose. Both an account-level budget and a per-load one were tried here and both went
-	 * quiet before the run that mattered: a session that keeps being kicked keeps reconnecting, and the samples
-	 * from those reconnects are the ones worth having. On a single-threaded server a join is one log record, so
-	 * the cheapest correct answer is to print every one of them.
-	 */
-	private static final java.util.Map<java.util.UUID, Integer> TRACES =
-			new java.util.concurrent.ConcurrentHashMap<>();
-
-	/**
-	 * Prints the full stack of EVERY {@code PlayerJoinEvent} the injected anchor reaches, and says whether it
-	 * was delivered or dropped.
-	 *
-	 * <h2>Why the dropped ones are printed too</h2>
-	 *
-	 * <p>From the outside, "the event was raised and suppressed" and "the event was never reached" produce the
-	 * same log: nothing. This issue has already been worked once on the wrong side of that ambiguity, with the
-	 * probe reading clean while the duplicate was being swallowed one line later. So the trace is taken before
-	 * the claim is consulted, and the line says which it turned out to be.
-	 *
-	 * <h2>Why the whole stack, and not a summary</h2>
-	 *
-	 * <p>Because the question is exactly "which code reached this anchor". A frame count and the thread name
-	 * are what makes two traces of the same join comparable at a glance; the frames above them are what names
-	 * the caller — the load packet, {@code respawn} from a move between worlds, or something that is not the
-	 * join path at all.
-	 *
-	 * <p>Never throws: it runs inside the client's load packet, where anything escaping would be attributed to
-	 * the connection. A failure to print is reported and the raise continues.
-	 */
-	private static void traceRaise(ServerPlayer player, boolean claimed) {
-		if (!JOIN_TRACE) {
-			return;
-		}
-		try {
-			int n = TRACES.merge(player.getUUID(), 1, Integer::sum);
-			Throwable probe = new Throwable("PlayerJoinEvent #" + n + " for " + player.getScoreboardName());
-			StackTraceElement[] frames = probe.getStackTrace();
-			// Header and stack go out as ONE record: the stack is passed as the trailing throwable, so the logger
-			// prints it underneath the same line. Two separate calls made the previous probe unreadable - a stack
-			// filtered out of, or written to a different file than, its header looks exactly like a probe that
-			// never fired, and this issue was diagnosed twice on that misreading.
-			ForbricLog.info("[Forbric/Bukkit] PlayerJoinEvent #%d for %s on thread=%s frames=%d — claimed=%s (%s);"
-							+ " the stack in this same record says who reached the anchor",
-							n, player.getScoreboardName(), Thread.currentThread().getName(), frames.length, claimed,
-							claimed ? "delivering" : "DROPPED by the session guard", probe);
-		} catch (Throwable failure) {
-			// Reported, not swallowed: a probe that fails silently is the failure mode this method exists to fix.
-			ForbricLog.warn("[Forbric/Bukkit] could not trace the PlayerJoinEvent of %s (%s)",
-							player.getScoreboardName(), failure);
-		}
-	}
-
-	/**
 	 * Ends the session this account held, so the next connection raises {@code PlayerJoinEvent} at once.
 	 *
 	 * <p>Called from {@link #playerLeft}, i.e. from {@code PlayerList.remove}, which is the leave path and not
@@ -403,7 +311,6 @@ public final class ForbricPlayerEventHook {
 	 */
 	private static void endSession(ServerPlayer player) {
 		SESSIONS.remove(player.getUUID());
-		// TRACES is deliberately NOT cleared here: a reconnect is the case the probe exists to compare.
 		// A quit arriving while the join event is still on the stack (a listener that disconnects the player)
 		// would otherwise leave the in-flight mark behind, and every later payload from that account would be
 		// held for a join that has already ended.
@@ -420,7 +327,6 @@ public final class ForbricPlayerEventHook {
 	public static void forgetAccounts() {
 		SESSIONS.clear();
 		JOIN_IN_FLIGHT.clear();
-		TRACES.clear();
 	}
 
 	/**

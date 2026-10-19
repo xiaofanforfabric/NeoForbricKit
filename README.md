@@ -90,6 +90,14 @@ Paper 插件发插件消息走的是 `minecraft:register` 这套通道协商，�
 - **CraftBukkit 兼容层仍在补全中。** 有两三个文件在 `universal.jar` 的编译
   classpath 上过不了（已知，见 `projects/neoforge/build.gradle` 的 exclude），
   对应的 API 目前是缺失的。
+- **BlueMap 的"`No regions found`"来自世界名，不是找不到文件夹。**
+  `Server#getLevelDirectory` / `World#getWorldFolder` 在 26.2 的存档布局下已经答对了
+  （见 #42），剩下的告警是 `World#getName()`：桥原先回的是维度键的路径段
+  （`the_nether`），而 Bukkit 的世界名是**文件夹名**（`world_nether`）。BlueMap 拿这个名字
+  拼地图 id（overworld 用配置的 id，其余维度用它做前缀 → `_the_nether` / `_the_end`），
+  名字错了地图就跟着改名。<br>⚠️ **这一条未实机验证**：本环境无 JDK，改动只过了人工走读。
+  换到你的服上跑一轮，若告警消失就说明这条坐实；若仍旧，把 `plugins/BlueMap/maps/` 下的
+  目录名和 `blueMap.conf` 里的 `world:` 行发上来。
 
 ---
 
@@ -372,6 +380,16 @@ both directions.
 - **The CraftBukkit layer is still being filled in.** A couple of files do not compile on
   `universal.jar`'s classpath (known, see the `exclude`s in
   `projects/neoforge/build.gradle`), so those API pieces are currently missing.
+- **BlueMap's "`No regions found`" is about the world name, not a missing folder.**
+  `Server#getLevelDirectory` and `World#getWorldFolder` already answer the 26.2 save layout
+  correctly (see #42); what was left is `World#getName()`, which returned the dimension key's
+  path segment (`the_nether`) where Bukkit's world name is the **folder name**
+  (`world_nether`). BlueMap builds a map id out of that name (the overworld keeps the
+  configured id, every other dimension prefixes it — `_the_nether`, `_the_end`), so a wrong
+  name renames the maps with it.<br>⚠️ **Not verified on a live server**: this environment
+  has no JDK, so the change was only read through by hand. Run it on your server and the
+  warning going away is the evidence; if it persists, post the folder names under
+  `plugins/BlueMap/maps/` and the `world:` line from `blueMap.conf`.
 
 ---
 

@@ -127,14 +127,41 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	/**
 	 * The world's name, as Bukkit knows it: the folder it is stored under.
 	 *
-	 * <p>Minecraft names a dimension with a {@code ResourceKey} ({@code minecraft:overworld}); Bukkit names a
-	 * world with the folder in {@code saves/} ({@code world}). The key's path half is what a plugin writes when
-	 * it says {@code getWorld("world")}, and it is the half that stays put when a datapack moves a dimension
-	 * between namespaces.
+	 * <p>For the three vanilla dimensions that is the save folder a Bukkit server writes them to --
+	 * {@code world}, {@code world_nether}, {@code world_the_end} -- NOT the dimension key's path. Bukkit's
+	 * world names are folders first: {@code Server#getWorld(String)} is asked for the world by that same
+	 * string, and a plugin appends the name to a directory to build a path. Minecraft also has a folder called
+	 * {@code the_nether}, which is exactly why the two are easy to conflate and must not be.
+	 *
+	 * <p>BlueMap is the caller that noticed: it names a map after the world, prefixing the overworld's
+	 * configured id with this name for every other dimension -- hence {@code _the_nether} in its log where a
+	 * stock server says {@code world_nether}. Answering the key path here renames those maps behind the server
+	 * owner's back, and a renamed map folder is a re-render.
+	 *
+	 * <p>A datapack dimension has no Bukkit folder name to inherit, so its key path stands in -- a name nobody
+	 * configured, and the one {@code Server#getWorld(String)} accepts for it.
 	 */
 	@Override
 	public String getName() {
-		return level.dimension().identifier().getPath();
+		net.minecraft.resources.Identifier id = level.dimension().identifier();
+		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD
+				|| level.dimension() == net.minecraft.world.level.Level.NETHER
+				|| level.dimension() == net.minecraft.world.level.Level.END) {
+			// `<level-name>`, `<level-name>_nether`, `<level-name>_the_end` -- the folders the game itself
+			// writes next to each other. Read from the save root rather than assumed, because
+			// `level-name=survival` makes them `survival_nether`, and `--universe` moves all three.
+			String root = level.getServer()
+					.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+					.getFileName().toString();
+			if (level.dimension() == net.minecraft.world.level.Level.NETHER) {
+				return root + "_nether";
+			}
+			if (level.dimension() == net.minecraft.world.level.Level.END) {
+				return root + "_the_end";
+			}
+			return root;
+		}
+		return id.getPath();
 	}
 
 	/**

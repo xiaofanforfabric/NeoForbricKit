@@ -237,6 +237,12 @@ public final class BridgeBootstrap {
 		// tasks hold a reference to a plugin that is no longer enabled. Stopping the timers after the
 		// plugins (rather than before) lets a plugin's own onDisable cancel what it scheduled.
 		server.shutdownSchedulers();
+		// The join hook's session book is static, so a bridge started again in this JVM would otherwise
+		// think every account already had its PlayerJoinEvent and raise none until they next disconnect.
+		ForbricPlayerEventHook.forgetAccounts();
+		// Held client messages go with it: the plugins that would have received them are disabled, and the
+		// queue is static like the session book above.
+		ForbricMessageHook.forgetHeld();
 		// The server stays registered, and deliberately so: a plugin's shutdown code still calls
 		// Bukkit.getXxx(), and a null field would turn a clean disable into the NullPointerException this
 		// bridge exists to avoid. Nothing has to be done to keep it - Bukkit holds the instance in its own

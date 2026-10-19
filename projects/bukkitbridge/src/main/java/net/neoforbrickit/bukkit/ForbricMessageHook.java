@@ -33,6 +33,130 @@ public final class ForbricMessageHook {
 	 * rather than delivered to nobody.
 	 */
 	public static void dispatchFromGame(ServerPlayer player, ServerboundCustomPayloadPacket packet) {
+		// Held rather than delivered when it arrived in the middle of this player's join event. The client
+		// cannot have answered something asked after that raise began, so a reply this early is to the
+		// handshake that raise itself sent — and completing a plugin's handshake while the server still
+		// considers the client to be loading is a state the game never produces on its own. Delivered on
+		// the next queued pass instead, which is one tick away at most; nothing is dropped.
+		//
+		// The deep copy is not tidiness: the payload object belongs to the packet being handled, and a
+		// payload whose packet has been released must not be read later.
+		if (ForbricPlayerEventHook.isJoining(player)) {
+			CustomPacketPayload copied = ForbricRawPayload.copyOf(packet.payload());
+			if (copied != null) {
+				ServerboundCustomPayloadPacket held = new ServerboundCustomPayloadPacket(copied);
+				synchronized (DEFERRED) {
+					DEFERRED.addLast(held);
+					DEFERRED_PLAYER.addLast(player.getUUID());
+				}
+				net.neoforbrickit.bridge.util.ForbricLog.info(
+						"[Forbric/Bukkit] client payload arrived during %s's join event, so it is delivered"
+								+ " after it finishes rather than inside the join handler (thread=%s)",
+						player.getScoreboardName(), Thread.currentThread().getName());
+				scheduleDrain();
+				return;
+			}
+			// No copy possible: delivering late is impossible too, and dropping a plugin message the plugin
+			// is waiting for is worse than delivering it early. Falls through to the normal path.
+		}
+		deliver(player, packet);
+	}
+
+	/** Payloads held while a join event was running, oldest first, each with the player it came from. */
+	private static final java.util.ArrayDeque<ServerboundCustomPayloadPacket> DEFERRED =
+			new java.util.ArrayDeque<>();
+	private static final java.util.ArrayDeque<java.util.UUID> DEFERRED_PLAYER = new java.util.ArrayDeque<>();
+
+	/** Set while a drain is queued, so a burst of held payloads queues ONE drain rather than one each. */
+	private static final java.util.concurrent.atomic.AtomicBoolean DRAIN_QUEUED =
+			new java.util.concurrent.atomic.AtomicBoolean();
+
+	/**
+	 * Queues one drain on the game thread.
+	 *
+	 * <p>{@code MinecraftServer#execute} runs the task on the next pass of the server's own loop, which is
+	 * exactly "after the handler that caused this". Queued through the bridge's server rather than a thread of
+	 * our own: these are plugin messages, and a plugin listener that touches the world has to be on the game
+	 * thread.
+	 */
+	private static void scheduleDrain() {
+		if (!DRAIN_QUEUED.compareAndSet(false, true)) {
+			return;
+		}
+		org.bukkit.Server server = org.bukkit.Bukkit.getServer();
+		if (!(server instanceof ServerImpl bridgeServer) || bridgeServer.minecraft() == null) {
+			// No game to queue on: deliver now rather than hold a payload nobody will come back for.
+			DRAIN_QUEUED.set(false);
+			drain();
+			return;
+		}
+		try {
+			bridgeServer.minecraft().execute(ForbricMessageHook::drain);
+		} catch (Throwable failure) {
+			DRAIN_QUEUED.set(false);
+			net.neoforbrickit.bridge.util.ForbricLog.warn(
+					"[NeoFobric/Bukkit] could not queue held plugin messages; they are delivered immediately");
+			drain();
+		}
+	}
+
+	/** Delivers everything held, oldest first, and clears the pending flag even if one of them throws. */
+	private static void drain() {
+		try {
+			while (true) {
+				ServerboundCustomPayloadPacket packet;
+				java.util.UUID who;
+				synchronized (DEFERRED) {
+					packet = DEFERRED.pollFirst();
+					who = DEFERRED_PLAYER.pollFirst();
+				}
+				if (packet == null) {
+					return;
+				}
+				ServerPlayer player = playerOf(who);
+				if (player == null) {
+					// Left between the hold and the drain. The quit path has already told the plugin.
+					net.neoforbrickit.bridge.util.ForbricLog.debug(
+							"[NeoFobric/Bukkit] a held plugin message lost its player before delivery; dropped");
+					continue;
+				}
+				deliver(player, packet);
+			}
+		} finally {
+			DRAIN_QUEUED.set(false);
+		}
+	}
+
+	/**
+	 * Drops every held client message.
+	 *
+	 * <p>For the bridge's own shutdown: the queue is static, and the plugins that would have received what is
+	 * in it have been disabled. Left behind, a restarted bridge would deliver a stranger's handshake to a
+	 * freshly loaded plugin.
+	 */
+	public static void forgetHeld() {
+		synchronized (DEFERRED) {
+			DEFERRED.clear();
+			DEFERRED_PLAYER.clear();
+		}
+	}
+
+	/** The online player with this id, or null once they have left. */
+	private static ServerPlayer playerOf(java.util.UUID id) {
+		org.bukkit.Server server = org.bukkit.Bukkit.getServer();
+		if (!(server instanceof ServerImpl bridgeServer) || bridgeServer.minecraft() == null) {
+			return null;
+		}
+		for (ServerPlayer candidate : bridgeServer.minecraft().getPlayerList().getPlayers()) {
+			if (candidate.getUUID().equals(id)) {
+				return candidate;
+			}
+		}
+		return null;
+	}
+
+	/** The delivery itself, unchanged apart from being callable from both the immediate and the held path. */
+	private static void deliver(ServerPlayer player, ServerboundCustomPayloadPacket packet) {
 		try {
 			if (player == null || packet == null) {
 				return;

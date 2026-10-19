@@ -235,11 +235,21 @@ public final class ForbricSchedulers {
             // body directly here would let the exception escape into the scheduling call -- so a plugin
             // that schedules from a command handler would see the game's command dispatch report the
             // throw, and the task bookkeeping (state, forget()) would be left half done.
-            task.runOnGameThread(server);
+            task.runOnGameThread(server, false);
             return task;
         }
 
-        Runnable dispatch = () -> task.runOnGameThread(server);
+        // `fromTimer`, not the thread we happen to be on: a plugin body running on the timer can schedule
+        // the next run synchronously, and that call has to queue rather than run here.
+        //
+        // The zero delay is set here rather than in the task because the body runs one hop LATER now: the
+        // timer fires, this dispatch hands the body to the game queue, and the body runs on the next tick.
+        // A plugin that re-schedules itself from inside the body (Simple Voice Chat does, per message) reads
+        // what is left of the delay, and the delay it asked for is already spent.
+        Runnable dispatch = () -> {
+            task.delayMillis = 0L;
+            task.runOnGameThread(server, true);
+        };
         if (repeating) {
             gameTimer.scheduleAtFixedRate(dispatch, delayMillis, periodMillis, TimeUnit.MILLISECONDS);
         } else {
@@ -274,6 +284,16 @@ public final class ForbricSchedulers {
         private final Consumer<ScheduledTask> body;
         private final boolean repeating;
         private final AtomicBoolean cancelled = new AtomicBoolean();
+        /**
+         * The delay this task was scheduled with, in ms — the wait left before its body runs.
+         *
+         * <p>Handed over as the times arrive rather than kept as ticks: the timer takes milliseconds, and
+         * converting back would let a fractional tick round into a delay nobody asked for. Cleared when the
+         * timer hands the body over, because from that point the wait is over — a plugin that reads it inside
+         * its own body to schedule the next run would otherwise pick the previous delay up again and run a
+         * tick early, which is the drift this class's timer hop was changed to stop.
+         */
+        volatile long delayMillis;
         /** The id BOTH APIs report: ScheduledTask has none, BukkitTask's is this. */
         final int id = TASK_IDS.incrementAndGet();
         private volatile ExecutionState state = ExecutionState.IDLE;
@@ -284,8 +304,24 @@ public final class ForbricSchedulers {
             this.repeating = repeating;
         }
 
-        /** Runs the body on the game thread, skipping it when it was cancelled while queued. */
-        void runOnGameThread(ServerImpl server) {
+        /**
+         * Runs the body on the game thread, skipping it when it was cancelled while queued.
+         *
+         * <p><b>{@code fromTimer} is not the same question as {@code isPrimaryThread()}.</b> The timer
+         * threads this class owns are neither the game thread nor the caller's, and
+         * {@code ServerImpl.isPrimaryThread()} has to keep answering "not the game thread" about them:
+         * it is the API's answer to "may I touch the world directly", and returning {@code true} on a
+         * thread the game is not ticking would let a plugin write to the world from a foreign thread
+         * with no warning.
+         *
+         * <p>The consequence is that this hop cannot be decided by asking the thread: while a task runs
+         * on the timer, the calling thread answers "not primary", {@code minecraft().execute} sees a task
+         * that is already queued on the game thread and queues it behind itself, and the body runs one
+         * server tick BEFORE the task's own delay elapses. A timer task would then drift a tick early
+         * every period; TAB's belowname refresh hit this on the join path. So the timer says who it is,
+         * and a dispatch from it is always handed to the game's own queue.
+         */
+        void runOnGameThread(ServerImpl server, boolean fromTimer) {
             if (stopped()) {
                 state = ExecutionState.CANCELLED;
                 forget();
@@ -293,7 +329,7 @@ public final class ForbricSchedulers {
             }
             // The body is run here rather than re-dispatched: the timer thread is not the game thread, so
             // this hops onto it through the server's own queue when it has to.
-            if (server.isPrimaryThread()) {
+            if (!fromTimer && server.isPrimaryThread()) {
                 invoke();
                 forget();
             } else {
@@ -366,8 +402,16 @@ public final class ForbricSchedulers {
             state = ExecutionState.RUNNING;
         }
 
-        /** Runs the body and records what happened, on whichever thread the caller chose. */
+        /**
+         * Runs the body and records what happened, on whichever thread the caller chose.
+         *
+         * <p>Also where the delay is spent. The hop onto the game queue means the body runs on the tick
+         * AFTER the timer fired, and a plugin that schedules its next run from inside the body reads the
+         * delay there: leaving the old value behind makes every such task run a tick early, which is the
+         * drift the timer hop was changed to stop, only moved one call further out.
+         */
         void runBody() {
+            delayMillis = 0L;
             body.accept(this);
             state = repeating ? ExecutionState.RUNNING : ExecutionState.FINISHED;
         }

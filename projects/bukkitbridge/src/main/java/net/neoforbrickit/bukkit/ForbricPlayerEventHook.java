@@ -67,26 +67,23 @@ public final class ForbricPlayerEventHook {
 			// The player is registered with the game by this point, so the wrapper is live: it reads
 			// through to the game object for every accessor, and a plugin that stores it keeps working.
 			org.bukkit.entity.Player bukkitPlayer = ForbricPlayer.of(player, server);
-			if (!joinClaim(player)) {
+			// Traced BEFORE the claim, so the raise the guard would have swallowed is in the log too. That is
+			// the whole point of this probe: a suppressed raise and no raise at all look identical from the
+			// outside, and this issue has already been diagnosed once with the wrong one assumed.
+			boolean claimed = joinClaim(player);
+			traceRaise(player, claimed);
+			if (!claimed) {
 				// The same session, asked for another join. Not hypothetical: the anchor is reached again from
 				// PlayerList.respawn on a move between worlds, and TAB rebuilds its scoreboard each time. The
 				// FIRST event was delivered and the plugin acted on it; a second one makes the client throw the
 				// connection away over a duplicate objective name. The thread is logged because the raise is not
 				// always on the server thread, and which one it was is the first question a repeat asks.
-				traceRepeatRaise(player);
 				ForbricLog.info("[Forbric/Bukkit] %s already has a PlayerJoinEvent this session — no second one is"
 								+ " raised (thread=%s)", player.getScoreboardName(),
 								Thread.currentThread().getName());
 				return;
 			}
-			// Traced on the raise that actually goes OUT, the first of its session included. The report behind
-			// this issue carried the switch on for two runs and produced no trace at all, because the one
-			// branch that could reach the trace was the branch the guard had already closed: the second raise
-			// was suppressed here, so nothing was ever printed, and the log read as "the probe is broken".
-			// Every raise that reaches a client is a candidate for the one that kills it, so the trace is
-			// taken here — before the call, from the thread that really is raising — and capped per account
-			// rather than per session.
-			traceRaise(player);
+			noteLoadStart(player);
 			// Unconditional otherwise, while the seam is being proven: the only other evidence an event fired is
 			// the plugin's own reaction, and for a plugin whose listener does nothing visible that is
 			// not evidence at all. One line per join is nothing next to what the game already logs.
@@ -329,15 +326,10 @@ public final class ForbricPlayerEventHook {
 	 * only branch that could reach the printer belonged to the raise the guard had already suppressed. A
 	 * probe that is silent when the bug is present is worse than no probe — it reads as proof of absence.
 	 *
-	 * <p>So it prints on every raise that is actually delivered, and it is on by default: the cost is one
-	 * trace per join, and the alternative is another round of guessing.
-	 * {@code -Dneofobric.joinTrace=off} turns it off.
-	 *
-	 * <h2>Why a cap per account</h2>
-	 *
-	 * <p>The stack is the same on every join, so a few per account are enough to catch a pattern, and an
-	 * uncapped trace on a server that keeps being tested buries everything else. Counted per account and
-	 * kept after the player leaves, because a reconnect is the case worth seeing twice.
+	 * <p>So it prints on every raise the anchor reaches — delivered or dropped — and it is on by default: the
+	 * cost is one trace per join, and the alternative is another round of guessing.
+	 * {@code -Dneofobric.joinTrace=off} turns it off. The counters are kept after the player leaves, because a
+	 * reconnect is the case worth comparing against the join it followed.
 	 */
 	private static final boolean JOIN_TRACE = traceEnabled();
 
@@ -346,65 +338,85 @@ public final class ForbricPlayerEventHook {
 		return !("off".equalsIgnoreCase(value) || "0".equals(value) || "false".equalsIgnoreCase(value));
 	}
 
-	/** Traces printed per account before it goes quiet; enough to see a repeat, not enough to bury a log. */
-	private static final int TRACE_LIMIT = 6;
-
-	/** How many traces each account has had, capped by {@link #TRACE_LIMIT}. */
+	/**
+	 * How many traces each account has had — the sequence number on the line, not a cap.
+	 *
+	 * <p>Every trace that belongs to the same client load is printed; a probe that goes quiet after N samples
+	 * always goes quiet before the run that matters, and this one is read by a human comparing two traces of
+	 * the same join. The numbering is what lets them be told apart in one grep.
+	 *
+	 * <p>Capped per LOAD, not per account, because the duplicate is per load by construction: a session that
+	 * keeps being kicked keeps reconnecting, and the account-level cap ran out in the middle of the reconnects
+	 * that matter. See {@link #LOAD_STARTS}.
+	 */
 	private static final java.util.Map<java.util.UUID, Integer> TRACES =
 			new java.util.concurrent.ConcurrentHashMap<>();
 
+	/** Traces printed per client load before it goes quiet; past this the stack is the same stack. */
+	private static final int TRACE_LIMIT_PER_LOAD = 4;
+
 	/**
-	 * Prints the stack of a raise that is about to reach the plugins.
+	 * The value of {@link #TRACES} when this player's current load began, so a repeat is counted per load.
 	 *
-	 * <p>A few frames up are the ones that matter: this method, {@link #playerJoined}, the injected call site
-	 * and then whichever of the game's own paths reached it. Nothing here interprets the trace — the point is
-	 * that the reading is done against a real one instead of a hypothesis.
-	 *
-	 * <p>Never throws: it runs inside the client's load packet, where anything escaping would be attributed
-	 * to the connection. A failure to print is reported and the raise continues.
+	 * <p>Keyed by the same counter: the delta is "how many traces this load has printed", and nothing has to be
+	 * cleared on quit — a reconnecting account simply reads its own total as the new baseline.
 	 */
-	private static void traceRaise(ServerPlayer player) {
-		if (!JOIN_TRACE) {
-			return;
-		}
-		try {
-			int printed = TRACES.merge(player.getUUID(), 1, Integer::sum);
-			if (printed > TRACE_LIMIT) {
-				return;
-			}
-			ForbricLog.info("[Forbric/Bukkit] PlayerJoinEvent #%d for %s is being raised; the stack below says"
-							+ " from where (thread=%s)", printed, player.getScoreboardName(),
-							Thread.currentThread().getName());
-			new Throwable("PlayerJoinEvent #" + printed + " for " + player.getScoreboardName())
-					.printStackTrace();
-		} catch (Throwable failure) {
-			ForbricLog.warn("[Forbric/Bukkit] could not trace the PlayerJoinEvent of %s (%s)",
-							player.getScoreboardName(), failure);
-		}
+	private static final java.util.Map<java.util.UUID, Integer> LOAD_STARTS =
+			new java.util.concurrent.ConcurrentHashMap<>();
+
+	/**
+	 * Records that {@code player} has arrived on a new connection, which restarts the per-load budget.
+	 *
+	 * <p>Called from the delivered side of {@code playerJoined}: that is the first raise of a session, i.e. the
+	 * join that the following repeats are repeats OF.
+	 */
+	private static void noteLoadStart(ServerPlayer player) {
+		LOAD_STARTS.put(player.getUUID(), TRACES.getOrDefault(player.getUUID(), 0));
+	}
+
+	private static int loadBaseline(ServerPlayer player) {
+		return LOAD_STARTS.getOrDefault(player.getUUID(), 0);
 	}
 
 	/**
-	 * Prints the stack of a raise the guard has just suppressed.
+	 * Prints the full stack of EVERY {@code PlayerJoinEvent} the injected anchor reaches, and says whether it
+	 * was delivered or dropped.
 	 *
-	 * <p>A different question from {@link #traceRaise}: this one never reaches a client, so it cannot be the
-	 * packet that kills one — but it is the evidence that the anchor is being reached more than once, and
-	 * which path reached it. Shared cap, so the two together stay readable.
+	 * <h2>Why the dropped ones are printed too</h2>
+	 *
+	 * <p>From the outside, "the event was raised and suppressed" and "the event was never reached" produce the
+	 * same log: nothing. This issue has already been worked once on the wrong side of that ambiguity, with the
+	 * probe reading clean while the duplicate was being swallowed one line later. So the trace is taken before
+	 * the claim is consulted, and the line says which it turned out to be.
+	 *
+	 * <h2>Why the whole stack, and not a summary</h2>
+	 *
+	 * <p>Because the question is exactly "which code reached this anchor". A frame count and the thread name
+	 * are what makes two traces of the same join comparable at a glance; the frames above them are what names
+	 * the caller — the load packet, {@code respawn} from a move between worlds, or something that is not the
+	 * join path at all.
+	 *
+	 * <p>Never throws: it runs inside the client's load packet, where anything escaping would be attributed to
+	 * the connection. A failure to print is reported and the raise continues.
 	 */
-	private static void traceRepeatRaise(ServerPlayer player) {
+	private static void traceRaise(ServerPlayer player, boolean delivered) {
 		if (!JOIN_TRACE) {
 			return;
 		}
 		try {
-			int printed = TRACES.merge(player.getUUID(), 1, Integer::sum);
-			if (printed > TRACE_LIMIT) {
+			int n = TRACES.merge(player.getUUID(), 1, Integer::sum);
+			if (n - loadBaseline(player) > TRACE_LIMIT_PER_LOAD) {
 				return;
 			}
-			ForbricLog.info("[Forbric/Bukkit] a second PlayerJoinEvent was reached for %s and suppressed;"
-							+ " the stack below says from where (thread=%s)",
-							player.getScoreboardName(), Thread.currentThread().getName());
-			new Throwable("suppressed PlayerJoinEvent for " + player.getScoreboardName()).printStackTrace();
+			Throwable probe = new Throwable("PlayerJoinEvent #" + n + " for " + player.getScoreboardName());
+			StackTraceElement[] frames = probe.getStackTrace();
+			ForbricLog.info("[Forbric/Bukkit] PlayerJoinEvent #%d for %s on thread=%s frames=%d — %s;"
+							+ " the stack below says who reached the anchor",
+							n, player.getScoreboardName(), Thread.currentThread().getName(), frames.length,
+							delivered ? "delivering" : "DROPPED by the session guard");
+			ForbricLog.info("%s", probe);
 		} catch (Throwable failure) {
-			ForbricLog.warn("[Forbric/Bukkit] could not trace the suppressed PlayerJoinEvent of %s (%s)",
+			ForbricLog.warn("[Forbric/Bukkit] could not trace the PlayerJoinEvent of %s (%s)",
 							player.getScoreboardName(), failure);
 		}
 	}
@@ -435,6 +447,7 @@ public final class ForbricPlayerEventHook {
 		SESSIONS.clear();
 		JOIN_IN_FLIGHT.clear();
 		TRACES.clear();
+		LOAD_STARTS.clear();
 	}
 
 	/**

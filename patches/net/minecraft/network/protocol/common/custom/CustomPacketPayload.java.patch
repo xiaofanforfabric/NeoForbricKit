@@ -1,6 +1,15 @@
 --- a/net/minecraft/network/protocol/common/custom/CustomPacketPayload.java
 +++ b/net/minecraft/network/protocol/common/custom/CustomPacketPayload.java
-@@ -22,20 +_,46 @@
+@@ -22,20 +_,55 @@
++    /**
++     * NeoFobric: thrown out of the vanilla decode path for a channel Fabric registered, so that the decode
++     * handler Fabric prepends to that path gets the chance to decode it first. Only the type matters; the
++     * id is carried so a stack trace names the channel.
++     *
++     * <p>Declared at the top of the file: it is the only throwable on that path, and the decode catch names
++     * it by its simple name, so it has to be in scope there.
++     */
++    record FabricDecodeEverything(Identifier id) implements net.minecraft.network.protocol.Packet {}
      }
  
      static <B extends FriendlyByteBuf> StreamCodec<B, CustomPacketPayload> codec(
@@ -47,7 +56,7 @@
              }
  
              public void encode(B output, CustomPacketPayload value) {
-@@ -44,11 +_,52 @@
+@@ -44,10 +_,41 @@
  
              public CustomPacketPayload decode(B input) {
                  Identifier identifier = input.readIdentifier();
@@ -87,16 +96,5 @@
 +    default net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket toVanillaServerbound() {
 +        return new net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket(this);
      }
- 
-+    /**
-+     * NeoFobric: what the vanilla decode path throws for a channel Fabric registered, so that the decode
-+     * mixin Fabric prepends to that path gets the chance to decode it first. Only the type matters; the id
-+     * is carried so a stack trace names the channel.
-+     */
-+    class FabricDecodeEverything extends RuntimeException {
-+        FabricDecodeEverything(Identifier id) {
-+            super("Forwarding " + id + " to Fabric's networking", null, false, false);
-+        }
-+    }
  
      interface FallbackProvider<B extends FriendlyByteBuf> {

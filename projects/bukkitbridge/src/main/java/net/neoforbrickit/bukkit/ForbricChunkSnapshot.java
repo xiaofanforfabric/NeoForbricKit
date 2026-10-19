@@ -336,7 +336,10 @@ final class ForbricChunkSnapshot implements org.bukkit.ChunkSnapshot {
 	private static net.minecraft.world.level.block.state.BlockState stateOf(
 			net.minecraft.nbt.CompoundTag entry) {
 		com.mojang.serialization.DataResult<net.minecraft.world.level.block.state.BlockState> parsed =
-				net.minecraft.world.level.block.Block.CODEC.parse(net.minecraft.nbt.NbtOps.INSTANCE, entry);
+				// BlockState.CODEC, not Block.CODEC: a palette entry carries Name AND Properties, and
+				// Block.CODEC is a MapCodec over the block alone -- it has no parse() at all.
+				net.minecraft.world.level.block.state.BlockState.CODEC
+						.parse(net.minecraft.nbt.NbtOps.INSTANCE, entry);
 		if (parsed.isError()) {
 			net.neoforbrickit.bridge.util.ForbricLog.warn(
 					"[Forbric/Bukkit] unreadable palette entry %s: %s", entry.toString(),
@@ -378,8 +381,10 @@ final class ForbricChunkSnapshot implements org.bukkit.ChunkSnapshot {
 	private static net.minecraft.world.level.chunk.DataLayer lightLayer(
 			net.minecraft.world.level.chunk.LevelChunk chunk, int sectionIndex,
 			net.minecraft.world.level.LightLayer layer) {
-		return chunk.getLightEngine().getLayerListener(layer).getDataLayerData(
-				net.minecraft.core.SectionPos.of(chunk.getPos(),
+		// The light engine belongs to the level's chunk source, not to the chunk:
+		// LevelChunk has no getLightEngine() of its own.
+		return chunk.getLevel().getChunkSource().getLightEngine().getLayerListener(layer)
+				.getDataLayerData(net.minecraft.core.SectionPos.of(chunk.getPos(),
 						chunk.getSectionYFromSectionIndex(sectionIndex)));
 	}
 

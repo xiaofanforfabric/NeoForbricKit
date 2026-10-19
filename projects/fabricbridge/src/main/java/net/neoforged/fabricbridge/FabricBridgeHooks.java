@@ -642,7 +642,7 @@ public final class FabricBridgeHooks {
             "SERVERBOUND_CONFIGURATION", "CLIENTBOUND_CONFIGURATION", "SERVERBOUND_PLAY", "CLIENTBOUND_PLAY"
     };
 
-    /** {@code (registry, get(Identifier))} pairs of the registries above, resolved once. */
+    /** {@code (registry, get(Identifier))} pairs of the registries above, resolved on first use. */
     private static volatile java.util.List<java.util.function.Predicate<String>> fabricChannelTests;
 
     /**
@@ -701,6 +701,45 @@ public final class FabricBridgeHooks {
         return false;
     }
 
+    /**
+     * {@return whether Fabric should decode this channel itself, before NeoForge's decode path answers it}
+     *
+     * <p>Fabric prepends its handler to vanilla's payload decode, but it only does anything while the
+     * payload is still an id: it looks the id up in {@code PayloadTypeRegistry} and decodes with whatever
+     * codec it finds there. What it cannot recover from is the payload having been decoded already, and
+     * NeoForge's decode path answers "unregistered, refuse to decode" (which lands in the fallback as an
+     * unknown channel) for every id its own registry does not know - which includes every channel a Fabric
+     * mod registered. Those payloads therefore arrived as {@code DiscardedPayload}, their bodies went down
+     * the Bukkit plugin-message path and Fabric's receivers never saw them: Simple Voice Chat's
+     * {@code voicechat:request_secret} handshake was refused as an unregistered payload and the client
+     * stayed disconnected from voice chat for the whole session.
+     *
+     * <p>So the vanilla decode path throws for exactly those ids, and Fabric's prepended handler gets its
+     * turn: it decodes with Fabric's codec and returns without calling on. Everything else behaves as
+     * before - a channel Fabric never registered falls through that handler to the ordinary path, and a
+     * NeoForge-registered channel has its codec there anyway.
+     *
+     * <p>This is the same set {@link #isFabricChannel} answers, so the two directions stay symmetric: what
+     * NeoForge lets Fabric send is what NeoForge lets Fabric decode.
+     *
+     * <p>Called on the network thread, whose first Fabric payload pays for the one-time registry scan behind
+     * {@link #isFabricChannel}. A lookup that fails answers "not Fabric": the alternative is an exception
+     * out of a codec on the network thread, and the handshake this exists for would be the first casualty.
+     *
+     * @param channel the payload id being decoded, or null when there is none
+     */
+    public static boolean letFabricDecode(Object channel) {
+        if (channel == null || !bridgeActive()) {
+            return false;
+        }
+        try {
+            return isFabricChannel(channel.toString());
+        } catch (Throwable t) {
+            LOGGER.debug("[NeoFobric] Could not ask Fabric about the channel of {}", channel, t);
+            return false;
+        }
+    }
+
     /** {@return the namespaces of the loaded Fabric mods, resolved once} */
     private static java.util.Set<String> fabricModNamespaces() {
         var resolved = fabricNamespaces;
@@ -756,6 +795,14 @@ public final class FabricBridgeHooks {
 
     private static volatile java.util.Set<String> fabricNamespaces;
 
+    /**
+     * A scan that failed publishes nothing and is retried on the next lookup.
+     *
+     * <p>Both decoders reach this: the packet classes build one codec per connection, and the client
+     * decodes vanilla's own channel declarations with it before the server ever sends a Fabric payload. A
+     * scan that ran into fabric-networking-api-v1 still initialising would otherwise be frozen as an empty
+     * list for the rest of the session, and every Fabric channel would be an unknown one again.
+     */
     private static java.util.List<java.util.function.Predicate<String>> fabricChannelTests() {
         var resolved = fabricChannelTests;
         if (resolved != null) {
@@ -763,6 +810,7 @@ public final class FabricBridgeHooks {
         }
 
         var tests = new java.util.ArrayList<java.util.function.Predicate<String>>(FABRIC_PAYLOAD_TYPE_REGISTRIES.length);
+        var complete = true;
         try {
             var modsLoader = net.fabricmc.loader.impl.launch.FabricLauncherBase.getLauncher().getTargetClassLoader();
             var payloadTypeRegistry = Class.forName("net.fabricmc.fabric.impl.networking.PayloadTypeRegistryImpl", false, modsLoader);
@@ -790,11 +838,16 @@ public final class FabricBridgeHooks {
                 });
             }
         } catch (Throwable t) {
+            // Fabric's registries are not reachable yet, or not at all (a pure NeoForge run). Publish
+            // nothing: see the note on the field.
+            complete = false;
             LOGGER.debug("[NeoFobric] Could not reach Fabric's payload type registries for the channel lookup", t);
         }
 
         resolved = java.util.List.copyOf(tests);
-        fabricChannelTests = resolved;
+        if (complete) {
+            fabricChannelTests = resolved;
+        }
         return resolved;
     }
 

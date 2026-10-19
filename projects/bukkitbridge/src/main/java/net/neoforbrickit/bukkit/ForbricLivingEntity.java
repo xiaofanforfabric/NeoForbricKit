@@ -57,6 +57,10 @@ class ForbricLivingEntity extends ForbricEntity implements org.bukkit.entity.Liv
      */
     private final net.minecraft.world.entity.LivingEntity living;
 
+    /** One line per refusing method, rather than one per call: an event handler runs every tick. */
+    private static final java.util.Set<String> NOT_YET_REPORTED =
+                    java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
     ForbricLivingEntity(net.minecraft.world.entity.LivingEntity living, ServerImpl server) {
         super(living, server);
         this.living = living;
@@ -67,7 +71,23 @@ class ForbricLivingEntity extends ForbricEntity implements org.bukkit.entity.Liv
         return living;
     }
 
+    /**
+     * Refuses by method name, and says so loudly enough to survive being swallowed.
+     *
+     * <p><b>Called straight out of an event handler, the stack trace is usually lost.</b> Reflective
+     * listeners wrap it and {@code ForbricInteractDispatch.raise()} catches {@code Throwable} and returns
+     * {@code false}, so the plugin's guard clause — {@code isSneaking()}, {@code isOnGround()},
+     * {@code getCooldown(...)} — throws, the event goes no further, and the plugin simply does nothing
+     * with no line in {@code latest.log} to explain it. So the refusal is logged here, once per method
+     * name, on the reasoning that the call site cannot be relied on to report it.
+     */
     private static UnsupportedOperationException notYet(String what) {
+        if (NOT_YET_REPORTED.add(what)) {
+            net.neoforbrickit.bridge.util.ForbricLog.warn(
+                    "[Forbric/Bukkit] LivingEntity.%s() is not implemented by this bridge yet; "
+                                    + "a plugin that guarded on it took the refusal instead of an answer",
+                    what);
+        }
         return new UnsupportedOperationException(
                 "[Forbric/Bukkit] LivingEntity." + what + "() is not implemented by this bridge yet");
     }

@@ -62,8 +62,14 @@ final class ForbricInteractDispatch implements ForbricInteractHook.Sink {
 
 	ForbricInteractDispatch(ServerImpl server) {
 		this.server = server;
-		org.bukkit.plugin.PluginManager installed = server.getPluginManager();
-		this.manager = installed instanceof ForbricPluginManager plugins ? plugins : null;
+		// The wrapper, NOT whichever manager `getPluginManager()` returns.
+		//
+		// That accessor is deliberately the stock SimplePluginManager (LuckPerms refuses to inject its
+		// permission tables into anything else), so an `instanceof ForbricPluginManager` test against it is
+		// always false. This used to be exactly that test, and the consequence was total: `raise` short-
+		// circuited on the null manager and returned false without logging, so every interact event was
+		// silently dropped while the hooks upstream reported themselves armed.
+		this.manager = server.paperPluginManager();
 	}
 
 	@Override
@@ -111,7 +117,16 @@ final class ForbricInteractDispatch implements ForbricInteractHook.Sink {
 	 */
 	private boolean raise(Action action, ServerPlayer player, Level level, ItemStack held, InteractionHand hand,
 			BlockPos pos, Direction face) {
-		if (manager == null) return false;
+		if (manager == null) {
+			// Loud, and once only. A null bus means every interaction on the server is being dropped, which
+			// is exactly the failure that went unnoticed before: the hooks upstream keep reporting "armed"
+			// because arming is a different object, so silence here reads as "the game never called us".
+			if (warned.compareAndSet(false, true)) {
+				server.getLogger().severe("[Forbric/Bukkit] interact events are DISABLED: the bridge has no "
+						+ "ForbricPluginManager (plugins will never see right- or left-clicks)");
+			}
+			return false;
+		}
 		// Diagnostic for "the event never arrives" reports, which are otherwise indistinguishable from "the
 		// game never called this site". Off by default: it is one line per interaction, which is noise on a
 		// busy server. -Dforbric.debug turns it on. The line says which SITE fired, so a missing RIGHT_CLICK_AIR

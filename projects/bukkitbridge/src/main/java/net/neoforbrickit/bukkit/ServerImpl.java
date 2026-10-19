@@ -58,6 +58,15 @@ public final class ServerImpl implements org.bukkit.Server {
 	 * only caller that could was the constructor.
 	 */
 	private org.bukkit.plugin.PluginManager pluginManager;
+	/**
+	 * The wrapper behind {@link #pluginManager}, kept for the bridge's own use.
+	 *
+	 * <p>{@link #pluginManager} is the stock {@code SimplePluginManager} on purpose (LuckPerms tests for
+	 * that exact type before injecting its permission tables), so bridge code cannot find the wrapper by an
+	 * {@code instanceof} on what {@link #getPluginManager()} hands out. Keeping the field makes the lookup
+	 * direct instead of a guess.
+	 */
+	private ForbricPluginManager paperPluginManager;
 	private org.bukkit.command.SimpleCommandMap commandMap;
 	private final java.nio.file.Path pluginsFolder;
 	private final String version;
@@ -161,6 +170,7 @@ public final class ServerImpl implements org.bukkit.Server {
 		// list is still answered from the bridge's handles, and the permission tables it injects into are the
 		// ones its own lookups read.
 		this.pluginManager = simple;
+		this.paperPluginManager = manager;
 	}
 
 	/**
@@ -553,6 +563,16 @@ public final class ServerImpl implements org.bukkit.Server {
 	@Override
 	public org.bukkit.plugin.PluginManager getPluginManager() {
 		return pluginManager;
+	}
+
+	/**
+	 * The wrapper {@link #getPluginManager()} hides, for bridge code that needs the real event bus.
+	 *
+	 * <p>Not a Bukkit API: plugins reach the bridge through {@link #getPluginManager()} and the
+	 * {@code SimplePluginManager} forward, which is the arrangement their type checks expect.
+	 */
+	public ForbricPluginManager paperPluginManager() {
+		return paperPluginManager;
 	}
 
 	@Override

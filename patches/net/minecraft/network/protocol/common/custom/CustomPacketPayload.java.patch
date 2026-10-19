@@ -47,7 +47,7 @@
              }
  
              public void encode(B output, CustomPacketPayload value) {
-@@ -44,11 +_,52 @@
+@@ -44,10 +_,52 @@
  
              public CustomPacketPayload decode(B input) {
                  Identifier identifier = input.readIdentifier();

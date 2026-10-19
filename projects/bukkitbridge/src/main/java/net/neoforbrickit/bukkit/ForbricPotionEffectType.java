@@ -31,17 +31,12 @@ import net.minecraft.core.registries.BuiltInRegistries;
  * than faked: a numeric id is an internal the game no longer exposes, and a made-up one would collide
  * with no meaning.
  */
-public final class ForbricPotionEffectType implements org.bukkit.potion.PotionEffectType {
+public final class ForbricPotionEffectType extends org.bukkit.potion.PotionEffectType {
 
     private final org.bukkit.NamespacedKey key;
 
     private ForbricPotionEffectType(org.bukkit.NamespacedKey key) {
         this.key = key;
-    }
-
-    /** Wraps an effect id. The one place a key becomes a {@code PotionEffectType}. */
-    static ForbricPotionEffectType of(org.bukkit.NamespacedKey key) {
-        return new ForbricPotionEffectType(key);
     }
 
     /**
@@ -55,15 +50,14 @@ public final class ForbricPotionEffectType implements org.bukkit.potion.PotionEf
             return null;
         }
         var id = net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
-        var effect = BuiltInRegistries.MOB_EFFECT.get(id);
+        var effect = BuiltInRegistries.MOB_EFFECT.getValue(id);
         return effect == null ? null : new ForbricPotionEffectType(key);
     }
 
     /** Every effect id the game has, in its own order. */
     public static java.util.List<org.bukkit.NamespacedKey> gameKeys() {
         java.util.List<org.bukkit.NamespacedKey> keys = new java.util.ArrayList<>();
-        for (var holder : BuiltInRegistries.MOB_EFFECT.holders().toList()) {
-            var id = holder.key().location();
+        for (var id : BuiltInRegistries.MOB_EFFECT.keySet()) {
             keys.add(new org.bukkit.NamespacedKey(id.getNamespace(), id.getPath()));
         }
         return keys;
@@ -111,6 +105,76 @@ public final class ForbricPotionEffectType implements org.bukkit.potion.PotionEf
     @Override
     public org.bukkit.Color getColor() {
         throw notYet("getColor");
+    }
+
+    /**
+     * A potion effect of this type, at the strength and duration asked for.
+     *
+     * <p>Answered rather than refused: it needs nothing the game layer does not already hold, and a
+     * plugin that hands one out (a command, an area effect) would otherwise fail for a reason that says
+     * nothing about what it asked.
+     */
+    @Override
+    public org.bukkit.potion.PotionEffect createEffect(int duration, int amplifier) {
+        return new org.bukkit.potion.PotionEffect(this, duration, amplifier);
+    }
+
+    /**
+     * Whether this effect applies all at once. The game's own flag.
+     */
+    @Override
+    public boolean isInstant() {
+        var id = net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
+        var effect = BuiltInRegistries.MOB_EFFECT.getValue(id);
+        if (effect == null) {
+            throw notYet("isInstant (unknown effect " + key + ")");
+        }
+        return effect.isInstantaneous();
+    }
+
+    @Override
+    public double getDurationModifier() {
+        throw notYet("getDurationModifier");
+    }
+
+    @Override
+    public java.util.Map<org.bukkit.attribute.Attribute, org.bukkit.attribute.AttributeModifier> getEffectAttributes() {
+        throw notYet("getEffectAttributes");
+    }
+
+    @Override
+    public double getAttributeModifierAmount(org.bukkit.attribute.Attribute attribute, int modifierEffect) {
+        throw notYet("getAttributeModifierAmount");
+    }
+
+    @Override
+    public org.bukkit.potion.PotionEffectType.Category getEffectCategory() {
+        throw notYet("getEffectCategory");
+    }
+
+    /**
+     * The effect's translation key, which is what the client looks its name up by.
+     *
+     * <p>Derived from the game's own effect when it knows this id, so a mod's effect names itself the way
+     * the game names it; the vanilla shape is used for an id the game no longer has.
+     */
+    @Override
+    public String getTranslationKey() {
+        var id = net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
+        var effect = BuiltInRegistries.MOB_EFFECT.getValue(id);
+        if (effect != null) {
+            return effect.getDescriptionId();
+        }
+        return "effect." + key.getNamespace() + "." + key.getKey();
+    }
+
+    /**
+     * Adventure's translation key, which is the same string as {@link #getTranslationKey()} -- the two
+     * interfaces name the same value for different consumers.
+     */
+    @Override
+    public String translationKey() {
+        return getTranslationKey();
     }
 
     private static UnsupportedOperationException notYet(String what) {

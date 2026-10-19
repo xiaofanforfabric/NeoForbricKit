@@ -82,7 +82,7 @@ public final class ForbricRegistryAccess implements RegistryAccess {
             org.bukkit.Registry<T> sounds = (org.bukkit.Registry<T>) ForbricSoundRegistry.INSTANCE;
             return sounds;
         }
-        if (key == RegistryKey.POTION_EFFECT_TYPE) {
+        if (key == RegistryKey.MOB_EFFECT) {
             @SuppressWarnings("unchecked")
             org.bukkit.Registry<T> effects = (org.bukkit.Registry<T>) ForbricPotionEffectTypeRegistry.INSTANCE;
             return effects;
@@ -404,7 +404,8 @@ public final class ForbricRegistryAccess implements RegistryAccess {
                 return null;
             }
             try {
-                return gameLayerHalf().getMethod("of", org.bukkit.NamespacedKey.class)
+                return (org.bukkit.potion.PotionEffectType) gameLayerHalf()
+                                .getMethod("of", org.bukkit.NamespacedKey.class)
                                 .invoke(null, key);
             } catch (Throwable failure) {
                 if (REPORTED.compareAndSet(false, true)) {

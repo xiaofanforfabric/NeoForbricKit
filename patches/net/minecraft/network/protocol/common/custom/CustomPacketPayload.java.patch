@@ -1,6 +1,8 @@
 --- a/net/minecraft/network/protocol/common/custom/CustomPacketPayload.java
 +++ b/net/minecraft/network/protocol/common/custom/CustomPacketPayload.java
-@@ -22,20 +_,55 @@
+@@ -22,31 +22,102 @@
+     }
++
 +    /**
 +     * NeoFobric: thrown out of the vanilla decode path for a channel Fabric registered, so that the decode
 +     * handler Fabric prepends to that path gets the chance to decode it first. Only the type matters; the
@@ -9,8 +11,11 @@
 +     * <p>Declared at the top of the file: it is the only throwable on that path, and the decode catch names
 +     * it by its simple name, so it has to be in scope there.
 +     */
-+    record FabricDecodeEverything(Identifier id) implements net.minecraft.network.protocol.Packet {}
-     }
++    class FabricDecodeEverything extends RuntimeException {
++        FabricDecodeEverything(Identifier id) {
++            super("Forwarding " + id + " to Fabric's networking", null, false, false);
++        }
++    }
  
      static <B extends FriendlyByteBuf> StreamCodec<B, CustomPacketPayload> codec(
 +        final CustomPacketPayload.FallbackProvider<B> fallback, List<CustomPacketPayload.TypeAndCodec<? super B, ?>> types, net.minecraft.network.ConnectionProtocol protocol, net.minecraft.network.protocol.PacketFlow packetFlow
@@ -56,7 +61,8 @@
              }
  
              public void encode(B output, CustomPacketPayload value) {
-@@ -44,10 +_,41 @@
+                 this.writeCap(output, value.type(), value);
+             }
  
              public CustomPacketPayload decode(B input) {
                  Identifier identifier = input.readIdentifier();

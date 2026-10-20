@@ -6,12 +6,14 @@ package net.neoforbrickit.bukkit;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import io.papermc.paper.threadedregions.scheduler.AsyncScheduler;
+import io.papermc.paper.threadedregions.scheduler.EntityScheduler;
 import io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler;
 import io.papermc.paper.threadedregions.scheduler.RegionScheduler;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
@@ -105,6 +107,16 @@ public final class ForbricSchedulers {
 
     public AsyncScheduler async() {
         return new Async();
+    }
+
+    /**
+     * The scheduler a plugin uses to act on one entity, alive for as long as {@code alive} says so.
+     *
+     * <p>A fresh wrapper per call, like every other handle this bridge hands out: it holds nothing but
+     * the liveness test, so two of them for one entity are interchangeable and neither can go stale.
+     */
+    public EntityScheduler entity(java.util.function.BooleanSupplier alive) {
+        return new Entity(alive);
     }
 
     /** Stops every timer, for a clean shutdown. */
@@ -296,6 +308,8 @@ public final class ForbricSchedulers {
         volatile long delayMillis;
         /** The id BOTH APIs report: ScheduledTask has none, BukkitTask's is this. */
         final int id = TASK_IDS.incrementAndGet();
+        /** Whether this task's retirement callback already ran, so it cannot fire twice. */
+        final AtomicBoolean retiredFired = new AtomicBoolean();
         private volatile ExecutionState state = ExecutionState.IDLE;
 
         public Task(Plugin plugin, Consumer<ScheduledTask> body, boolean repeating) {
@@ -517,6 +531,133 @@ public final class ForbricSchedulers {
         public ScheduledTask runAtFixedRate(Plugin plugin, org.bukkit.World world, int chunkX, int chunkZ,
                         Consumer<ScheduledTask> task, long initialDelayTicks, long periodTicks) {
             return scheduleGame(plugin, task, initialDelayTicks, periodTicks, true);
+        }
+    }
+
+    /**
+     * The entity scheduler: the same thread as every region, plus a liveness check.
+     *
+     * <p>On Folia this is the scheduler a plugin uses to touch one entity without racing that entity's
+     * region. Here one thread ticks everything, so "the tick thread" is unambiguous and the scheduling
+     * itself is the same as {@link Global}; what this class adds is {@code retired}, which the API fires
+     * instead of the task when the entity is gone. That part still matters: a plugin refreshing a
+     * per-player marker every second would otherwise keep running after the player logged out, and the
+     * handle it held would be stale.
+     */
+    public final class Entity implements EntityScheduler {
+
+        /** Whether the entity this scheduler belongs to is still in the world. */
+        private final java.util.function.BooleanSupplier alive;
+
+        /**
+         * The retirement watch attached to each task handed out, so it can be stopped.
+         *
+         * <p>Without this the watcher outlives the task it was watching: the schedule is fixed-rate, so
+         * it would tick once per tick forever for a task that finished on its first run.
+         */
+        private final java.util.Map<Task, ScheduledFuture<?>> watchers = new java.util.concurrent.ConcurrentHashMap<>();
+
+        Entity(java.util.function.BooleanSupplier alive) {
+            this.alive = alive;
+        }
+
+        /**
+         * Runs the task now, or reports that the entity was already gone.
+         *
+         * <p>The boolean is the API's own answer: {@code true} when the runnable was handed off,
+         * {@code false} when it was dropped because the entity retired first. Answering {@code true}
+         * unconditionally would tell a caller the work happened when it did not.
+         */
+        @Override
+        public boolean execute(Plugin plugin, Runnable runnable, Runnable retired, long delayTicks) {
+            if (!alive.getAsBoolean()) {
+                if (retired != null) {
+                    retired.run();
+                }
+                return false;
+            }
+            if (delayTicks <= 0L && isGameThread()) {
+                runnable.run();
+                return true;
+            }
+            // Through the same timer the other schedulers use, so the delay is honoured: a plugin that
+            // asks for "one tick later" on a player gets one tick later, not the next time this thread
+            // happens to be free.
+            scheduleGame(plugin, ignored -> {
+                if (alive.getAsBoolean()) {
+                    runnable.run();
+                } else if (retired != null) {
+                    retired.run();
+                }
+            }, delayTicks, 0L, false);
+            return true;
+        }
+
+        @Override
+        public ScheduledTask run(Plugin plugin, Consumer<ScheduledTask> task, Runnable retired) {
+            return runDelayed(plugin, task, retired, 0L);
+        }
+
+        @Override
+        public ScheduledTask runDelayed(Plugin plugin, Consumer<ScheduledTask> task, Runnable retired,
+                        long delayTicks) {
+            Task handle = scheduleGame(plugin, task, delayTicks, 0L, false);
+            if (retired != null) {
+                watchForRetirement(handle, retired, delayTicks * MILLIS_PER_TICK);
+            }
+            return handle;
+        }
+
+        @Override
+        public ScheduledTask runAtFixedRate(Plugin plugin, Consumer<ScheduledTask> task, Runnable retired,
+                        long initialDelayTicks, long periodTicks) {
+            Task handle = scheduleGame(plugin, task, initialDelayTicks, periodTicks, true);
+            if (retired != null) {
+                watchForRetirement(handle, retired, initialDelayTicks * MILLIS_PER_TICK);
+            }
+            return handle;
+        }
+
+        /**
+         * Fires {@code retired} and cancels the handle when the entity goes away first.
+         *
+         * <p>Polled on the game thread rather than hooked to the entity's removal, because the entity
+         * is already gone by the time such a hook would run and the API says {@code retired} is called
+         * <em>instead of</em> the task. One check per tick is the cheapest way to keep that promise
+         * without a per-entity listener the game does not offer here.
+         */
+        private void watchForRetirement(Task handle, Runnable retired, long firstCheckMs) {
+            long delay = Math.max(0L, firstCheckMs);
+            ScheduledFuture<?> watch = gameTimer.scheduleAtFixedRate(() -> {
+                // Stop once the entity is gone or the task itself finished: leaving the watcher running
+                // would keep one doomed timer alive per task for the life of the server.
+                if (!alive.getAsBoolean()) {
+                    retireOnce(handle, retired);
+                } else if (handle.stopped()) {
+                    forgetWatcher(handle);
+                }
+            }, delay, MILLIS_PER_TICK, TimeUnit.MILLISECONDS);
+            watchers.put(handle, watch);
+        }
+
+        /** Fires {@code retired} at most once, then drops the watcher. */
+        private void retireOnce(Task handle, Runnable retired) {
+            if (handle.retiredFired.compareAndSet(false, true)) {
+                forgetWatcher(handle);
+                handle.cancel();
+                if (isGameThread()) {
+                    retired.run();
+                } else {
+                    server.minecraft().execute(retired);
+                }
+            }
+        }
+
+        private void forgetWatcher(Task handle) {
+            ScheduledFuture<?> watch = watchers.remove(handle);
+            if (watch != null) {
+                watch.cancel(false);
+            }
         }
     }
 

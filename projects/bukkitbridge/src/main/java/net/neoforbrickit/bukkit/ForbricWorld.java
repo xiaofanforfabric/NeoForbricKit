@@ -50,13 +50,35 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	/**
 	 * Wraps a level. The one place a {@code ServerLevel} becomes an {@code org.bukkit.World}.
 	 *
-	 * <p>A fresh wrapper per call rather than a cache: two wrappers for one level are equal through
-	 * {@link #equals} and hash alike, so nothing downstream can tell them apart — and a cache would need
-	 * invalidating when a level unloads, which is a correctness problem bought for nothing.
+	 * <p><b>One wrapper per level, not one per call.</b> An earlier version built a fresh wrapper each time
+	 * and argued that {@link #equals} made them interchangeable. That held for this class but not for the
+	 * world's <i>state</i>: {@link #chunkTickets} is per-world bookkeeping, so a fresh wrapper per call meant
+	 * every {@code addChunkTicket} was written to an object nobody would ask again, and the next call saw an
+	 * empty table.
+	 *
+	 * <p>The reason this was found is worth keeping: BlueMap's {@code BukkitWorld} holds its delegate through
+	 * a {@code WeakReference} and its {@code equals} compares {@code delegate.get()}. Because BlueMap's own
+	 * world cache is keyed weakly, a per-call wrapper was collected almost immediately, {@code delegate.get()}
+	 * started answering {@code null}, and every comparison against it failed -- which BlueMap reported as
+	 * "this player is in another world", and the webapp then hid the player's marker. A stable wrapper has no
+	 * such window.
+	 *
+	 * <p>Keyed by the level, which is the identity {@link #equals} uses, so a level that unloads and is
+	 * reloaded is a different key and gets a fresh wrapper.
 	 */
 	static ForbricWorld of(net.minecraft.server.level.ServerLevel level, ServerImpl server) {
-		return new ForbricWorld(level, server);
+		return WRAPPERS.computeIfAbsent(level, ignored -> new ForbricWorld(level, server));
 	}
+
+	/**
+	 * The wrapper per level, so {@link #of} can answer the same instance twice.
+	 *
+	 * <p>Weak keys: a level that unloads is collected along with its wrapper, which is what makes the wrapper
+	 * per-loading rather than per-server. Concurrent because plugins ask from their own schedulers while the
+	 * server thread asks from its own.
+	 */
+	private static final java.util.Map<net.minecraft.server.level.ServerLevel, ForbricWorld> WRAPPERS =
+			java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
 	/** The wrapped level, for the bridge's own use by {@link ForbricBlock} and the event layer. */
 	net.minecraft.server.level.ServerLevel level() {
@@ -127,14 +149,41 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	/**
 	 * The world's name, as Bukkit knows it: the folder it is stored under.
 	 *
-	 * <p>Minecraft names a dimension with a {@code ResourceKey} ({@code minecraft:overworld}); Bukkit names a
-	 * world with the folder in {@code saves/} ({@code world}). The key's path half is what a plugin writes when
-	 * it says {@code getWorld("world")}, and it is the half that stays put when a datapack moves a dimension
-	 * between namespaces.
+	 * <p>For the three vanilla dimensions that is the save folder a Bukkit server writes them to --
+	 * {@code world}, {@code world_nether}, {@code world_the_end} -- NOT the dimension key's path. Bukkit's
+	 * world names are folders first: {@code Server#getWorld(String)} is asked for the world by that same
+	 * string, and a plugin appends the name to a directory to build a path. Minecraft also has a folder called
+	 * {@code the_nether}, which is exactly why the two are easy to conflate and must not be.
+	 *
+	 * <p>BlueMap is the caller that noticed: it names a map after the world, prefixing the overworld's
+	 * configured id with this name for every other dimension -- hence {@code _the_nether} in its log where a
+	 * stock server says {@code world_nether}. Answering the key path here renames those maps behind the server
+	 * owner's back, and a renamed map folder is a re-render.
+	 *
+	 * <p>A datapack dimension has no Bukkit folder name to inherit, so its key path stands in -- a name nobody
+	 * configured, and the one {@code Server#getWorld(String)} accepts for it.
 	 */
 	@Override
 	public String getName() {
-		return level.dimension().identifier().getPath();
+		net.minecraft.resources.Identifier id = level.dimension().identifier();
+		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD
+				|| level.dimension() == net.minecraft.world.level.Level.NETHER
+				|| level.dimension() == net.minecraft.world.level.Level.END) {
+			// `<level-name>`, `<level-name>_nether`, `<level-name>_the_end` -- the folders the game itself
+			// writes next to each other. Read from the save root rather than assumed, because
+			// `level-name=survival` makes them `survival_nether`, and `--universe` moves all three.
+			String root = level.getServer()
+					.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+					.getFileName().toString();
+			if (level.dimension() == net.minecraft.world.level.Level.NETHER) {
+				return root + "_nether";
+			}
+			if (level.dimension() == net.minecraft.world.level.Level.END) {
+				return root + "_the_end";
+			}
+			return root;
+		}
+		return id.getPath();
 	}
 
 	/**
@@ -224,7 +273,29 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.block.Block getBlockAt(int x, int y, int z) {
-		return ForbricBlock.at(this, x, y, z);
+		return getBlockAt(x, y, z, true);
+	}
+
+	/**
+	 * A block, with the caller saying whether a chunk that is not in memory may be brought in to answer.
+	 *
+	 * <p><b>Why the caller decides.</b> The API's own reads are allowed to load -- a plugin asking for a block
+	 * outside the ticking area expects the world to be fetched for it. A renderer walking millions of
+	 * coordinates off the tick path is not: the load it triggers has to be finished by the thread doing the
+	 * walking, so the read never returns. That is not a slow path, it is a hang, and it is why the answer is a
+	 * parameter rather than a policy this class picks for everybody.
+	 *
+	 * <p>With {@code load == false} a block in a chunk that is not in memory answers air, and the handle keeps
+	 * answering air even if the chunk arrives later -- it stands for "the block I could see without loading",
+	 * not for the corner as it will be. The renderer's actual data comes from the snapshot, which reads the
+	 * region file instead of loading.
+	 */
+	org.bukkit.block.Block getBlockAt(int x, int y, int z, boolean load) {
+		if (!load) {
+			// "Is this chunk in memory" answered without the load. A miss is the answer, not a reason to fetch.
+			return ForbricBlock.at(this, x, y, z, level.getChunkSource().getChunkNow(x >> 4, z >> 4) != null);
+		}
+		return ForbricBlock.at(this, x, y, z, true);
 	}
 
 	@Override
@@ -1095,12 +1166,65 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public boolean isChunkGenerated(int arg0, int arg1) {
-		// Asked of the chunk source, which knows about chunks on disk: true for a chunk that exists whether or
-		// not anyone is holding it. This is the question a pre-generator asks to decide whether a coordinate
-		// still needs work, and answering it from "is it loaded" would send it over the whole region again.
-		return level.getChunkSource().hasChunk(arg0, arg1);
+		// Asked of the save, not of memory.
+		//
+		// `ChunkSource#hasChunk` looks like the right question and is not: it answers "is this chunk in
+		// memory", and a freshly started server has nothing in memory. A pre-generator survives asking it
+		// by accident -- it loads what it asks about first. A renderer does not: BlueMap asks whether a
+		// dimension has anything to draw at all, gets `false` everywhere, and writes
+		// `No regions found in world '#minecraft:overworld'` over a save full of chunks.
+		//
+		// So this asks the chunk in memory first, and otherwise reads the region file's index. Nothing is
+		// loaded and nothing is generated either way, which is also what makes it safe to ask from a thread
+		// that is not the server's -- a renderer's, say, while it decides what there is to draw.
+		return regionHasChunk(arg0 >> 4, arg1 >> 4);
 	}
 
+	/**
+	 * Whether the save holds this chunk: in memory, or written into its region file.
+	 *
+	 * <p>A region file is a 4 KiB table of 4-byte entries followed by the chunks themselves. The entry for
+	 * chunk {@code (lx, lz)} inside the region sits at {@code 4 * (lx + lz * 32)} and is zero when that
+	 * chunk was never written, so the check is one short read of four bytes. A region file that does not
+	 * exist is a region nobody has visited, which is legitimately empty.
+	 *
+	 * @param chunkX the chunk's own coordinate
+	 * @param chunkZ see {@code chunkX}
+	 */
+	private boolean regionHasChunk(int chunkX, int chunkZ) {
+		// Memory first: a chunk generated a second ago may not be in the file yet, and a chunk being held
+		// is generated by any reading of the word.
+		if (level.getChunkSource().getChunkNow(chunkX, chunkZ) != null) {
+			return true;
+		}
+		int regionX = chunkX >> 5;
+		int regionZ = chunkZ >> 5;
+		int localX = chunkX & 31;
+		int localZ = chunkZ & 31;
+		java.io.File file = new java.io.File(
+				dimensionFolder().resolve("region").toFile(),
+				"r." + regionX + "." + regionZ + ".mca");
+		if (!file.isFile()) {
+			return false;
+		}
+		long offset = 4L * (localX + localZ * 32);
+		try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
+			if (raf.length() < offset + 4) {
+				// A truncated file: the table does not even reach this entry, so the chunk is not there.
+				return false;
+			}
+			raf.seek(offset);
+			return raf.readInt() != 0;
+		} catch (java.io.IOException unreadable) {
+			// A region that cannot be read is not a chunk that exists. Said out loud rather than guessed
+			// at: a wrong `true` sends a pre-generator over a region it then has to generate from scratch,
+			// and a wrong `false` only means the caller asks again later.
+			net.neoforbrickit.bridge.util.ForbricLog.warn(
+					"[Forbric/Bukkit] could not read the region index of %s; answering 'not generated'",
+					(String) file.getPath());
+			return false;
+		}
+	}
 	@Override
 	public boolean isChunkInUse(int arg0, int arg1) {
 		throw notYet("isChunkInUse");
@@ -1569,7 +1693,10 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public org.bukkit.ChunkSnapshot getEmptyChunkSnapshot(int arg0, int arg1, boolean arg2, boolean arg3) {
-		throw notYet("getEmptyChunkSnapshot");
+		// An EMPTY snapshot, which is what the API promises: a chunk-shaped block of air and no
+		// terrain. A renderer fills the area outside the map with it, so answering with real blocks
+		// would put things where the caller asked for nothing.
+		return ForbricChunkSnapshot.empty(this, arg0, arg1);
 	}
 
 	@Override
@@ -1682,11 +1809,36 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public java.nio.file.Path getWorldPath() {
-           // The dimension's own folder -- the same answer getWorldFolder gives, as a Path.
-           //
-           // Bukkit declares both, and a plugin may reach for either; answering one and refusing the other
-           // makes it look like the world has no save while the folder is right there.
-           return getWorldFolder().toPath();
+           // The DIMENSION's own folder, which is what `getWorldFolder` used to answer and what a plugin
+           // asking for "where is this world's save" means. `getWorldFolder` now answers the shared save
+           // root instead (see its comment for why BlueMap needs that), so the dimension folder is
+           // resolved here rather than delegated.
+           return dimensionFolder();
+	}
+
+	/**
+	 * This dimension's own folder, under the shared save root.
+	 *
+	 * <p>{@code <root>/dimensions/<namespace>/<path>} on a modern save, or the legacy {@code <root>} /
+	 * {@code <root>/DIM-1} / {@code <root>/DIM1} layout when that is what is on disk. Used by the reads
+	 * that walk a dimension's own files — the region index here, and whatever else needs one dimension
+	 * rather than the whole save.
+	 */
+	private java.nio.file.Path dimensionFolder() {
+		java.nio.file.Path worldRoot = level.getServer()
+				.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+				.toAbsolutePath().normalize();
+		net.minecraft.resources.Identifier id = level.dimension().identifier();
+		java.nio.file.Path modern = worldRoot.resolve("dimensions")
+				.resolve(id.getNamespace()).resolve(id.getPath());
+		if (java.nio.file.Files.isDirectory(modern)) {
+			return modern;
+		}
+		// Legacy layout: `<root>/region` for the overworld, `<root>/DIM-1` and `<root>/DIM1` for the rest.
+		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD) {
+			return worldRoot;
+		}
+		return modern;
 	}
 
 	@Override
@@ -2006,36 +2158,26 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public java.io.File getWorldFolder() {
-		// The save folder a map or backup plugin walks to find `region/*.mca`.
+		// The SAVE ROOT, not this dimension's own folder.
 		//
-		// In Bukkit that is one folder per world -- `<container>/world/`, `<container>/world/DIM-1/` -- because
-		// a Bukkit world is a self-contained save. This game instead keeps one save root (`level-name`) and puts
-		// every dimension inside it, the overworld included:
+		// Bukkit's contract is "the folder this world's save lives in", and on a stock server that is one
+		// folder per world (`world`, `world_nether`). This game keeps ONE save root and puts every
+		// dimension inside it:
 		//
-		//   <server>/world/level.dat                              <- the save root, shared by all dimensions
-		//   <server>/world/dimensions/minecraft/overworld/region/  <- the overworld's own chunks
+		//   <server>/world/level.dat                              <- the save root, shared
+		//   <server>/world/dimensions/minecraft/overworld/region/  <- the overworld's chunks
 		//   <server>/world/dimensions/minecraft/the_nether/region/
-		//   <server>/world/dimensions/<namespace>/<path>/region/   <- a datapack dimension
 		//
-		// So the answer is NOT the save root: that folder holds `level.dat` and `dimensions`, no `region`, and a
-		// map plugin given it renders nothing. Every dimension, overworld included, lives one level deeper.
+		// Answering with this dimension's own folder was wrong for the caller that matters: BlueMap takes
+		// ServerWorld.getWorldFolder() as the save root and then appends `dimensions/<namespace>/<path>`
+		// itself, using this world's dimension key. Given the dimension folder it appends a second
+		// `dimensions/...` that does not exist, finds no regions, and renders nothing -- which is exactly
+		// the blank map this was traced from.
 		//
-		// A legacy pre-1.16 save has no `dimensions` folder, and there the overworld really is `<root>/` with a
-		// sibling `DIM-1`/`DIM1` -- keep answering that layout, so an old world still renders instead of
-		// silently producing an empty map.
-		java.nio.file.Path worldRoot = level.getServer().getWorldPath(
-				net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
-		net.minecraft.resources.Identifier id = level.dimension().identifier();
-		java.nio.file.Path modern = worldRoot.resolve("dimensions")
-				.resolve(id.getNamespace()).resolve(id.getPath());
-		if (java.nio.file.Files.isDirectory(modern)) {
-			return modern.toFile();
-		}
-		// Legacy layout: `<root>/region` for the overworld, `<root>/DIM-1` and `<root>/DIM1` for the rest.
-		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD) {
-			return worldRoot.toFile();
-		}
-		return modern.toFile();
+		// The root is what the game reports, so `--universe` and a renamed `level-name` both keep working.
+		return level.getServer()
+				.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+				.toAbsolutePath().normalize().toFile();
 	}
 
 	@Override

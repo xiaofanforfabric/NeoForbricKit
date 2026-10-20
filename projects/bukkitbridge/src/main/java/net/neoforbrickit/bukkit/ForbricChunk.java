@@ -32,12 +32,12 @@ package net.neoforbrickit.bukkit;
  * <p>A chunk that is generated but not loaded is the normal case for a pre-generator and the reason the two
  * cannot be collapsed into one answer.
  *
- * <h2>What is not answered here</h2>
+ * <h2>What a read here is allowed to do</h2>
  *
- * <p>The snapshot methods are refused rather than approximated. A snapshot must be an immutable copy of the
- * chunk's blocks, biomes and heightmaps taken at one moment, and building a wrong one is worse than an
- * exception: a plugin that reads a snapshot and gets live data would see the world change under it, with
- * nothing to point at. The exception names the method, which is what a plugin's own stack trace then shows.
+ * <p>Nothing in this class loads a chunk. A block read or a snapshot is a question, and on a render thread a
+ * question that loads is a hang: the load is finished by the thread the caller is waiting on. So a chunk that
+ * is not in memory answers air to {@code getBlock}, and its snapshot comes out of the region file without a
+ * load -- see {@code ForbricChunkSnapshot#read}.
  */
 final class ForbricChunk implements org.bukkit.Chunk {
 
@@ -89,13 +89,17 @@ final class ForbricChunk implements org.bukkit.Chunk {
 	/**
 	 * Whether this chunk exists on disk.
 	 *
-	 * <p>Asked of the level's chunk source rather than derived from whether a game chunk was found, because the
-	 * two differ in exactly the case this is used for: a chunk a pre-generator has just written is generated
-	 * and no longer loaded.
+	 * <p>Asked of the save itself -- the region file's own index -- rather than of the chunk source's
+	 * {@code hasChunk}, which answers "is it in memory". The two differ in exactly the case this is used for:
+	 * a chunk a pre-generator has just written is generated and no longer loaded.
+	 *
+	 * <p>They differ in the case that matters more, too. A freshly started server holds no chunks, so a
+	 * renderer asking "is there anything in this dimension" got {@code false} for every coordinate it tried
+	 * and concluded the world was empty. Nothing is loaded or generated to answer this.
 	 */
 	@Override
 	public boolean isGenerated() {
-		return world.level().getChunkSource().hasChunk(x, z);
+		return world.isChunkGenerated(x, z);
 	}
 
 	@Override
@@ -146,13 +150,29 @@ final class ForbricChunk implements org.bukkit.Chunk {
 		// Deliberately through the world rather than through the wrapper's own handle: a block is addressed by
 		// world coordinates, and a chunk-local offset would be a second way of locating the same block that
 		// could disagree with the first after a chunk is reloaded.
-		return world.getBlockAt((x << 4) + bx, by, (z << 4) + bz);
+		return world.getBlockAt((x << 4) + bx, by, (z << 4) + bz, handle != null);
 	}
 
 	@Override
 	public org.bukkit.ChunkSnapshot getChunkSnapshot(boolean includeMaxBlockY, boolean includeBiome,
 					boolean includeBiomeTempRain, boolean includeLightData) {
-		throw notYet("getChunkSnapshot");
+		// A loaded chunk is copied from memory; one that is not is read out of its region file. Both are
+		// full answers, and neither loads anything.
+		//
+		// The file path is the one a renderer takes: BlueMap snapshots the chunks of a world that is not
+		// ticking them, from its own thread, where a load would wait on the thread that is doing the asking.
+		// Refusing here -- which is what this used to do -- left the renderer with something it could not
+		// tell from an empty chunk, and that is a blank map with nothing in any log.
+		if (handle != null) {
+			return new ForbricChunkSnapshot(world, handle, includeMaxBlockY);
+		}
+		org.bukkit.ChunkSnapshot fromDisk = ForbricChunkSnapshot.read(world, x, z);
+		if (fromDisk != null) {
+			return fromDisk;
+		}
+		// Nothing saved at this coordinate and nothing in memory: a chunk of air is the honest answer, and
+		// it is what the API's own implementation gives for a coordinate outside the generated world.
+		return world.getEmptyChunkSnapshot(x, z, includeBiome, includeBiomeTempRain);
 	}
 
 	@Override

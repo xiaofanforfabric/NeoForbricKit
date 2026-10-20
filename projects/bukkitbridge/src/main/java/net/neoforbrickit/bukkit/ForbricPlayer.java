@@ -778,12 +778,12 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public boolean isSneaking() {
-		throw notYet("isSneaking");
+		return player.isShiftKeyDown();
 	}
 
 	@Override
 	public void setSneaking(boolean arg0) {
-		throw notYet("setSneaking");
+		player.setShiftKeyDown(arg0);
 	}
 
 	@Override
@@ -2358,22 +2358,88 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public boolean hasPotionEffect(org.bukkit.potion.PotionEffectType arg0) {
-		throw notYet("hasPotionEffect");
+		var effect = mobEffectOf(arg0);
+		return effect != null && player.hasEffect(effect);
 	}
 
 	@Override
 	public org.bukkit.potion.PotionEffect getPotionEffect(org.bukkit.potion.PotionEffectType arg0) {
-		throw notYet("getPotionEffect");
+		var effect = mobEffectOf(arg0);
+		if (effect == null) {
+			return null;
+		}
+		var instance = player.getEffect(effect);
+		return instance == null ? null : toBukkitEffect(instance);
 	}
 
 	@Override
 	public void removePotionEffect(org.bukkit.potion.PotionEffectType arg0) {
-		throw notYet("removePotionEffect");
+		var effect = mobEffectOf(arg0);
+		if (effect != null) {
+			player.removeEffect(effect);
+		}
 	}
 
 	@Override
 	public java.util.Collection<org.bukkit.potion.PotionEffect> getActivePotionEffects() {
-		throw notYet("getActivePotionEffects");
+		java.util.List<org.bukkit.potion.PotionEffect> effects = new java.util.ArrayList<>();
+		for (var instance : player.getActiveEffects()) {
+			var effect = toBukkitEffect(instance);
+			if (effect != null) {
+				effects.add(effect);
+			}
+		}
+		return effects;
+	}
+
+	/**
+	 * The game's effect for a Bukkit type, or null when the id names nothing.
+	 *
+	 * <p>Goes through the id rather than the object: two {@code PotionEffectType}s for one effect are
+	 * equal by key but are not the same instance, and only {@link ForbricPotionEffectType} carries the
+	 * key. A type from the game's own registry still answers, because the id it was built from is the
+	 * game's own id.
+	 *
+	 * <p>Null rather than a throw for an unknown id: "this effect does not exist" is the honest answer,
+	 * and {@code hasPotionEffect} on an effect nobody can have is {@code false}, not a failure. BlueMap
+	 * asks this on every player join to decide whether to hide them, and dying there is what made every
+	 * player invisible to it.
+	 */
+	private net.minecraft.core.Holder<net.minecraft.world.effect.MobEffect> mobEffectOf(
+					org.bukkit.potion.PotionEffectType type) {
+		if (type == null) {
+			return null;
+		}
+		// Keyed.getKey() rather than a cast: every PotionEffectType carrying an id answers it, ours
+		// and the game's own alike, and getTranslationKey() would hand back 'effect.minecraft.name'
+		// which is not a key at all.
+		org.bukkit.NamespacedKey key = type.getKey();
+		var id = net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
+		var effect = net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT.getValue(id);
+		return effect == null ? null : net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT
+						.wrapAsHolder(effect);
+	}
+
+	/**
+	 * One active effect as Bukkit sees it, or null when its type has no Bukkit wrapper.
+	 *
+	 * <p>A mod's effect with no {@link ForbricPotionEffectType} equivalent is dropped rather than
+	 * invented: Bukkit's type is a fixed set, and a made-up one would be an object no other API can
+	 * match.
+	 */
+	private org.bukkit.potion.PotionEffect toBukkitEffect(
+					net.minecraft.world.effect.MobEffectInstance instance) {
+		var id = net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT.getKey(instance.getEffect().value());
+		if (id == null) {
+			return null;
+		}
+		var type = ForbricPotionEffectType.of(
+						new org.bukkit.NamespacedKey(id.getNamespace(), id.getPath()));
+		if (type == null) {
+			return null;
+		}
+		return new org.bukkit.potion.PotionEffect(type, instance.getDuration(), instance.getAmplifier(),
+						instance.isAmbient(), instance.isVisible(), instance.showIcon());
 	}
 
 	@Override
@@ -3353,7 +3419,9 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public io.papermc.paper.threadedregions.scheduler.EntityScheduler getScheduler() {
-		throw notYet("getScheduler");
+		// Retired once the game drops the player, which is what the API means by "the entity is gone":
+		// a logged-out player is removed from the level, and a task still queued for one must not run.
+		return server.schedulers().entity(() -> !player.isRemoved());
 	}
 
 	@Override

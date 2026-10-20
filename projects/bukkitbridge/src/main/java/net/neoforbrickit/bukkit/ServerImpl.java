@@ -191,9 +191,15 @@ public final class ServerImpl implements org.bukkit.Server {
 	/**
 	 * Every loaded world, wrapped.
 	 *
-	 * <p>{@link ForbricWorld#of} is the one place a {@code ServerLevel} becomes an {@code org.bukkit.World}.
-	 * Wrapping per call rather than caching, so a world reloaded under the same name is not answered from a
-	 * stale wrapper.
+	 * <p>{@link ForbricWorld#of} is the one place a {@code ServerLevel} becomes an {@code org.bukkit.World},
+	 * and it answers the same wrapper for the same level. That identity matters to callers outside this
+	 * bridge: BlueMap's {@code BukkitWorld} keeps its delegate in a {@code WeakReference}, and a wrapper that
+	 * nothing else held was collected between two calls, after which BlueMap's own {@code equals} answered
+	 * "different world" for a player standing in the world it had just asked about -- and hid that player's
+	 * marker. Held strongly here for the life of the level so that window does not exist.
+	 *
+	 * <p>Rebuilt per call from {@code getAllLevels()} rather than cached: a level that unloads is no longer
+	 * in that list, so nothing here keeps answering a world the server has put away.
 	 */
 	private java.util.List<org.bukkit.World> worlds() {
 		if (minecraft == null) return java.util.List.of();
@@ -201,8 +207,19 @@ public final class ServerImpl implements org.bukkit.Server {
 		for (net.minecraft.server.level.ServerLevel level : minecraft.getAllLevels()) {
 			wrapped.add(ForbricWorld.of(level, this));
 		}
+		worldKeepAlive.clear();
+		worldKeepAlive.addAll(wrapped);
 		return wrapped;
         }
+
+	/**
+	 * A strong reference to the wrappers handed out, so a weak-keyed consumer cannot lose them.
+	 *
+	 * <p>See {@link #worlds()} for the failure this prevents. Cleared and refilled on each rebuild, so it
+	 * never holds a world the server has unloaded.
+	 */
+	private final java.util.List<org.bukkit.World> worldKeepAlive =
+			new java.util.concurrent.CopyOnWriteArrayList<>();
 
 	/**
          * One world by name, unique id, or key.
@@ -1028,8 +1045,9 @@ public final class ServerImpl implements org.bukkit.Server {
 		// Absolute, because the game answers this as a path relative to its working directory, and a plugin
 		// that resolves a relative path later does so against *its* notion of the current directory. The
 		// lookup itself is fine either way; a value that means the same thing to every caller is not.
-		return this.minecraft.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+		java.nio.file.Path root = this.minecraft.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
 				.toAbsolutePath().normalize();
+		return root;
 	}
 
 	@Override

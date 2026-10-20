@@ -50,13 +50,35 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 	/**
 	 * Wraps a level. The one place a {@code ServerLevel} becomes an {@code org.bukkit.World}.
 	 *
-	 * <p>A fresh wrapper per call rather than a cache: two wrappers for one level are equal through
-	 * {@link #equals} and hash alike, so nothing downstream can tell them apart — and a cache would need
-	 * invalidating when a level unloads, which is a correctness problem bought for nothing.
+	 * <p><b>One wrapper per level, not one per call.</b> An earlier version built a fresh wrapper each time
+	 * and argued that {@link #equals} made them interchangeable. That held for this class but not for the
+	 * world's <i>state</i>: {@link #chunkTickets} is per-world bookkeeping, so a fresh wrapper per call meant
+	 * every {@code addChunkTicket} was written to an object nobody would ask again, and the next call saw an
+	 * empty table.
+	 *
+	 * <p>The reason this was found is worth keeping: BlueMap's {@code BukkitWorld} holds its delegate through
+	 * a {@code WeakReference} and its {@code equals} compares {@code delegate.get()}. Because BlueMap's own
+	 * world cache is keyed weakly, a per-call wrapper was collected almost immediately, {@code delegate.get()}
+	 * started answering {@code null}, and every comparison against it failed -- which BlueMap reported as
+	 * "this player is in another world", and the webapp then hid the player's marker. A stable wrapper has no
+	 * such window.
+	 *
+	 * <p>Keyed by the level, which is the identity {@link #equals} uses, so a level that unloads and is
+	 * reloaded is a different key and gets a fresh wrapper.
 	 */
 	static ForbricWorld of(net.minecraft.server.level.ServerLevel level, ServerImpl server) {
-		return new ForbricWorld(level, server);
+		return WRAPPERS.computeIfAbsent(level, ignored -> new ForbricWorld(level, server));
 	}
+
+	/**
+	 * The wrapper per level, so {@link #of} can answer the same instance twice.
+	 *
+	 * <p>Weak keys: a level that unloads is collected along with its wrapper, which is what makes the wrapper
+	 * per-loading rather than per-server. Concurrent because plugins ask from their own schedulers while the
+	 * server thread asks from its own.
+	 */
+	private static final java.util.Map<net.minecraft.server.level.ServerLevel, ForbricWorld> WRAPPERS =
+			java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
 	/** The wrapped level, for the bridge's own use by {@link ForbricBlock} and the event layer. */
 	net.minecraft.server.level.ServerLevel level() {
@@ -1179,7 +1201,8 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 		int regionZ = chunkZ >> 5;
 		int localX = chunkX & 31;
 		int localZ = chunkZ & 31;
-		java.io.File file = new java.io.File(new java.io.File(getWorldFolder(), "region"),
+		java.io.File file = new java.io.File(
+				dimensionFolder().resolve("region").toFile(),
 				"r." + regionX + "." + regionZ + ".mca");
 		if (!file.isFile()) {
 			return false;
@@ -1786,11 +1809,36 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public java.nio.file.Path getWorldPath() {
-           // The dimension's own folder -- the same answer getWorldFolder gives, as a Path.
-           //
-           // Bukkit declares both, and a plugin may reach for either; answering one and refusing the other
-           // makes it look like the world has no save while the folder is right there.
-           return getWorldFolder().toPath();
+           // The DIMENSION's own folder, which is what `getWorldFolder` used to answer and what a plugin
+           // asking for "where is this world's save" means. `getWorldFolder` now answers the shared save
+           // root instead (see its comment for why BlueMap needs that), so the dimension folder is
+           // resolved here rather than delegated.
+           return dimensionFolder();
+	}
+
+	/**
+	 * This dimension's own folder, under the shared save root.
+	 *
+	 * <p>{@code <root>/dimensions/<namespace>/<path>} on a modern save, or the legacy {@code <root>} /
+	 * {@code <root>/DIM-1} / {@code <root>/DIM1} layout when that is what is on disk. Used by the reads
+	 * that walk a dimension's own files — the region index here, and whatever else needs one dimension
+	 * rather than the whole save.
+	 */
+	private java.nio.file.Path dimensionFolder() {
+		java.nio.file.Path worldRoot = level.getServer()
+				.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+				.toAbsolutePath().normalize();
+		net.minecraft.resources.Identifier id = level.dimension().identifier();
+		java.nio.file.Path modern = worldRoot.resolve("dimensions")
+				.resolve(id.getNamespace()).resolve(id.getPath());
+		if (java.nio.file.Files.isDirectory(modern)) {
+			return modern;
+		}
+		// Legacy layout: `<root>/region` for the overworld, `<root>/DIM-1` and `<root>/DIM1` for the rest.
+		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD) {
+			return worldRoot;
+		}
+		return modern;
 	}
 
 	@Override
@@ -2110,36 +2158,26 @@ final class ForbricWorld extends net.neoforbrickit.bukkit.entity.CraftWorld
 
 	@Override
 	public java.io.File getWorldFolder() {
-		// The save folder a map or backup plugin walks to find `region/*.mca`.
+		// The SAVE ROOT, not this dimension's own folder.
 		//
-		// In Bukkit that is one folder per world -- `<container>/world/`, `<container>/world/DIM-1/` -- because
-		// a Bukkit world is a self-contained save. This game instead keeps one save root (`level-name`) and puts
-		// every dimension inside it, the overworld included:
+		// Bukkit's contract is "the folder this world's save lives in", and on a stock server that is one
+		// folder per world (`world`, `world_nether`). This game keeps ONE save root and puts every
+		// dimension inside it:
 		//
-		//   <server>/world/level.dat                              <- the save root, shared by all dimensions
-		//   <server>/world/dimensions/minecraft/overworld/region/  <- the overworld's own chunks
+		//   <server>/world/level.dat                              <- the save root, shared
+		//   <server>/world/dimensions/minecraft/overworld/region/  <- the overworld's chunks
 		//   <server>/world/dimensions/minecraft/the_nether/region/
-		//   <server>/world/dimensions/<namespace>/<path>/region/   <- a datapack dimension
 		//
-		// So the answer is NOT the save root: that folder holds `level.dat` and `dimensions`, no `region`, and a
-		// map plugin given it renders nothing. Every dimension, overworld included, lives one level deeper.
+		// Answering with this dimension's own folder was wrong for the caller that matters: BlueMap takes
+		// ServerWorld.getWorldFolder() as the save root and then appends `dimensions/<namespace>/<path>`
+		// itself, using this world's dimension key. Given the dimension folder it appends a second
+		// `dimensions/...` that does not exist, finds no regions, and renders nothing -- which is exactly
+		// the blank map this was traced from.
 		//
-		// A legacy pre-1.16 save has no `dimensions` folder, and there the overworld really is `<root>/` with a
-		// sibling `DIM-1`/`DIM1` -- keep answering that layout, so an old world still renders instead of
-		// silently producing an empty map.
-		java.nio.file.Path worldRoot = level.getServer().getWorldPath(
-				net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
-		net.minecraft.resources.Identifier id = level.dimension().identifier();
-		java.nio.file.Path modern = worldRoot.resolve("dimensions")
-				.resolve(id.getNamespace()).resolve(id.getPath());
-		if (java.nio.file.Files.isDirectory(modern)) {
-			return modern.toFile();
-		}
-		// Legacy layout: `<root>/region` for the overworld, `<root>/DIM-1` and `<root>/DIM1` for the rest.
-		if (level.dimension() == net.minecraft.world.level.Level.OVERWORLD) {
-			return worldRoot.toFile();
-		}
-		return modern.toFile();
+		// The root is what the game reports, so `--universe` and a renamed `level-name` both keep working.
+		return level.getServer()
+				.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+				.toAbsolutePath().normalize().toFile();
 	}
 
 	@Override

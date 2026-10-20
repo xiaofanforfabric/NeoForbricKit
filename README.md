@@ -90,6 +90,18 @@ Paper 插件发插件消息走的是 `minecraft:register` 这套通道协商，�
 - **CraftBukkit 兼容层仍在补全中。** 有两三个文件在 `universal.jar` 的编译
   classpath 上过不了（已知，见 `projects/neoforge/build.gradle` 的 exclude），
   对应的 API 目前是缺失的。
+- **BlueMap 的"`No regions found`"有三层，根子在"渲染线程上不许加载区块"。**
+  1. *世界名*：`World#getName()` 原本回维度键的路径段（`the_nether`），而 Bukkit 的世界名是
+     **文件夹名**（`world_nether`）。BlueMap 拿它拼地图 id，于是日志里出现 `_the_nether`。
+  2. *有没有区块*：`World#isChunkGenerated` 原本问"在内存里吗"。刚起的服内存里什么都没有，
+     渲染器于是判定维度全空。现在问存档——读 region 文件的 4 KiB 索引表，不加载不生成。
+  3. *读方块*：`Chunk#getChunkSnapshot` 现在**直接从 region 文件读**（解压 + 游戏自己的
+     `NbtIo`/`Block.CODEC` + 1.18+ 的调色板打包规则），一次加载都没有；`Chunk#getBlock` 对
+     不在内存的区块答空气而不是顺手触发加载——渲染线程上那次加载要等主线程，而主线程正在
+     等渲染线程，表现是卡死而不是报错。<br>代价：文件里没有可用的光照，这条路读出来的快照
+     光照答 0（内存路径仍然从 light engine 复制）。<br>⚠️ **未实机验证**：本环境无 JDK，
+     改动只过了人工走读。跑一轮看告警是否消失；若仍旧，把 `plugins/BlueMap/maps/` 下的
+     目录名和 `blueMap.conf` 里的 `world:` 行发上来。
 
 ---
 
@@ -372,6 +384,26 @@ both directions.
 - **The CraftBukkit layer is still being filled in.** A couple of files do not compile on
   `universal.jar`'s classpath (known, see the `exclude`s in
   `projects/neoforge/build.gradle`), so those API pieces are currently missing.
+- **BlueMap's "`No regions found`" has two layers, and both are now answered.**
+  1. *The world name*: `Server#getLevelDirectory` and `World#getWorldFolder` already answer the
+     26.2 save layout correctly (see #42); what was left is `World#getName()`, which returned the
+     dimension key's path segment (`the_nether`) where Bukkit's world name is the **folder name**
+     (`world_nether`). BlueMap builds a map id out of that name (every other dimension prefixes the
+     configured id — `_the_nether`, `_the_end`), so a wrong name renames the maps with it.
+  2. *Whether there are any chunks*: `World#isChunkGenerated` asked "is this chunk in memory". On a
+     fresh start nothing is, so the renderer was told the dimension holds no chunks and never
+     created its update task. It now asks the save — it reads the region file's 4 KiB index table and
+     generates and loads nothing.
+  3. *Reading blocks*: `Chunk#getChunkSnapshot` now reads the chunk **straight out of its region file**
+     (decompress, then the game's own `NbtIo` / `Block.CODEC` and the 1.18+ palette packing), with no
+     load at all; `Chunk#getBlock` answers air for a chunk that is not in memory instead of quietly
+     loading it — on a render thread that load waits for the main thread, which is waiting for the
+     render thread, and the result is a hang rather than an error.
+     <br>Cost: a save carries no light this bridge can decode, so a snapshot read that way reports
+     light 0 (the in-memory path still copies it from the light engine).
+  <br>⚠️ **Not verified on a live server**: this environment has no JDK, so the changes were only read
+  through by hand. Run it and the warnings going away is the evidence; if they persist, post the folder
+  names under `plugins/BlueMap/maps/` and the `world:` line from `blueMap.conf`.
 
 ---
 

@@ -35,11 +35,20 @@ final class ForbricBlock implements org.bukkit.block.Block {
         private final int y;
         private final int z;
 
-        private ForbricBlock(ForbricWorld world, int x, int y, int z) {
+        /**
+         * Whether this corner's chunk is in memory, and so whether reading it is allowed.
+         *
+         * <p>False only for a handle made by {@code at(..., false)}; a handle from the ordinary path is always
+         * readable, because that path is allowed to load. See {@link #at(ForbricWorld, int, int, int, boolean)}.
+         */
+        private final boolean readable;
+
+        private ForbricBlock(ForbricWorld world, int x, int y, int z, boolean readable) {
                 this.world = world;
                 this.x = x;
                 this.y = y;
                 this.z = z;
+                this.readable = readable;
         }
 
         /**
@@ -50,7 +59,19 @@ final class ForbricBlock implements org.bukkit.block.Block {
          * would have to be invalidated when the chunk unloads, which is a correctness problem bought for nothing.
          */
         static ForbricBlock at(ForbricWorld world, int x, int y, int z) {
-                return new ForbricBlock(world, x, y, z);
+                return new ForbricBlock(world, x, y, z, true);
+        }
+
+        /**
+         * A corner that may or may not be in memory, for callers that must not load it.
+         *
+         * <p>{@code readable == false} means the chunk is not loaded and the caller cannot afford to load it
+         * (a render thread, see {@code ForbricWorld#getBlockAt(int, int, int, boolean)}). Every read of such a
+         * handle answers air rather than pulling the chunk in: a load asked for from the wrong thread does not
+         * complete, and a plugin that hangs looks exactly like a server that stopped.
+         */
+        static ForbricBlock at(ForbricWorld world, int x, int y, int z, boolean readable) {
+                return new ForbricBlock(world, x, y, z, readable);
         }
 
         /** The corner as a game position, for the bridge's own use and the event layer. */
@@ -58,8 +79,15 @@ final class ForbricBlock implements org.bukkit.block.Block {
                 return new net.minecraft.core.BlockPos(x, y, z);
         }
 
+        /**
+         * What is at this corner, as the game's own state.
+         *
+         * <p>The one place a read happens, and the one place {@link #readable} is honoured: an unreadable
+         * handle answers {@code null}, which every caller here turns into air. Reading the level directly
+         * would be a chunk load, and that is the thing this handle exists to refuse.
+         */
         private net.minecraft.world.level.block.state.BlockState state() {
-                return world.level().getBlockState(pos());
+                return readable ? world.level().getBlockState(pos()) : null;
         }
 
         private static UnsupportedOperationException notYet(String what) {
@@ -105,16 +133,61 @@ final class ForbricBlock implements org.bukkit.block.Block {
          */
         @Override
         public org.bukkit.Material getType() {
+                net.minecraft.world.level.block.state.BlockState state = state();
+                if (state == null) {
+                        // Unreadable handle: the chunk is not in memory and this caller may not load it.
+                        return org.bukkit.Material.AIR;
+                }
                 net.minecraft.resources.Identifier id =
-                                net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state().getBlock());
+                                net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
                 org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
                 if (material == null) {
-                        // A block this bridge's copy of the Bukkit API has never heard of: a mod-added one, or a
-                        // newer game than the API was built against. Naming it beats returning air, which would
-                        // look like an empty corner and send a plugin down the wrong path.
-                        throw notYet("getType() for block " + id);
-                }
-                return material;
+			// A block this bridge's copy of the Bukkit API has never heard of: a mod-added one, or a newer
+			// game than the API was built against.
+			//
+			// Named in the log, but NOT thrown. A renderer walks millions of blocks, and a modded world is
+			// the whole reason this bridge exists -- one exception per unknown block would abort the map
+			// rather than leave a hole in it. AIR is the honest answer for "no Bukkit material names this".
+			warnUnknownBlock("getType", id);
+			return org.bukkit.Material.AIR;
+		}
+		return material;
+	}
+
+	/**
+	 * The Bukkit material for a game state, or {@code AIR} when this API has no name for it.
+	 *
+	 * <p>Package-visible because the chunk snapshot resolves millions of these and must resolve them the
+	 * same way a single block read does — two spellings of "which material is this" would drift.
+	 *
+	 * <p>Unknown blocks answer {@code AIR} rather than throwing: see {@link #getType()}.
+	 */
+	static org.bukkit.Material materialOf(net.minecraft.world.level.block.state.BlockState state) {
+		net.minecraft.resources.Identifier id =
+				net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
+		org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
+		if (material == null) {
+			warnUnknownBlock("getType", id);
+			return org.bukkit.Material.AIR;
+		}
+		return material;
+	}
+
+	/**
+	 * One line per unknown block id, not one per read.
+	 *
+	 * <p>A renderer reads the same block a few million times, so a per-read warning would be both useless
+	 * and enormous. The set is static because the id is the identity: two wrappers over the same block
+	 * report the same gap.
+	 */
+	private static final java.util.Set<net.minecraft.resources.Identifier> REPORTED_UNKNOWN =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	private static void warnUnknownBlock(String what, net.minecraft.resources.Identifier id) {
+		if (REPORTED_UNKNOWN.add(id)) {
+			net.neoforbrickit.bridge.util.ForbricLog.warn(
+					"[Forbric/Bukkit] Block.%s() has no Bukkit material for %s; answering AIR", what, id);
+		}
         }
 
         /**
@@ -150,13 +223,15 @@ final class ForbricBlock implements org.bukkit.block.Block {
          */
         @Override
         public boolean isEmpty() {
-                return state().isAir();
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null || state.isAir();
         }
 
         /** Whether what is here is a liquid. */
         @Override
         public boolean isLiquid() {
-                return !state().getFluidState().isEmpty();
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null || !state.getFluidState().isEmpty();
         }
 
         /**
@@ -167,7 +242,8 @@ final class ForbricBlock implements org.bukkit.block.Block {
          */
         @Override
         public boolean isPassable() {
-                return !state().blocksMotion();
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null || !state.blocksMotion();
         }
 
         /** The light level where this block sits, 0-15. */
@@ -179,7 +255,8 @@ final class ForbricBlock implements org.bukkit.block.Block {
         /** This block's state as Bukkit block data, which is how a plugin reads or sets properties like facing. */
         @Override
         public org.bukkit.block.data.BlockData getBlockData() {
-                return dataOf(state());
+                net.minecraft.world.level.block.state.BlockState state = state();
+                return state == null ? org.bukkit.Material.AIR.createBlockData() : dataOf(state);
         }
 
         /** Replaces this block's state, properties and all. */
@@ -191,10 +268,19 @@ final class ForbricBlock implements org.bukkit.block.Block {
                 world.level().setBlock(pos(), stateOf(data), 3);
         }
 
-        /** The block's full state as a Bukkit snapshot. Refuses until the snapshot type is bridged. */
-        @Override
-        public org.bukkit.block.BlockState getState() {
-                throw notYet("getState()");
+/**
+	 * This block as a {@code BlockState}.
+	 *
+	 * <p>A live handle rather than a copy — see {@link ForbricBlockState}, which states the difference and
+	 * offers {@code copy()} for callers that need the API's usual detached behaviour.
+	 *
+	 * <p>Answered rather than refused because a map renderer asks for it once per block and then reads
+	 * only {@code getType} and {@code getBlockData}: refusing it leaves the renderer with nothing it can
+	 * distinguish from an empty world.
+	 */
+	@Override
+	public org.bukkit.block.BlockState getState() {
+		return new ForbricBlockState(this);
         }
 
         /**
@@ -216,22 +302,33 @@ final class ForbricBlock implements org.bukkit.block.Block {
          * the API registered for that block — the game's state string and Bukkit's property names are not the same
          * spelling, and letting the API do the translation is what keeps them in step.
          */
-        private static org.bukkit.block.data.BlockData dataOf(
+        static org.bukkit.block.data.BlockData dataOf(
                         net.minecraft.world.level.block.state.BlockState state) {
                 net.minecraft.resources.Identifier id =
                                 net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock());
                 org.bukkit.Material material = org.bukkit.Material.matchMaterial(id.toString());
                 if (material == null) {
-                        throw notYet("block data for " + id);
-                }
-                return material.createBlockData();
+			warnUnknownBlock("getBlockData", id);
+			return org.bukkit.Material.AIR.createBlockData();
+		}
+		// The game's own state string, so the properties a plugin reads are the ones that are actually
+		// there -- `minecraft:oak_stairs[facing=east,half=top]` rather than the default state a bare
+		// createBlockData() would give. A renderer reading orientation, water level or slab half needs
+		// the difference, and a default state is only right when the block IS in its default state.
+		try {
+			return material.createBlockData(state.toString());
+		} catch (RuntimeException unsupported) {
+			// A property this API's copy of the block does not model (a newer game, or a mod). The
+			// material is still right, and default-shaped data beats no block at all.
+			return material.createBlockData();
+		}
         }
 
         /**
          * Bukkit block data as a game state.
          *
-         * <p>The round trip is name-based on both ends: the data's material names the block, and the game's default
-         * state for it is what gets written. Properties the API models but the game does not (or spells differently)
+         * <p>The round trip is name-based on both ends: the data's material names the block, and the game's
+         * default state for it is what gets written. Properties the API models but the game does not (or spells differently)
          * are dropped rather than guessed at.
          */
         private static net.minecraft.world.level.block.state.BlockState stateOf(
@@ -297,12 +394,29 @@ final class ForbricBlock implements org.bukkit.block.Block {
 
 	@Override
 	public byte getLightFromSky() {
-		throw notYet("getLightFromSky");
+		return lightValue(net.minecraft.world.level.LightLayer.SKY);
 	}
 
 	@Override
 	public byte getLightFromBlocks() {
-		throw notYet("getLightFromBlocks");
+		return lightValue(net.minecraft.world.level.LightLayer.BLOCK);
+	}
+
+	/**
+	 * One light layer's value at this corner, as the game's light engine has it.
+	 *
+	 * <p>Read through the engine rather than through {@link #getLightLevel()}: that answers the
+	 * <em>combined</em> brightness a mob would see, which is what Bukkit's deprecated
+	 * {@code getLightLevel()} means, while these two each want one layer on its own.
+	 *
+	 * <p>Zero for an unreadable handle, matching every other read on one: a caller that must not load
+	 * the chunk (a render thread) is told "no light" rather than being handed the cost of a load.
+	 */
+	private byte lightValue(net.minecraft.world.level.LightLayer layer) {
+		if (!readable) {
+			return 0;
+		}
+		return (byte) world.level().getLightEngine().getLayerListener(layer).getLightValue(pos());
 	}
 
 	@Override

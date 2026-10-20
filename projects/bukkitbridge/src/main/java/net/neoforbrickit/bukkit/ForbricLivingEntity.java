@@ -1357,7 +1357,9 @@ class ForbricLivingEntity extends ForbricEntity implements org.bukkit.entity.Liv
 
 	@Override
 	public io.papermc.paper.threadedregions.scheduler.EntityScheduler getScheduler() {
-		throw notYet("getScheduler");
+		// The same handle the base class hands out: a living entity IS an entity, and one
+		// scheduler for it is what the API promises.
+		return super.getScheduler();
 	}
 
 	@Override

@@ -110,13 +110,26 @@ public final class ForbricSchedulers {
     }
 
     /**
-     * The scheduler a plugin uses to act on one entity, alive for as long as {@code alive} says so.
+     * An entity's scheduler.
      *
-     * <p>A fresh wrapper per call, like every other handle this bridge hands out: it holds nothing but
-     * the liveness test, so two of them for one entity are interchangeable and neither can go stale.
+     * <p>A fresh handle per call, like every other wrapper this bridge hands out: it holds nothing but a
+     * liveness test, so two of them for one entity are interchangeable and neither can go stale.
+     *
+     * <p>Alive means "still in a level and not removed": a logged-out player is removed from the level,
+     * which is the point at which the API says a task queued for them must not run.
      */
     public EntityScheduler entity(java.util.function.BooleanSupplier alive) {
         return new Entity(alive);
+    }
+
+    /**
+     * The scheduler of one game entity.
+     *
+     * <p>Shorthand for the {@link #entity(java.util.function.BooleanSupplier)} form, so callers holding an
+     * entity do not each have to spell out the liveness test.
+     */
+    public EntityScheduler entity(net.minecraft.world.entity.Entity entity) {
+        return entity(() -> entity != null && !entity.isRemoved() && entity.level() != null);
     }
 
     /** Stops every timer, for a clean shutdown. */

@@ -778,6 +778,9 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public boolean isSneaking() {
+		// The client's shift flag, which is what upstream reads too: this is the pose the player is
+		// asking for, not the one the game has settled on, and a plugin testing "is this player
+		// crouching" wants the input rather than a collision-derived state.
 		return player.isShiftKeyDown();
 	}
 
@@ -2358,6 +2361,9 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public boolean hasPotionEffect(org.bukkit.potion.PotionEffectType arg0) {
+		// Matched by registry id rather than by object identity: PotionEffectType instances are wrappers
+		// built per call (see ForbricPotionEffectType), so two of them for one effect are never `==`.
+		// A null argument means "no effect", and the answer to "has none" is false.
 		var effect = mobEffectOf(arg0);
 		return effect != null && player.hasEffect(effect);
 	}
@@ -2382,6 +2388,8 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public java.util.Collection<org.bukkit.potion.PotionEffect> getActivePotionEffects() {
+		// A snapshot, like the game's own getActiveEffects: the collection is the level's live map and
+		// iterating it while a plugin removes an effect would otherwise be a concurrent modification.
 		java.util.List<org.bukkit.potion.PotionEffect> effects = new java.util.ArrayList<>();
 		for (var instance : player.getActiveEffects()) {
 			var effect = toBukkitEffect(instance);
@@ -2412,8 +2420,12 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 		}
 		// Keyed.getKey() rather than a cast: every PotionEffectType carrying an id answers it, ours
 		// and the game's own alike, and getTranslationKey() would hand back 'effect.minecraft.name'
-		// which is not a key at all.
+		// which is not a key at all. A type built without a key names nothing, rather than throwing
+		// out of a read.
 		org.bukkit.NamespacedKey key = type.getKey();
+		if (key == null) {
+			return null;
+		}
 		var id = net.minecraft.resources.Identifier.fromNamespaceAndPath(key.getNamespace(), key.getKey());
 		var effect = net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT.getValue(id);
 		return effect == null ? null : net.minecraft.core.registries.BuiltInRegistries.MOB_EFFECT
@@ -3419,6 +3431,10 @@ final class ForbricPlayer extends net.neoforbrickit.bukkit.entity.CraftPlayer
 
 	@Override
 	public io.papermc.paper.threadedregions.scheduler.EntityScheduler getScheduler() {
+		// The player's own scheduler, which is the entity scheduler for the player's game object. BlueMap
+		// starts its per-player position refresh from here on every join, so refusing it drops the player
+		// from the map with an exception in an event handler.
+		//
 		// Retired once the game drops the player, which is what the API means by "the entity is gone":
 		// a logged-out player is removed from the level, and a task still queued for one must not run.
 		return server.schedulers().entity(() -> !player.isRemoved());

@@ -394,12 +394,29 @@ final class ForbricBlock implements org.bukkit.block.Block {
 
 	@Override
 	public byte getLightFromSky() {
-		throw notYet("getLightFromSky");
+		return lightValue(net.minecraft.world.level.LightLayer.SKY);
 	}
 
 	@Override
 	public byte getLightFromBlocks() {
-		throw notYet("getLightFromBlocks");
+		return lightValue(net.minecraft.world.level.LightLayer.BLOCK);
+	}
+
+	/**
+	 * One light layer's value at this corner, as the game's light engine has it.
+	 *
+	 * <p>Read through the engine rather than through {@link #getLightLevel()}: that answers the
+	 * <em>combined</em> brightness a mob would see, which is what Bukkit's deprecated
+	 * {@code getLightLevel()} means, while these two each want one layer on its own.
+	 *
+	 * <p>Zero for an unreadable handle, matching every other read on one: a caller that must not load
+	 * the chunk (a render thread) is told "no light" rather than being handed the cost of a load.
+	 */
+	private byte lightValue(net.minecraft.world.level.LightLayer layer) {
+		if (!readable) {
+			return 0;
+		}
+		return (byte) world.level().getLightEngine().getLayerListener(layer).getLightValue(pos());
 	}
 
 	@Override
